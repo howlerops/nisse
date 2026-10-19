@@ -1,0 +1,10 @@
+{
+  "name": "d16-ts-frontend-spike",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "ts6": "npm:typescript@6.0.3",
+    "ts7": "npm:typescript@7.0.2",
+    "ts7next": "npm:typescript@7.1.0-dev.20261019.1"
+  }
+}
