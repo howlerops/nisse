@@ -18,6 +18,7 @@ import (
 type result struct {
 	Engine           string  `json:"engine"`
 	Bundle           string  `json:"bundle"`
+	Rows             int     `json:"rows"`
 	HTMLBytes        int     `json:"htmlBytes"`
 	RendersPerSec    float64 `json:"rendersPerSec"`
 	P50ms            float64 `json:"p50ms"`
@@ -33,14 +34,15 @@ func main() {
 	dist := flag.String("dist", "", "directory with ssr.js and ssr-stream.js")
 	dur := flag.Duration("dur", 10*time.Second, "measurement time per phase")
 	dump := flag.String("dump", "", "write one render's HTML here")
+	rows := flag.Int("rows", 800, "table rows: 800 (~220 KB page) or 100 (~28 KB page)")
 	bundle := flag.String("bundle", "ssr.js", "bundle in dist to render: ssr.js (stock) or ssr-join.js (join patch)")
 	flag.Parse()
 
-	f, err := newFactory(*engine, *dist+"/"+*bundle)
+	f, err := newFactory(*engine, *dist+"/"+*bundle, *rows)
 	check(err)
-	sf, err := newFactory(*engine, *dist+"/ssr-stream.js")
+	sf, err := newFactory(*engine, *dist+"/ssr-stream.js", *rows)
 	check(err)
-	res := result{Engine: *engine, Bundle: *bundle}
+	res := result{Engine: *engine, Bundle: *bundle, Rows: *rows}
 
 	// Startup: new instance including bundle evaluation, median of 5.
 	var starts []float64

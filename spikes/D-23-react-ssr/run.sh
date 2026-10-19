@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # D-23 spike: React SSR in embedded JS engines vs Node vs Go-native.
-# Usage: WORK=/some/scratch/dir RUNS=3 DUR=10s ./run.sh
+# Usage: WORK=/some/scratch/dir RUNS=3 DUR=10s ROWS=800 ./run.sh   (ROWS=100 for the small page)
 # Results: $WORK/results/*.jsonl (one JSON line per run), summary on stdout.
 # Overrides: CONFIGS="engine:bundle ..." (see below). Start from an empty $WORK/results to avoid mixing runs.
 set -euo pipefail
@@ -9,6 +9,7 @@ WORK="${WORK:?set WORK to a scratch directory}"
 RUNS="${RUNS:-3}"
 DUR="${DUR:-10s}"
 DURSEC="${DUR%s}"
+ROWS="${ROWS:-800}"
 
 WORK="$WORK" "$HERE/build.sh" >/dev/null
 (cd "$HERE/go" && CGO_ENABLED=0 go build -o "$WORK/bench" .)
@@ -21,14 +22,14 @@ for run in $(seq 1 "$RUNS"); do
   echo "run $run start: $(cat /proc/loadavg)" >> "$WORK/results/load.txt"
   for c in $CONFIGS; do
     e="${c%%:*}"; b="${c#*:}"; [ "$b" = "-" ] && b=ssr.js
-    tag="$e-${b%.js}"
+    tag="$e-${b%.js}-r$ROWS"
     if [ "$e" = node ]; then
-      node --expose-gc "$HERE/node/bench.mjs" "$D" "$DURSEC" "$D/$tag.html" "$b" >> "$WORK/results/$tag.jsonl"
+      node --expose-gc "$HERE/node/bench.mjs" "$D" "$DURSEC" "$D/$tag.html" "$b" "$ROWS" >> "$WORK/results/$tag.jsonl"
     else
-      "$WORK/bench" -engine "$e" -dist "$D" -bundle "$b" -dur "$DUR" -dump "$D/$tag.html" >> "$WORK/results/$tag.jsonl"
+      "$WORK/bench" -engine "$e" -dist "$D" -bundle "$b" -dur "$DUR" -rows "$ROWS" -dump "$D/$tag.html" >> "$WORK/results/$tag.jsonl"
     fi
-    if cmp -s "$D/$tag.html" "$D/node-ssr.html"; then same="identical"; else same="DIFFERENT"; fi
-    echo "run $run $tag: HTML $same to node-ssr" | tee -a "$WORK/results/html-check.txt"
+    if cmp -s "$D/$tag.html" "$D/node-ssr-r$ROWS.html"; then same="identical"; else same="DIFFERENT"; fi
+    echo "run $run $tag: HTML $same to node-ssr-r$ROWS" | tee -a "$WORK/results/html-check.txt"
   done
 done
 

@@ -26,11 +26,12 @@ type StreamEngine interface {
 // factory loads the bundle once and creates instances from it.
 type factory func() (Engine, error)
 
-func newFactory(name, bundle string) (factory, error) {
+func newFactory(name, bundle string, rows int) (factory, error) {
 	src, err := os.ReadFile(bundle)
 	if err != nil {
 		return nil, err
 	}
+	src = append([]byte(fmt.Sprintf("globalThis.ROWS=%d;\n", rows)), src...)
 	switch name {
 	case "goja":
 		prg, err := goja.Compile("ssr.js", string(src), false)
@@ -43,7 +44,7 @@ func newFactory(name, bundle string) (factory, error) {
 	case "modernc":
 		return func() (Engine, error) { return newModernc(string(src)) }, nil
 	case "native":
-		return func() (Engine, error) { return &nativeEngine{rows: makeData(800)}, nil }, nil
+		return func() (Engine, error) { return &nativeEngine{rows: makeData(rows)}, nil }, nil
 	}
 	return nil, fmt.Errorf("unknown engine %q", name)
 }

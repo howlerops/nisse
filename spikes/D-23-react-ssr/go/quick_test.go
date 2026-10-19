@@ -23,7 +23,7 @@ func TestQuick(t *testing.T) {
 		names = strings.Fields(s)
 	}
 	for _, name := range names {
-		f, err := newFactory(name, dist+"/"+bundle)
+		f, err := newFactory(name, dist+"/"+bundle, 800)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -43,7 +43,7 @@ func TestQuick(t *testing.T) {
 		}
 		t.Logf("%s: load %v renders %v", name, load, times)
 		h, _ := e.Render()
-		sf, _ := newFactory(name, dist+"/ssr-stream.js")
+		sf, _ := newFactory(name, dist+"/ssr-stream.js", 800)
 		se, err := sf()
 		if err != nil {
 			t.Logf("%s: stream load error %v", name, err)
