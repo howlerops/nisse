@@ -28,6 +28,7 @@ type benchOut struct {
 	CompileMs float64            `json:"compileMs"` // all corpus patterns, compile + one test
 	Compiled  int                `json:"compiled"`
 	PerPat    map[string]float64 `json:"perPatternUs"` // median µs per full global match pass over the text
+	PerLine   map[string]float64 `json:"perLineUs"`    // median µs for one non-global exec on each line of the text
 }
 
 // bench measures compile time over every corpus pattern and global-match time
@@ -46,7 +47,8 @@ func bench(engine, casesPath, harness, textPath string, runs int, out string) {
 	check(err)
 	text := string(tb)
 	h := readHarness(harness)
-	res := benchOut{Engine: engine, PerPat: map[string]float64{}}
+	res := benchOut{Engine: engine, PerPat: map[string]float64{}, PerLine: map[string]float64{}}
+	lines := strings.Split(strings.TrimSuffix(text, "\n"), "\n")
 
 	var compileTimes []float64
 	for r := 0; r < runs; r++ {
@@ -139,6 +141,20 @@ func bench(engine, casesPath, harness, textPath string, runs int, out string) {
 	for i, xs := range samples {
 		if len(xs) == runs {
 			res.PerPat[fmt.Sprint(i)] = median(xs)
+		}
+	}
+	lineSamples := map[int][]float64{}
+	for r := 0; r < runs; r++ {
+		for i, p := range pats {
+			f := strings.ReplaceAll(p.F, "g", "")
+			if us, ok := benchLines(e, p.P, f, lines); ok {
+				lineSamples[i] = append(lineSamples[i], us)
+			}
+		}
+	}
+	for i, xs := range lineSamples {
+		if len(xs) == runs {
+			res.PerLine[fmt.Sprint(i)] = median(xs)
 		}
 	}
 	ob, _ := json.Marshal(res)
@@ -243,4 +259,98 @@ func benchLRE(le *lreEngine, p benchPat, text string, n int) float64 {
 		}
 	}
 	return float64(time.Since(t0).Nanoseconds()) / 1000 / float64(n)
+}
+
+// benchLines times one non-global exec on every line; it returns µs per line.
+func benchLines(e Engine, p, f string, lines []string) (float64, bool) {
+	const n = 3
+	per := func(d time.Duration) float64 { return float64(d.Nanoseconds()) / 1000 / float64(n*len(lines)) }
+	switch ee := e.(type) {
+	case evaler:
+		js, _ := json.Marshal(lines)
+		code := "__benchLines(" + mustJSON(p) + "," + mustJSON(f) + "," + string(js) + "," + fmt.Sprint(n) + ")"
+		t0 := time.Now()
+		if _, err := ee.Eval(code); err != nil {
+			return 0, false
+		}
+		return per(time.Since(t0)), true
+	case *lreEngine:
+		c := ee.compile(p, f)
+		if c.err != "" {
+			return 0, false
+		}
+		bufs, lens := lreBuffers(ee, lines)
+		defer func() {
+			for _, b := range bufs {
+				libc.Xfree(ee.tls, b)
+			}
+		}()
+		t0 := time.Now()
+		for k := 0; k < n; k++ {
+			for j := range bufs {
+				ee.exec(c, bufs[j], lens[j], 0)
+			}
+		}
+		return per(time.Since(t0)), true
+	case *hybridLRE:
+		c := ee.re2.compile(p, f)
+		lc := ee.lre.compile(p, f)
+		bufs, lens := lreBuffers(ee.lre, lines)
+		defer func() {
+			for _, b := range bufs {
+				libc.Xfree(ee.lre.tls, b)
+			}
+		}()
+		ins := make([]*input, len(lines))
+		for j, l := range lines {
+			ins[j] = newInput(l, c.u)
+		}
+		t0 := time.Now()
+		for k := 0; k < n; k++ {
+			for j, l := range lines {
+				if _, ok := ee.useRE2(p, f, l); ok {
+					ins[j].execRE2(c.re2, 0)
+				} else if lc.err == "" {
+					ee.lre.exec(lc, bufs[j], lens[j], 0)
+				}
+			}
+		}
+		return per(time.Since(t0)), true
+	case *nativeEngine:
+		c := ee.compile(p, f)
+		if c.err != "" {
+			return 0, false
+		}
+		ins := make([]*input, len(lines))
+		for j, l := range lines {
+			ins[j] = newInput(l, c.u)
+		}
+		if ee.kind == "re2" && c.re2 == nil {
+			return 0, false
+		}
+		t0 := time.Now()
+		for k := 0; k < n; k++ {
+			for _, in := range ins {
+				if c.re2 != nil && !(c.plan.astralUnsafe && in.hasAstral) && !(c.plan.lineTermMode && strings.ContainsAny(in.s, "\r\u2028\u2029")) {
+					in.execRE2(c.re2, 0)
+				} else if ee.kind != "re2" {
+					in.execRegexp2(c, 0)
+				}
+			}
+		}
+		return per(time.Since(t0)), true
+	}
+	return 0, false
+}
+
+func lreBuffers(e *lreEngine, lines []string) ([]uintptr, []int) {
+	bufs := make([]uintptr, len(lines))
+	lens := make([]int, len(lines))
+	for j, l := range lines {
+		u := utf16.Encode([]rune(l))
+		bufs[j] = libc.Xmalloc(e.tls, libc.Tsize_t(2*len(u)+2))
+		copy(unsafe.Slice((*uint16)(unsafe.Pointer(bufs[j])), len(u)), u)
+		lens[j] = len(u)
+	}
+	return bufs, lens
 }

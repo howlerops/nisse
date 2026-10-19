@@ -3,8 +3,8 @@ package main
 import (
 	"fmt"
 
-	lib "modernc.org/libquickjs"
 	"modernc.org/libc"
+	lib "modernc.org/libquickjs"
 )
 
 func main() {

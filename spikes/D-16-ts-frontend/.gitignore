@@ -1,9 +1,9 @@
 node_modules/
 package-lock.json
-out/
+out/*
 bin/
 *.jsonl
 vendored/internal/
 vendored/go.sum
 vendored/go.mod
-vendored/nissedump
+!out/summary.md

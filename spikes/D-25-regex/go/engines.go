@@ -42,8 +42,14 @@ func newEngine(name string, harness string) (Engine, error) {
 		return &nativeEngine{kind: "hybrid"}, nil
 	case "libregexp":
 		return newLRE(), nil
+	case "libregexpopt":
+		e := newLRE()
+		e.opt = true
+		return e, nil
 	case "hybridlre":
-		return &hybridLRE{re2: &nativeEngine{kind: "re2"}, lre: newLRE()}, nil
+		e := newLRE()
+		e.opt = true
+		return &hybridLRE{re2: &nativeEngine{kind: "re2"}, lre: e}, nil
 	}
 	return nil, fmt.Errorf("unknown engine %q", name)
 }
@@ -51,7 +57,8 @@ func newEngine(name string, harness string) (Engine, error) {
 const jsGlue = `
 function __run(p,f,s){ return JSON.stringify(__runCase(p,f,s)); }
 function __benchMatch(p,f,s,n){ var re=new RegExp(p,f); var c=0; for(var i=0;i<n;i++){ var m=s.match(re); c+= m?m.length:0; } return c; }
-function __compileAll(list){ var c=0; for(var i=0;i<list.length;i++){ try { if (new RegExp(list[i][0], list[i][1]).test("x")) c++; } catch(e){} } return c; }
+function __compileAll(list){ var c=0; for(var i=0;i<list.length;i++){ try { new RegExp(list[i][0], list[i][1]).test("x"); c++; } catch(e){} } return c; }
+function __benchLines(p,f,lines,n){ var re=new RegExp(p,f); var c=0; for(var k=0;k<n;k++){ for(var i=0;i<lines.length;i++){ re.lastIndex=0; if(re.exec(lines[i])!==null) c++; } } return c; }
 `
 
 func jsCall(fn string, args ...any) string {

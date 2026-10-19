@@ -9,6 +9,7 @@ const med = xs => [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)];
 const ct = []; let compiled = 0;
 for (let r = 0; r < runs; r++) {
   // V8 compiles lazily, so "compile" here is construct + first test(), as for every other engine.
+  // V8 also caches compiled regexps by source and flags, so only the first run is a cold compile.
   const t0 = process.hrtime.bigint(); compiled = 0;
   for (const [p, f] of clist) { try { new RegExp(p, f).test("x"); compiled++; } catch {} }
   ct.push(Number(process.hrtime.bigint() - t0) / 1e6);
@@ -20,5 +21,12 @@ for (let r = 0; r < runs; r++) pats.forEach((p, i) => {
   (samples[i] ||= []).push(Number(process.hrtime.bigint() - t0) / 1e3 / 3);
 });
 const perPatternUs = {}; for (const [i, xs] of Object.entries(samples)) perPatternUs[i] = med(xs);
-fs.writeFileSync(dir + "/bench-node.json", JSON.stringify({ engine: "node", compileMs: med(ct), compiled, perPatternUs }));
+const lines = text.replace(/\n$/, "").split("\n"); const ls = {};
+for (let r = 0; r < runs; r++) pats.forEach((p, i) => {
+  const re = new RegExp(p.p, p.f.replace("g", "")); for (const l of lines) re.exec(l); // warm-up
+  const t0 = process.hrtime.bigint(); for (let k = 0; k < 3; k++) for (const l of lines) { re.lastIndex = 0; re.exec(l); }
+  (ls[i] ||= []).push(Number(process.hrtime.bigint() - t0) / 1e3 / (3 * lines.length));
+});
+const perLineUs = {}; for (const [i, xs] of Object.entries(ls)) perLineUs[i] = med(xs);
+fs.writeFileSync(dir + "/bench-node.json", JSON.stringify({ engine: "node", compileMs: ct[0], compileWarmMs: med(ct), compiled, perPatternUs, perLineUs }));
 console.error(`node: compile ${med(ct).toFixed(0)}ms, ${Object.keys(perPatternUs).length} patterns timed`);

@@ -202,7 +202,7 @@ func classify(engine, truthJSON, gotJSON string) string {
 	if _, ok := gv["err"]; ok {
 		return "fail"
 	}
-	native := engine == "regexp2v1" || engine == "regexp2v2" || engine == "re2fast" || engine == "hybrid" || engine == "libregexp" || engine == "hybridlre"
+	native := engine == "regexp2v1" || engine == "regexp2v2" || engine == "re2fast" || engine == "hybrid" || engine == "libregexp" || engine == "libregexpopt" || engine == "hybridlre"
 	if native {
 		if reflect.DeepEqual(tv["m"], gv["m"]) {
 			return "pass"

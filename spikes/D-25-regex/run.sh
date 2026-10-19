@@ -6,17 +6,15 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 W=${1:-${D25_WORK:-$HERE/out}}
 mkdir -p "$W/out"
 cd "$HERE"
-ENGINES="goja quickjs qjswasm regexp2v1 regexp2v2 libregexp re2fast hybrid hybridlre"
+ENGINES="goja quickjs qjswasm regexp2v1 regexp2v2 libregexp libregexpopt re2fast hybrid hybridlre"
 
 step() { echo "== $*" >&2; }
 
 if [ ! -d "$W/pkgs/node_modules" ]; then
   step "install npm corpus packages"
-  mkdir -p "$W/pkgs" && (cd "$W/pkgs" && npm init -y >/dev/null && npm i --silent \
-    validator zod date-fns lodash express marked semver uuid ajv yup moment dayjs acorn acorn-walk esbuild qs \
-    body-parser mime-types cookie path-to-regexp handlebars chalk commander yargs joi luxon jsonwebtoken ws dotenv \
-    minimatch glob micromatch picomatch markdown-it highlight.js sanitize-html he entities postcss autoprefixer \
-    csv-parse fast-xml-parser xml2js js-yaml uglify-js terser randexp)
+  # Top-level versions are pinned from corpus-packages.json; transitive dependencies can still drift.
+  PKGS=$(node -e 'const p=require(process.argv[1]);console.log(Object.entries(p).map(([k,v])=>k+"@"+v).join(" "))' "$HERE/corpus-packages.json")
+  mkdir -p "$W/pkgs" && (cd "$W/pkgs" && npm init -y >/dev/null && npm i --silent $PKGS)
 fi
 if [ ! -d "$W/test262" ]; then
   step "clone test262 (RegExp-related directories only)"
@@ -37,7 +35,8 @@ step "Node ground truth"
 node truth.mjs "$W/out/cases.json" "$W/out/truth-node.json"
 
 step "differential runs"
-for e in $ENGINES; do ./bin/d25 drive -engine $e -cases "$W/out/cases.json" -harness harness.js -out "$W/out/res-$e.json" 2> >(grep -v '^\s\|^goroutine\|^panic\|^$' >&2); done
+# goja panics (a Go panic, not a JS error) on some patterns; the driver restarts it and records the case as a crash.
+for e in $ENGINES; do ./bin/d25 drive -engine $e -cases "$W/out/cases.json" -harness harness.js -out "$W/out/res-$e.json" 2>&1 | grep -E '^[a-z0-9]+: [0-9]+ cases' >&2; done
 ./bin/d25 diff -cases "$W/out/cases.json" -truth "$W/out/truth-node.json" -out "$W/out/diff.md" \
   $(for e in $ENGINES; do echo "$e=$W/out/res-$e.json"; done) > /dev/null
 
@@ -52,11 +51,11 @@ for e in goja quickjs qjswasm; do ./bin/d25 t262 -engine $e -text "$W/test262" -
 step "benchmarks"
 node bench-prep.mjs "$W/out/cases.json" "$W/out"
 node bench-node.mjs "$W/out" 5
-for e in $ENGINES; do ./bin/d25 bench -engine $e -cases "$W/out/bench-patterns.json" -harness harness.js -text "$W/out/bench-text.txt" -runs 5 -out "$W/out/bench-$e.json"; done
+for e in re2fast hybridlre libregexpopt libregexp hybrid regexp2v2 regexp2v1 quickjs qjswasm goja; do ./bin/d25 bench -engine $e -cases "$W/out/bench-patterns.json" -harness harness.js -text "$W/out/bench-text.txt" -runs 5 -out "$W/out/bench-$e.json"; done
 node bench-report.mjs "$W/out" > "$W/out/bench.md"
 
 step "catastrophic backtracking"
 node redos-node.mjs > "$W/out/redos.tsv"
-for e in goja quickjs qjswasm regexp2v2 libregexp hybridlre; do ./bin/d25 redos -engine $e -harness harness.js >> "$W/out/redos.tsv"; done
+for e in goja quickjs qjswasm regexp2v2 libregexp libregexpopt hybridlre; do ./bin/d25 redos -engine $e -harness harness.js >> "$W/out/redos.tsv"; done
 
 step "done: results in $W/out (diff.md, re2cov.md, t262.md, bench.md, redos.tsv)"

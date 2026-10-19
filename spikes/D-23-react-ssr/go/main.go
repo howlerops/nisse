@@ -17,6 +17,7 @@ import (
 
 type result struct {
 	Engine           string  `json:"engine"`
+	Bundle           string  `json:"bundle"`
 	HTMLBytes        int     `json:"htmlBytes"`
 	RendersPerSec    float64 `json:"rendersPerSec"`
 	P50ms            float64 `json:"p50ms"`
@@ -32,13 +33,14 @@ func main() {
 	dist := flag.String("dist", "", "directory with ssr.js and ssr-stream.js")
 	dur := flag.Duration("dur", 10*time.Second, "measurement time per phase")
 	dump := flag.String("dump", "", "write one render's HTML here")
+	bundle := flag.String("bundle", "ssr.js", "bundle in dist to render: ssr.js (stock) or ssr-join.js (join patch)")
 	flag.Parse()
 
-	f, err := newFactory(*engine, *dist+"/ssr.js")
+	f, err := newFactory(*engine, *dist+"/"+*bundle)
 	check(err)
 	sf, err := newFactory(*engine, *dist+"/ssr-stream.js")
 	check(err)
-	res := result{Engine: *engine}
+	res := result{Engine: *engine, Bundle: *bundle}
 
 	// Startup: new instance including bundle evaluation, median of 5.
 	var starts []float64
@@ -120,9 +122,7 @@ func main() {
 		go func() {
 			defer wg.Done()
 			defer e.Close()
-			for j := 0; j < 20; j++ {
-				e.Render()
-			}
+			loop(e, *dur/5) // warm-up
 			counts[i] = len(loop(e, *dur))
 		}()
 	}

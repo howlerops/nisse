@@ -512,6 +512,14 @@ func isHex(c rune) bool {
 }
 
 func (t *tr) property() string {
+	// Go's Unicode tables (15.0 in Go 1.26) lag V8's (16.0 in Node 22), so
+	// property classes go to the backtracking engine, which carries one table.
+	panic(ineligible("unicode property"))
+}
+
+// propertyRE2 translates \p{…} to Go syntax. Unused while property classes are
+// routed to libregexp; kept to measure the coverage the exclusion costs.
+func (t *tr) propertyRE2() string {
 	neg := t.peek(0) == 'P'
 	if t.peek(1) != '{' {
 		panic(ineligible("bad property"))

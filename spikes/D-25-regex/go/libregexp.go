@@ -17,6 +17,7 @@ import (
 // A bare JSContext is still needed because libregexp allocates through it and
 // polls it for interrupts.
 type lreEngine struct {
+	opt   bool // wrapper prefilter: compile start-anchored patterns as sticky
 	tls   *libc.TLS
 	rt    uintptr
 	ctx   uintptr
@@ -104,6 +105,9 @@ func (e *lreEngine) compile(p, f string) *lreCompiled {
 			c.err = "invalid flag"
 			return c
 		}
+	}
+	if e.opt && anchoredStart(p, f) {
+		flags |= lib.MLRE_FLAG_STICKY
 	}
 	pat, _ := libc.CString(p)
 	defer libc.Xfree(e.tls, pat)
@@ -252,4 +256,36 @@ func (e *lreEngine) countMatches(c *lreCompiled, units []uint16, buf uintptr) in
 		}
 	}
 	return n
+}
+
+// anchoredStart reports whether every alternative of p begins with ^ and the
+// m flag is off, so a match can only start at the search position 0: running
+// such a pattern sticky gives identical results without scanning the input.
+func anchoredStart(p, f string) bool {
+	if strings.Contains(f, "m") || !strings.HasPrefix(p, "^") {
+		return false
+	}
+	depth, inClass := 0, false
+	rs := []rune(p)
+	for i := 0; i < len(rs); i++ {
+		switch c := rs[i]; {
+		case c == '\\':
+			i++
+		case inClass:
+			if c == ']' {
+				inClass = false
+			}
+		case c == '[':
+			inClass = true
+		case c == '(':
+			depth++
+		case c == ')':
+			depth--
+		case c == '|' && depth == 0:
+			if i+1 >= len(rs) || rs[i+1] != '^' {
+				return false
+			}
+		}
+	}
+	return true
 }
