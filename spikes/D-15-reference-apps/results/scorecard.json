@@ -1,0 +1,1423 @@
+[
+ {
+  "sha": "30b68e1e881462b2f4164ea09ab4c4f5699c7b0b",
+  "last_commit": "2024-01-04T16:28:24+01:00",
+  "license": {
+   "spdx": "MIT",
+   "declared": "MIT",
+   "osi_approved": true,
+   "enterprise_dirs": [],
+   "enterprise_license_files": []
+  },
+  "loc": {
+   "ts": 2095,
+   "tsx": 0,
+   "js": 2
+  },
+  "files": {
+   "ts": 37,
+   "tsx": 0,
+   "js": 1
+  },
+  "ts_loc_total": 2095,
+  "workspace_packages": 1,
+  "lockfile": "npm",
+  "deps_direct_runtime": 11,
+  "deps_direct_dev": 28,
+  "deps_transitive_unique": 733,
+  "native_known": [
+   "@prisma/engines",
+   "@swc/core",
+   "esbuild",
+   "fsevents",
+   "prisma"
+  ],
+  "native_runtime": [
+   "@prisma/engines",
+   "prisma"
+  ],
+  "install_scripts": [
+   "@prisma/client",
+   "@prisma/engines",
+   "@swc/core",
+   "esbuild",
+   "fsevents",
+   "nx",
+   "prisma"
+  ],
+  "prebuilt_platform_binaries": [
+   "@nx/nx",
+   "@swc/core"
+  ],
+  "binding_gyp_in_repo": [],
+  "node_builtins": {},
+  "decorators": {
+   "count": 0,
+   "files": 0
+  },
+  "frontend": [],
+  "backend": [
+   "express"
+  ],
+  "orm": [
+   "@prisma/client"
+  ],
+  "prisma_version": "^4.16.1",
+  "prisma_rust_engine": true,
+  "test_frameworks": [
+   "jest"
+  ],
+  "tests": {
+   "files": 5,
+   "cases": 27,
+   "e2e_files": 1,
+   "e2e_cases": 1
+  },
+  "services": [
+   "prisma:postgresql"
+  ],
+  "repo": "gothinkster/node-express-realworld-example-app",
+  "tier": 1
+ },
+ {
+  "sha": "c1c2cc4e448b279ff083272df1ac50d20c3304fa",
+  "last_commit": "2021-01-18T09:24:16+01:00",
+  "license": {
+   "spdx": "ISC",
+   "declared": "ISC",
+   "osi_approved": true,
+   "enterprise_dirs": [],
+   "enterprise_license_files": []
+  },
+  "loc": {
+   "ts": 967,
+   "tsx": 0,
+   "js": 2
+  },
+  "files": {
+   "ts": 35,
+   "tsx": 0,
+   "js": 1
+  },
+  "ts_loc_total": 967,
+  "workspace_packages": 1,
+  "lockfile": "npm",
+  "deps_direct_runtime": 22,
+  "deps_direct_dev": 10,
+  "deps_transitive_unique": 664,
+  "native_known": [
+   "argon2",
+   "fsevents",
+   "nan",
+   "node-addon-api"
+  ],
+  "native_runtime": [
+   "argon2"
+  ],
+  "install_scripts": [],
+  "prebuilt_platform_binaries": [],
+  "binding_gyp_in_repo": [],
+  "node_builtins": {},
+  "decorators": {
+   "count": 123,
+   "files": 23
+  },
+  "frontend": [],
+  "backend": [
+   "@nestjs/core"
+  ],
+  "orm": [
+   "typeorm"
+  ],
+  "prisma_version": null,
+  "prisma_rust_engine": null,
+  "test_frameworks": [
+   "jest",
+   "supertest"
+  ],
+  "tests": {
+   "files": 1,
+   "cases": 1,
+   "e2e_files": 0,
+   "e2e_cases": 0
+  },
+  "services": [],
+  "repo": "lujakob/nestjs-realworld-example-app",
+  "tier": 1
+ },
+ {
+  "sha": "0c30a1828af52cf6528d0b3e9ddf86fc459723f6",
+  "last_commit": "2023-04-29T02:54:29+08:00",
+  "license": {
+   "spdx": "MIT",
+   "declared": "MIT",
+   "osi_approved": true,
+   "enterprise_dirs": [],
+   "enterprise_license_files": []
+  },
+  "loc": {
+   "ts": 718,
+   "tsx": 0,
+   "js": 0
+  },
+  "files": {
+   "ts": 26,
+   "tsx": 0,
+   "js": 0
+  },
+  "ts_loc_total": 718,
+  "workspace_packages": 1,
+  "lockfile": "pnpm",
+  "deps_direct_runtime": 19,
+  "deps_direct_dev": 20,
+  "deps_transitive_unique": 951,
+  "native_known": [
+   "fsevents"
+  ],
+  "native_runtime": [],
+  "install_scripts": [
+   "@colors/colors",
+   "@nestjs/core",
+   "@pkgjs/parseargs",
+   "fsevents",
+   "uglify-js"
+  ],
+  "prebuilt_platform_binaries": [],
+  "binding_gyp_in_repo": [],
+  "node_builtins": {
+   "crypto": 1
+  },
+  "decorators": {
+   "count": 39,
+   "files": 13
+  },
+  "frontend": [],
+  "backend": [
+   "@nestjs/core"
+  ],
+  "orm": [
+   "typeorm"
+  ],
+  "prisma_version": null,
+  "prisma_rust_engine": null,
+  "test_frameworks": [
+   "jest",
+   "supertest",
+   "newman"
+  ],
+  "tests": {
+   "files": 6,
+   "cases": 20,
+   "e2e_files": 2,
+   "e2e_cases": 7
+  },
+  "services": [
+   "postgres"
+  ],
+  "repo": "mutoe/nestjs-realworld-example-app",
+  "tier": 1
+ },
+ {
+  "sha": "ec0ff50388c264ed8ce46f00967e92f7e71476ae",
+  "last_commit": "2026-09-16T21:02:41-07:00",
+  "license": {
+   "spdx": "MIT",
+   "declared": "MIT",
+   "osi_approved": true,
+   "enterprise_dirs": [],
+   "enterprise_license_files": []
+  },
+  "loc": {
+   "ts": 90330,
+   "tsx": 30576,
+   "js": 1178
+  },
+  "files": {
+   "ts": 826,
+   "tsx": 536,
+   "js": 18
+  },
+  "ts_loc_total": 120906,
+  "workspace_packages": 3,
+  "lockfile": "pnpm",
+  "deps_direct_runtime": 60,
+  "deps_direct_dev": 31,
+  "deps_transitive_unique": 1162,
+  "native_known": [
+   "@napi-rs/lzma",
+   "@parcel/watcher",
+   "@prisma/engines",
+   "@swc/core",
+   "esbuild",
+   "fsevents",
+   "lightningcss",
+   "node-addon-api",
+   "prisma",
+   "sharp"
+  ],
+  "native_runtime": [
+   "@napi-rs/lzma",
+   "@prisma/engines",
+   "prisma",
+   "sharp"
+  ],
+  "install_scripts": [],
+  "prebuilt_platform_binaries": [
+   "@biomejs/cli",
+   "@img/sharp",
+   "@img/sharp-libvips",
+   "@napi-rs/lzma",
+   "@next/swc",
+   "@parcel/watcher",
+   "@rolldown/binding",
+   "@rollup/rollup",
+   "@swc/core",
+   "lightningcss"
+  ],
+  "binding_gyp_in_repo": [],
+  "node_builtins": {
+   "path": 17,
+   "fs": 16,
+   "crypto": 7,
+   "url": 5,
+   "child_process": 5,
+   "zlib": 3,
+   "https": 3,
+   "util": 2,
+   "module": 2,
+   "tls": 1,
+   "net": 1,
+   "os": 1
+  },
+  "decorators": {
+   "count": 0,
+   "files": 0
+  },
+  "frontend": [
+   "next",
+   "react"
+  ],
+  "backend": [
+   "next"
+  ],
+  "orm": [
+   "@prisma/client"
+  ],
+  "prisma_version": "^7.10.0",
+  "prisma_rust_engine": false,
+  "test_frameworks": [
+   "vitest",
+   "@playwright/test"
+  ],
+  "tests": {
+   "files": 145,
+   "cases": 1134,
+   "e2e_files": 8,
+   "e2e_cases": 38
+  },
+  "services": [
+   "clickhouse",
+   "postgres",
+   "prisma:postgresql"
+  ],
+  "repo": "umami-software/umami",
+  "tier": 2
+ },
+ {
+  "sha": "04f7ce8372ec72682f7d157fe0eb8319bce57d8b",
+  "last_commit": "2026-10-19T22:08:38+08:00",
+  "license": {
+   "spdx": "AGPL-3.0",
+   "declared": null,
+   "osi_approved": true,
+   "enterprise_dirs": [],
+   "enterprise_license_files": []
+  },
+  "loc": {
+   "ts": 60790,
+   "tsx": 72595,
+   "js": 850
+  },
+  "files": {
+   "ts": 568,
+   "tsx": 597,
+   "js": 9
+  },
+  "ts_loc_total": 133385,
+  "workspace_packages": 16,
+  "lockfile": "pnpm",
+  "deps_direct_runtime": 122,
+  "deps_direct_dev": 40,
+  "deps_transitive_unique": 2484,
+  "native_known": [
+   "@napi-rs/lzma",
+   "@prisma/engines",
+   "@swc/core",
+   "esbuild",
+   "fsevents",
+   "lightningcss",
+   "node-addon-api",
+   "prebuild-install",
+   "prisma",
+   "sharp"
+  ],
+  "native_runtime": [
+   "@napi-rs/lzma",
+   "@prisma/engines",
+   "prisma",
+   "sharp"
+  ],
+  "install_scripts": [],
+  "prebuilt_platform_binaries": [
+   "@anthropic-ai/claude-agent-sdk",
+   "@biomejs/cli",
+   "@img/sharp",
+   "@img/sharp-libvips",
+   "@napi-rs/lzma",
+   "@next/swc",
+   "@oxc-parser/binding",
+   "@oxlint/binding",
+   "@rollup/rollup",
+   "@swc/core",
+   "@tailwindcss/oxide",
+   "lightningcss",
+   "turbo"
+  ],
+  "binding_gyp_in_repo": [],
+  "node_builtins": {
+   "crypto": 19,
+   "path": 15,
+   "fs": 10,
+   "url": 5,
+   "http": 4,
+   "net": 3,
+   "child_process": 2,
+   "dns": 2,
+   "module": 1
+  },
+  "decorators": {
+   "count": 0,
+   "files": 0
+  },
+  "frontend": [
+   "next",
+   "react"
+  ],
+  "backend": [
+   "hono",
+   "next",
+   "@trpc/server"
+  ],
+  "orm": [
+   "@prisma/client"
+  ],
+  "prisma_version": "^7.8.0",
+  "prisma_rust_engine": false,
+  "test_frameworks": [
+   "vitest",
+   "@playwright/test"
+  ],
+  "tests": {
+   "files": 142,
+   "cases": 1167,
+   "e2e_files": 0,
+   "e2e_cases": 0
+  },
+  "services": [
+   "postgres",
+   "prisma:postgresql",
+   "redis"
+  ],
+  "repo": "lukevella/rallly",
+  "tier": 2
+ },
+ {
+  "sha": "359177ee9054e5187e8ff66cf11e98cbae3bca70",
+  "last_commit": "2026-10-19T12:05:18+11:00",
+  "license": {
+   "spdx": "AGPL-3.0",
+   "declared": null,
+   "osi_approved": true,
+   "enterprise_dirs": [
+    "packages/ee"
+   ],
+   "enterprise_license_files": []
+  },
+  "loc": {
+   "ts": 146954,
+   "tsx": 101844,
+   "js": 1001
+  },
+  "files": {
+   "ts": 1518,
+   "tsx": 708,
+   "js": 13
+  },
+  "ts_loc_total": 248798,
+  "workspace_packages": 17,
+  "lockfile": "npm",
+  "deps_direct_runtime": 170,
+  "deps_direct_dev": 79,
+  "deps_transitive_unique": 1974,
+  "native_known": [
+   "@datadog/pprof",
+   "@documenso/skia-canvas",
+   "@napi-rs/canvas",
+   "@node-rs/argon2",
+   "@node-rs/bcrypt",
+   "@prisma/engines",
+   "aws-crt",
+   "esbuild",
+   "fsevents",
+   "lightningcss",
+   "msgpackr-extract",
+   "prisma",
+   "sharp"
+  ],
+  "native_runtime": [
+   "@datadog/pprof",
+   "@documenso/skia-canvas",
+   "@napi-rs/canvas",
+   "@node-rs/argon2",
+   "@node-rs/bcrypt",
+   "@prisma/engines",
+   "aws-crt",
+   "msgpackr-extract",
+   "prisma",
+   "sharp"
+  ],
+  "install_scripts": [
+   "@datadog/pprof",
+   "@documenso/skia-canvas",
+   "@playwright/browser-chromium",
+   "@prisma/client",
+   "@prisma/engines",
+   "aws-crt",
+   "core-js",
+   "esbuild",
+   "fsevents",
+   "inngest-cli",
+   "msgpackr-extract",
+   "prisma",
+   "protobufjs"
+  ],
+  "prebuilt_platform_binaries": [
+   "@biomejs/cli",
+   "@img/sharp",
+   "@img/sharp-libvips",
+   "@msgpackr-extract/msgpackr-extract",
+   "@napi-rs/canvas",
+   "@next/swc",
+   "@node-rs/argon2",
+   "@node-rs/bcrypt",
+   "@rollup/rollup",
+   "@tailwindcss/oxide",
+   "@yuku-analyzer/binding",
+   "lightningcss",
+   "syncpack"
+  ],
+  "binding_gyp_in_repo": [],
+  "node_builtins": {
+   "path": 53,
+   "fs": 39,
+   "crypto": 9,
+   "os": 2,
+   "stream": 2,
+   "module": 2,
+   "url": 2,
+   "http": 1,
+   "util": 1,
+   "dns": 1
+  },
+  "decorators": {
+   "count": 1,
+   "files": 1
+  },
+  "frontend": [
+   "next",
+   "react",
+   "react-router",
+   "vite"
+  ],
+  "backend": [
+   "hono",
+   "next",
+   "@trpc/server"
+  ],
+  "orm": [
+   "@prisma/client",
+   "kysely"
+  ],
+  "prisma_version": "^6.19.0",
+  "prisma_rust_engine": true,
+  "test_frameworks": [
+   "vitest",
+   "@playwright/test"
+  ],
+  "tests": {
+   "files": 18,
+   "cases": 256,
+   "e2e_files": 157,
+   "e2e_cases": 1255
+  },
+  "services": [
+   "postgres",
+   "prisma:postgresql",
+   "redis"
+  ],
+  "repo": "documenso/documenso",
+  "tier": 2
+ },
+ {
+  "sha": "dff810b69dad25c3ad21429b4a011f6c0b2cf4d3",
+  "last_commit": "2026-10-18T19:21:55-07:00",
+  "license": {
+   "spdx": "AGPL-3.0",
+   "declared": "AGPL-3.0-or-later",
+   "osi_approved": true,
+   "enterprise_dirs": [],
+   "enterprise_license_files": []
+  },
+  "loc": {
+   "ts": 253400,
+   "tsx": 269490,
+   "js": 321
+  },
+  "files": {
+   "ts": 2581,
+   "tsx": 2082,
+   "js": 9
+  },
+  "ts_loc_total": 522890,
+  "workspace_packages": 12,
+  "lockfile": "pnpm",
+  "deps_direct_runtime": 185,
+  "deps_direct_dev": 45,
+  "deps_transitive_unique": 2819,
+  "native_known": [
+   "@prisma/engines",
+   "@swc/core",
+   "esbuild",
+   "fsevents",
+   "node-addon-api",
+   "node-gyp",
+   "prebuild-install",
+   "prisma",
+   "sharp",
+   "sqlite3"
+  ],
+  "native_runtime": [
+   "@prisma/engines",
+   "prisma",
+   "sharp",
+   "sqlite3"
+  ],
+  "install_scripts": [],
+  "prebuilt_platform_binaries": [
+   "@img/sharp",
+   "@img/sharp-libvips",
+   "@next/swc",
+   "@rollup/rollup",
+   "@swc/core",
+   "esbuild",
+   "turbo"
+  ],
+  "binding_gyp_in_repo": [],
+  "node_builtins": {
+   "crypto": 33,
+   "fs": 14,
+   "path": 7,
+   "dns": 6,
+   "url": 2,
+   "net": 2,
+   "http": 1,
+   "child_process": 1,
+   "async_hooks": 1,
+   "zlib": 1
+  },
+  "decorators": {
+   "count": 1,
+   "files": 1
+  },
+  "frontend": [
+   "next",
+   "react",
+   "vite"
+  ],
+  "backend": [
+   "next"
+  ],
+  "orm": [
+   "@prisma/client"
+  ],
+  "prisma_version": "6.19.1",
+  "prisma_rust_engine": true,
+  "test_frameworks": [
+   "vitest",
+   "@playwright/test"
+  ],
+  "tests": {
+   "files": 141,
+   "cases": 1228,
+   "e2e_files": 46,
+   "e2e_cases": 441
+  },
+  "services": [
+   "mailhog",
+   "mysql",
+   "prisma:mysql",
+   "redis"
+  ],
+  "repo": "dubinc/dub",
+  "tier": 2
+ },
+ {
+  "sha": "fff2bd73f9b38a5a5b510ea69a77a470dd1acf56",
+  "last_commit": "2026-10-19T19:49:15+00:00",
+  "license": {
+   "spdx": "AGPL-3.0",
+   "declared": null,
+   "osi_approved": true,
+   "enterprise_dirs": [],
+   "enterprise_license_files": []
+  },
+  "loc": {
+   "ts": 149952,
+   "tsx": 512,
+   "js": 831
+  },
+  "files": {
+   "ts": 1078,
+   "tsx": 11,
+   "js": 17
+  },
+  "ts_loc_total": 150464,
+  "workspace_packages": 12,
+  "lockfile": "pnpm",
+  "deps_direct_runtime": 137,
+  "deps_direct_dev": 104,
+  "deps_transitive_unique": 2698,
+  "native_known": [
+   "@mapbox/node-pre-gyp",
+   "@parcel/watcher",
+   "@swc/core",
+   "bcrypt",
+   "canvas",
+   "cpu-features",
+   "esbuild",
+   "exiftool-vendored",
+   "fsevents",
+   "lightningcss",
+   "msgpackr-extract",
+   "nan",
+   "node-addon-api",
+   "node-gyp",
+   "prebuild-install",
+   "sharp",
+   "ssh2"
+  ],
+  "native_runtime": [
+   "bcrypt",
+   "canvas",
+   "cpu-features",
+   "exiftool-vendored",
+   "msgpackr-extract",
+   "sharp",
+   "ssh2"
+  ],
+  "install_scripts": [],
+  "prebuilt_platform_binaries": [
+   "@img/sharp",
+   "@img/sharp-libvips",
+   "@msgpackr-extract/msgpackr-extract",
+   "@parcel/watcher",
+   "@rolldown/binding",
+   "@rollup/rollup",
+   "@swc/core",
+   "@tailwindcss/oxide",
+   "@typescript/typescript",
+   "@unrs/resolver-binding",
+   "lightningcss"
+  ],
+  "binding_gyp_in_repo": [],
+  "node_builtins": {
+   "fs": 67,
+   "path": 54,
+   "stream": 23,
+   "crypto": 14,
+   "child_process": 12,
+   "os": 11,
+   "timers": 4,
+   "url": 4,
+   "http": 3,
+   "util": 3,
+   "worker_threads": 2,
+   "zlib": 2,
+   "readline": 1
+  },
+  "decorators": {
+   "count": 2789,
+   "files": 248
+  },
+  "frontend": [
+   "react",
+   "svelte",
+   "@sveltejs/kit",
+   "vite"
+  ],
+  "backend": [
+   "express",
+   "@nestjs/core"
+  ],
+  "orm": [
+   "kysely"
+  ],
+  "prisma_version": null,
+  "prisma_rust_engine": null,
+  "test_frameworks": [
+   "vitest",
+   "@playwright/test",
+   "supertest"
+  ],
+  "tests": {
+   "files": 240,
+   "cases": 3022,
+   "e2e_files": 49,
+   "e2e_cases": 482
+  },
+  "services": [
+   "postgres",
+   "valkey"
+  ],
+  "repo": "immich-app/immich",
+  "tier": 3
+ },
+ {
+  "sha": "2f68f32b40c456a7a290a76261f3e0a60b6204ba",
+  "last_commit": "2026-10-19T09:05:24-04:00",
+  "license": {
+   "spdx": "BUSL-1.1",
+   "declared": "Business Source License 1.1",
+   "osi_approved": false,
+   "enterprise_dirs": [],
+   "enterprise_license_files": []
+  },
+  "loc": {
+   "ts": 221520,
+   "tsx": 96548,
+   "js": 2310
+  },
+  "files": {
+   "ts": 1527,
+   "tsx": 745,
+   "js": 55
+  },
+  "ts_loc_total": 318068,
+  "workspace_packages": 1,
+  "lockfile": "yarn",
+  "deps_direct_runtime": 228,
+  "deps_direct_dev": 76,
+  "deps_transitive_unique": 1959,
+  "native_known": [
+   "@datadog/pprof",
+   "@napi-rs/nice",
+   "@swc/core",
+   "aws-crt",
+   "esbuild",
+   "fsevents",
+   "lightningcss",
+   "msgpackr-extract",
+   "nan",
+   "node-addon-api",
+   "node-gyp",
+   "unix-dgram"
+  ],
+  "native_runtime": [
+   "@datadog/pprof",
+   "@napi-rs/nice",
+   "aws-crt",
+   "msgpackr-extract",
+   "unix-dgram"
+  ],
+  "install_scripts": [],
+  "prebuilt_platform_binaries": [
+   "@firecrawl/pdf-inspector",
+   "@msgpackr-extract/msgpackr-extract",
+   "@napi-rs/nice",
+   "@oxc-parser/binding",
+   "@oxfmt/binding",
+   "@oxlint/binding",
+   "@rolldown/binding",
+   "@rollup/rollup",
+   "@swc/core",
+   "@typescript/typescript",
+   "lightningcss"
+  ],
+  "binding_gyp_in_repo": [],
+  "node_builtins": {
+   "crypto": 71,
+   "path": 38,
+   "fs": 22,
+   "stream": 18,
+   "http": 16,
+   "net": 9,
+   "os": 7,
+   "https": 5,
+   "dns": 5,
+   "child_process": 4,
+   "util": 4,
+   "cluster": 3,
+   "querystring": 3,
+   "events": 2,
+   "url": 2,
+   "timers": 2,
+   "async_hooks": 2,
+   "readline": 2,
+   "buffer": 2,
+   "process": 1
+  },
+  "decorators": {
+   "count": 1211,
+   "files": 113
+  },
+  "frontend": [
+   "react",
+   "vite"
+  ],
+  "backend": [
+   "koa"
+  ],
+  "orm": [
+   "sequelize"
+  ],
+  "prisma_version": null,
+  "prisma_rust_engine": null,
+  "test_frameworks": [
+   "vitest"
+  ],
+  "tests": {
+   "files": 339,
+   "cases": 4822,
+   "e2e_files": 0,
+   "e2e_cases": 0
+  },
+  "services": [
+   "postgres",
+   "redis"
+  ],
+  "repo": "outline/outline",
+  "tier": 3
+ },
+ {
+  "sha": "091659c20fdcdef991d330130815732c5fe141b6",
+  "last_commit": "2026-10-19T23:56:27+02:00",
+  "license": {
+   "spdx": "AGPL-3.0",
+   "declared": "AGPL-3.0",
+   "osi_approved": true,
+   "enterprise_dirs": [],
+   "enterprise_license_files": []
+  },
+  "loc": {
+   "ts": 1748913,
+   "tsx": 518378,
+   "js": 10438
+  },
+  "files": {
+   "ts": 27490,
+   "tsx": 5688,
+   "js": 89
+  },
+  "ts_loc_total": 2267291,
+  "workspace_packages": 46,
+  "lockfile": "yarn",
+  "deps_direct_runtime": 312,
+  "deps_direct_dev": 199,
+  "deps_transitive_unique": 4952,
+  "native_known": [
+   "@napi-rs/lzma",
+   "@napi-rs/nice",
+   "@parcel/watcher",
+   "@sentry/profiling-node",
+   "@swc/core",
+   "bcrypt",
+   "canvas",
+   "cpu-features",
+   "esbuild",
+   "fsevents",
+   "lightningcss",
+   "msgpackr-extract",
+   "nan",
+   "node-addon-api",
+   "node-gyp",
+   "prebuild-install",
+   "sharp",
+   "ssh2"
+  ],
+  "native_runtime": [
+   "@napi-rs/lzma",
+   "@napi-rs/nice",
+   "@sentry/profiling-node",
+   "bcrypt",
+   "canvas",
+   "cpu-features",
+   "msgpackr-extract",
+   "sharp",
+   "ssh2"
+  ],
+  "install_scripts": [],
+  "prebuilt_platform_binaries": [
+   "@anthropic-ai/claude-agent-sdk",
+   "@ast-grep/napi",
+   "@cloudflare/workerd",
+   "@img/sharp",
+   "@img/sharp-libvips",
+   "@msgpackr-extract/msgpackr-extract",
+   "@napi-rs/lzma",
+   "@napi-rs/nice",
+   "@next/swc",
+   "@nx/nx",
+   "@openai/codex",
+   "@oxc-parser/binding",
+   "@oxc-resolver/binding",
+   "@oxfmt/binding",
+   "@oxlint/binding",
+   "@parcel/watcher",
+   "@rolldown/binding",
+   "@rollup/rollup",
+   "@rspack/binding",
+   "@swc/core",
+   "@typescript/native-preview",
+   "@unrs/resolver-binding",
+   "lightningcss",
+   "sass-embedded"
+  ],
+  "binding_gyp_in_repo": [],
+  "node_builtins": {
+   "path": 442,
+   "fs": 382,
+   "crypto": 360,
+   "os": 132,
+   "url": 61,
+   "stream": 54,
+   "child_process": 41,
+   "util": 36,
+   "module": 33,
+   "http": 32,
+   "assert": 16,
+   "test": 12,
+   "net": 12,
+   "events": 11,
+   "timers": 10,
+   "https": 9,
+   "process": 6,
+   "readline": 4,
+   "async_hooks": 4,
+   "perf_hooks": 3,
+   "vm": 3,
+   "v8": 2,
+   "dns": 2,
+   "buffer": 2,
+   "zlib": 1,
+   "tty": 1
+  },
+  "decorators": {
+   "count": 17656,
+   "files": 3560
+  },
+  "frontend": [
+   "next",
+   "react",
+   "vite"
+  ],
+  "backend": [
+   "express",
+   "@nestjs/core",
+   "next",
+   "graphql"
+  ],
+  "orm": [
+   "typeorm"
+  ],
+  "prisma_version": null,
+  "prisma_rust_engine": null,
+  "test_frameworks": [
+   "jest",
+   "vitest",
+   "@playwright/test",
+   "supertest"
+  ],
+  "tests": {
+   "files": 4909,
+   "cases": 26889,
+   "e2e_files": 15,
+   "e2e_cases": 28
+  },
+  "services": [
+   "clickhouse",
+   "postgres",
+   "redis"
+  ],
+  "repo": "twentyhq/twenty",
+  "tier": 3
+ },
+ {
+  "sha": "63273f8e599e73f0fb38c0739314e8d46b6bc83d",
+  "last_commit": "2026-09-30T12:59:53+06:00",
+  "license": {
+   "spdx": "MIT",
+   "declared": "MIT",
+   "osi_approved": true,
+   "enterprise_dirs": [],
+   "enterprise_license_files": []
+  },
+  "loc": {
+   "ts": 210655,
+   "tsx": 0,
+   "js": 9448
+  },
+  "files": {
+   "ts": 1089,
+   "tsx": 0,
+   "js": 58
+  },
+  "ts_loc_total": 210655,
+  "workspace_packages": 15,
+  "lockfile": "pnpm",
+  "deps_direct_runtime": 178,
+  "deps_direct_dev": 115,
+  "deps_transitive_unique": 2704,
+  "native_known": [
+   "@napi-rs/canvas",
+   "@parcel/watcher",
+   "@prisma/engines",
+   "argon2",
+   "bcrypt",
+   "esbuild",
+   "fsevents",
+   "isolated-vm",
+   "node-addon-api",
+   "prisma"
+  ],
+  "native_runtime": [
+   "@napi-rs/canvas",
+   "@prisma/engines",
+   "argon2",
+   "bcrypt",
+   "isolated-vm",
+   "prisma"
+  ],
+  "install_scripts": [],
+  "prebuilt_platform_binaries": [
+   "@css-inline/css-inline",
+   "@napi-rs/canvas",
+   "@parcel/watcher",
+   "@rollup/rollup",
+   "@tauri-apps/cli",
+   "@unrs/resolver-binding",
+   "esbuild"
+  ],
+  "binding_gyp_in_repo": [],
+  "node_builtins": {
+   "path": 23,
+   "fs": 17,
+   "process": 9,
+   "child_process": 8,
+   "crypto": 7,
+   "url": 5,
+   "net": 4,
+   "os": 4,
+   "console": 3,
+   "module": 3,
+   "buffer": 1,
+   "http": 1
+  },
+  "decorators": {
+   "count": 1962,
+   "files": 157
+  },
+  "frontend": [
+   "vue",
+   "svelte",
+   "vite"
+  ],
+  "backend": [
+   "express",
+   "@nestjs/core",
+   "graphql",
+   "@apollo/server"
+  ],
+  "orm": [
+   "@prisma/client"
+  ],
+  "prisma_version": "7.9.1",
+  "prisma_rust_engine": false,
+  "test_frameworks": [
+   "jest",
+   "vitest",
+   "mocha",
+   "supertest"
+  ],
+  "tests": {
+   "files": 235,
+   "cases": 3695,
+   "e2e_files": 2,
+   "e2e_cases": 78
+  },
+  "services": [
+   "postgres",
+   "prisma:postgresql"
+  ],
+  "repo": "hoppscotch/hoppscotch",
+  "tier": 3
+ },
+ {
+  "sha": "61c19c3099d58b3b3900da70d92a647c33b09bb5",
+  "last_commit": "2026-10-19T13:31:43+00:00",
+  "license": {
+   "spdx": "MIT",
+   "declared": null,
+   "osi_approved": true,
+   "enterprise_dirs": [],
+   "enterprise_license_files": []
+  },
+  "loc": {
+   "ts": 731301,
+   "tsx": 250089,
+   "js": 28370
+  },
+  "files": {
+   "ts": 6891,
+   "tsx": 3274,
+   "js": 668
+  },
+  "ts_loc_total": 981390,
+  "workspace_packages": 115,
+  "lockfile": "yarn",
+  "deps_direct_runtime": 257,
+  "deps_direct_dev": 136,
+  "deps_transitive_unique": 2303,
+  "native_known": [
+   "@napi-rs/lzma",
+   "@swc/core",
+   "esbuild",
+   "fsevents",
+   "msgpackr-extract",
+   "node-gyp"
+  ],
+  "native_runtime": [
+   "@napi-rs/lzma",
+   "msgpackr-extract"
+  ],
+  "install_scripts": [],
+  "prebuilt_platform_binaries": [
+   "@msgpackr-extract/msgpackr-extract",
+   "@napi-rs/lzma",
+   "@oxc-parser/binding",
+   "@oxc-resolver/binding",
+   "@rollup/rollup",
+   "@swc/core",
+   "@typescript/native-preview",
+   "turbo"
+  ],
+  "binding_gyp_in_repo": [],
+  "node_builtins": {
+   "path": 343,
+   "fs": 197,
+   "timers": 47,
+   "os": 36,
+   "crypto": 28,
+   "url": 28,
+   "child_process": 26,
+   "util": 13,
+   "stream": 10,
+   "events": 9,
+   "http": 5,
+   "module": 3,
+   "process": 2,
+   "perf_hooks": 2,
+   "querystring": 2,
+   "zlib": 1,
+   "cluster": 1,
+   "tls": 1,
+   "net": 1,
+   "vm": 1
+  },
+  "decorators": {
+   "count": 1731,
+   "files": 48
+  },
+  "frontend": [
+   "next",
+   "react",
+   "vite"
+  ],
+  "backend": [
+   "express",
+   "next",
+   "graphql"
+  ],
+  "orm": [
+   "@mikro-orm/core"
+  ],
+  "prisma_version": null,
+  "prisma_rust_engine": null,
+  "test_frameworks": [
+   "jest",
+   "vitest",
+   "supertest"
+  ],
+  "tests": {
+   "files": 1464,
+   "cases": 8539,
+   "e2e_files": 0,
+   "e2e_cases": 0
+  },
+  "services": [
+   "postgres",
+   "redis"
+  ],
+  "repo": "medusajs/medusa",
+  "tier": 3
+ },
+ {
+  "sha": "b30b8ce1406fd22c4f9d8990b46e12b40284ba2e",
+  "last_commit": "2026-10-19T17:04:35+02:00",
+  "license": {
+   "spdx": "MIT",
+   "declared": null,
+   "osi_approved": true,
+   "enterprise_dirs": [
+    "enterprise"
+   ],
+   "enterprise_license_files": [
+    "EE-PACKAGES-LICENSE",
+    "LICENSE-ENTERPRISE"
+   ]
+  },
+  "loc": {
+   "ts": 768273,
+   "tsx": 220151,
+   "js": 9738
+  },
+  "files": {
+   "ts": 7543,
+   "tsx": 1746,
+   "js": 64
+  },
+  "ts_loc_total": 988424,
+  "workspace_packages": 94,
+  "lockfile": "pnpm",
+  "deps_direct_runtime": 438,
+  "deps_direct_dev": 229,
+  "deps_transitive_unique": 5491,
+  "native_known": [
+   "@datadog/pprof",
+   "@mapbox/node-pre-gyp",
+   "@napi-rs/nice",
+   "@sentry/profiling-node",
+   "@swc/core",
+   "bcrypt",
+   "esbuild",
+   "fsevents",
+   "lightningcss",
+   "msgpackr-extract",
+   "nan",
+   "node-addon-api",
+   "sharp"
+  ],
+  "native_runtime": [
+   "@datadog/pprof",
+   "@napi-rs/nice",
+   "@sentry/profiling-node",
+   "bcrypt",
+   "msgpackr-extract",
+   "sharp"
+  ],
+  "install_scripts": [],
+  "prebuilt_platform_binaries": [
+   "@anthropic-ai/claude-agent-sdk",
+   "@biomejs/cli",
+   "@cloudflare/workerd",
+   "@img/sharp",
+   "@img/sharp-libvips",
+   "@msgpackr-extract/msgpackr-extract",
+   "@napi-rs/nice",
+   "@next/swc",
+   "@nx/nx",
+   "@oxc-resolver/binding",
+   "@rolldown/binding",
+   "@rollup/rollup",
+   "@sentry/cli",
+   "@swc/core",
+   "@tailwindcss/oxide",
+   "@unrs/resolver-binding",
+   "lightningcss"
+  ],
+  "binding_gyp_in_repo": [],
+  "node_builtins": {
+   "path": 189,
+   "fs": 164,
+   "crypto": 125,
+   "os": 56,
+   "url": 56,
+   "child_process": 28,
+   "http": 20,
+   "dns": 19,
+   "net": 16,
+   "stream": 13,
+   "timers": 12,
+   "module": 10,
+   "tls": 9,
+   "events": 6,
+   "https": 5,
+   "util": 4,
+   "readline": 3,
+   "async_hooks": 2,
+   "assert": 1
+  },
+  "decorators": {
+   "count": 15360,
+   "files": 1822
+  },
+  "frontend": [
+   "next",
+   "react",
+   "@sveltejs/kit",
+   "solid-js",
+   "vite"
+  ],
+  "backend": [
+   "express",
+   "@nestjs/core",
+   "hono",
+   "next"
+  ],
+  "orm": [
+   "mongoose"
+  ],
+  "prisma_version": null,
+  "prisma_rust_engine": null,
+  "test_frameworks": [
+   "jest",
+   "vitest",
+   "mocha",
+   "@playwright/test",
+   "supertest"
+  ],
+  "tests": {
+   "files": 837,
+   "cases": 7096,
+   "e2e_files": 259,
+   "e2e_cases": 2189
+  },
+  "services": [
+   "clickhouse",
+   "localstack",
+   "mongo",
+   "redis"
+  ],
+  "repo": "novuhq/novu",
+  "tier": 3
+ }
+]
