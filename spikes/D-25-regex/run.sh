@@ -58,4 +58,9 @@ step "catastrophic backtracking"
 node redos-node.mjs > "$W/out/redos.tsv"
 for e in goja quickjs qjswasm regexp2v2 libregexp libregexpopt hybridlre; do ./bin/d25 redos -engine $e -harness harness.js >> "$W/out/redos.tsv"; done
 
-step "done: results in $W/out (diff.md, re2cov.md, t262.md, bench.md, redos.tsv)"
+
+
+step "binary size (stripped linux/amd64 hello-world per engine)"
+(cd go && for d in base re2 regexp2 lre; do go build -ldflags="-s -w" -o "$W/out/size-$d" ./sizes/$d; done)
+ls -l "$W/out"/size-* | awk '{print $5, $NF}' > "$W/out/sizes.txt"
+step "done: results in $W/out (diff.md, re2cov.md, t262.md, bench.md, redos.tsv, sizes.txt)"

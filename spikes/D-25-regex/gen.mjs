@@ -15,7 +15,8 @@ function inputsFor(p, f) {
   try {
     const r = new RandExp(new RegExp(p, f.replace(/[dvy]/g, "")));
     r.defaultRange.add(0xa0, 0x17f); r.max = 6; r.randInt = (a, b) => a + Math.floor(rnd() * (1 + b - a));
-    for (let i = 0; i < 4; i++) { const s = r.gen(); if (ok(s)) { xs.add(s); xs.add(mutate(s)); xs.add("pre " + s + " post"); } }
+    // Every input must be valid UTF-16: a lone surrogate (which a mutation can create) has no Go string form.
+    for (let i = 0; i < 4; i++) { const s = r.gen(); if (ok(s)) { xs.add(s); const m = mutate(s); if (ok(m)) xs.add(m); xs.add("pre " + s + " post"); } }
   } catch {}
   return [...xs];
 }
