@@ -1,7 +1,7 @@
 // Bundles the benchmark for every engine.
 //   ssr.js            stock React 19 renderToString
 //   ssr-join.js       same, with React's `result += chunk` accumulation in
-//                     renderToString replaced by an array join (one-line patch
+//                     renderToString replaced by an array join (a small patch
 //                     for engines without rope strings, such as goja)
 //   ssr-stream.js     renderToReadableStream with a ReadableStream polyfill
 import * as esbuild from "esbuild";

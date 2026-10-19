@@ -11,7 +11,7 @@ Oct 19, 2026 · decision [D-23](../ledger/decisions.md) · ledger [W17-01](../le
 **Recommendation for D-23:**
 
 1. **Make Go-native rendering the SSR path.** W17-03 lowers TSX components to Go, including the *initial render of client components*, not only stateless server components. W17-09 builds on it. W17-07 (React in an embedded engine) drops to a fallback.
-2. **Fallback engine: QuickJS-NG on wazero (`fastschema/qjs`)**, with the one-line join patch (see Method). It is not the fastest per core: modernc is. But modernc serialises every instance on a process-wide `malloc` lock, so it stops scaling at about 1.3× however many cores it gets. QuickJS on wazero scales with cores and isolates each instance's memory. Use the fallback only for components that cannot be lowered, typically JS-only npm component libraries.
+2. **Fallback engine: QuickJS-NG on wazero (`fastschema/qjs`)**, with the join patch (three edits to React's `renderToString`, see Method). It is not the fastest per core: modernc is. But modernc serialises every instance on a process-wide `malloc` lock, so it stops scaling at about 1.3× however many cores it gets. QuickJS on wazero scales with cores and isolates each instance's memory. Use the fallback only for components that cannot be lowered, typically JS-only npm component libraries.
 3. **Thresholds** (on the 28 KB reference page, per core, against Node 22 on the same machine):
    - Go-native SSR path: **≥ 1.5× Node throughput and p99 ≤ Node's**, the PRD's ported-performance target. The hand-written renderer reaches 7.5×, which leaves room for generated code to be up to about 5× slower than hand-written code.
    - Engine fallback: **≥ 25 renders/s and p99 ≤ 100 ms** before a route may use it in production. Today modernc passes (27.6/s, p99 58 ms) and QuickJS on wazero does not (16/s, p99 148 ms). Until it does, the fallback is for low-traffic routes and development.
@@ -19,7 +19,7 @@ Oct 19, 2026 · decision [D-23](../ledger/decisions.md) · ledger [W17-01](../le
 
 ## Results
 
-Medians of 3 runs, 10 s per phase. Ranges are across runs where they matter. "Join" is the bundle with the one-line join patch.
+Medians of 3 runs, 10 s per phase. Ranges are across runs where they matter. "Join" is the bundle with the join patch.
 
 ### Small page (100 rows, 28,123 bytes)
 
@@ -80,7 +80,7 @@ Stripped (`-s -w`), `CGO_ENABLED=0`, a program that evaluates `1+1`; Go-only hel
 
 ### Findings worth carrying into the ledger
 
-- **React's `renderToString` is quadratic in engines without rope strings.** It builds its result with `result += chunk`. On the large page it makes goja about 10× slower (p50 5.8 s vs 0.57 s) and QuickJS on wazero 1.8× slower. modernc's QuickJS is unaffected, and on Node the patch is *slower* (V8 has ropes). The join patch is a 3-line build-time edit (`js/build.mjs`) and should ship with any engine fallback.
+- **React's `renderToString` is quadratic in engines without rope strings.** It builds its result with `result += chunk`. On the large page it makes goja about 10× slower (p50 5.8 s vs 0.57 s) and QuickJS on wazero 1.8× slower. modernc's QuickJS is unaffected, and on Node the patch is *slower* (V8 has ropes). The join patch is three small build-time edits (`js/build.mjs`) and should ship with any engine fallback.
 - **Byte-identical markup from Go is achievable.** The Go renderer has to reproduce these `react-dom/server` rules:
   - `<!-- -->` separators between adjacent text nodes
   - the `useId` format (`_R_2_` in React 19.3)

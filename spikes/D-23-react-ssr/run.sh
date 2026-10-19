@@ -16,7 +16,7 @@ WORK="$WORK" "$HERE/build.sh" >/dev/null
 mkdir -p "$WORK/results"
 D="$WORK/dist"
 
-# Each config is "engine:bundle". ssr-join.js is the one-line join patch (see js/build.mjs).
+# Each config is "engine:bundle". ssr-join.js carries the join patch (see js/build.mjs).
 CONFIGS="${CONFIGS:-node:ssr.js node:ssr-join.js native:- goja:ssr.js goja:ssr-join.js modernc:ssr.js modernc:ssr-join.js qjs-wazero:ssr.js qjs-wazero:ssr-join.js}"
 for run in $(seq 1 "$RUNS"); do
   echo "run $run start: $(cat /proc/loadavg)" >> "$WORK/results/load.txt"
