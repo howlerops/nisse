@@ -14,7 +14,7 @@ mkdir -p "$here/internal/tsgo"
   | xargs -0 -I{} install -D {} "$here/internal/tsgo/{}")
 find "$here/internal/tsgo" -name '*.go' -print0 | xargs -0 sed -i -e "s#github.com/microsoft/TypeScript/tsc/internal/#$mod/internal/tsgo/#g" -e "s#github.com/microsoft/typescript-go/internal/#$mod/internal/tsgo/#g"
 cp "$src/LICENSE" "$here/internal/tsgo/LICENSE"
-cp "$src/../NOTICE.txt" "$here/internal/tsgo/NOTICE.txt" 2>/dev/null || cp "$src/NOTICE.txt" "$here/internal/tsgo/NOTICE.txt" 2>/dev/null || true
+cp "$src/../NOTICE.txt" "$here/internal/tsgo/NOTICE.txt" 2>/dev/null || cp "$src/NOTICE.txt" "$here/internal/tsgo/NOTICE.txt" 2>/dev/null || echo "warning: no NOTICE.txt found; Apache-2.0 requires shipping it" >&2
 # Same dependency versions as upstream.
 awk '/^require \(/{p=1} p{print} /^\)/{if(p){p=0; print ""}}' "$src/go.mod" > "$here/.upstream-require"
 go_line=$(grep '^go ' "$src/go.mod")

@@ -23,7 +23,7 @@ fi
 # at 2026-04-17 for the churn check.
 if [ ! -d "$WORK/ts" ]; then
   git clone -q --filter=blob:none --no-checkout https://github.com/microsoft/TypeScript "$WORK/ts"
-  git -C "$WORK/ts" sparse-checkout set --no-cone '/tsc/*' '!/tsc/testdata/'
+  git -C "$WORK/ts" sparse-checkout set --no-cone '/tsc/*' '!/tsc/testdata/' '/NOTICE.txt'
   git -C "$WORK/ts" checkout -q d7d39da5c4
 fi
 if [ ! -d "$WORK/old-apr17" ]; then

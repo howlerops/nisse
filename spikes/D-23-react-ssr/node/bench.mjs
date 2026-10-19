@@ -66,7 +66,7 @@ if (!isMainThread) {
   const pool = counts.reduce((a, b) => a + b, 0) / (ms / 1000);
 
   console.log(JSON.stringify({
-    engine: "node", bundle, rows: Number(rows), version: process.version, htmlBytes: html.length,
+    engine: "node", bundle, rows: Number(rows), version: process.version, htmlBytes: Buffer.byteLength(html),
     rendersPerSec: lat.length / Number(durSec), p50ms: pct(lat, 0.5), p99ms: pct(lat, 0.99),
     startupMs: starts[5], memPerInstanceMB: perInst / 1048576, pool4RendersPerSec: pool,
     stream: streamOK ? `ok (${sctx.__stream.chunks} chunks)` : "mismatch",
