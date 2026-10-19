@@ -1,6 +1,6 @@
 # Nisse work ledger
 
-Every piece of work needed to ship Nisse v1 (and the v2 npm phase), grouped into waves. The [PRD](../PRD.md) says *what* and *why*; this ledger says *what's left*, in what order, and when each item is done.
+Every piece of work needed to ship Nisse v1 and then the TypeScript parity line (reproducing complex TypeScript apps on the Go runtime), grouped into waves. The [PRD](../PRD.md) says *what* and *why*; this ledger says *what's left*, in what order, and when each item is done.
 
 ## Waves
 
@@ -15,7 +15,16 @@ Every piece of work needed to ship Nisse v1 (and the v2 npm phase), grouped into
 | 6 · Concurrency | [wave-6-concurrency.md](wave-6-concurrency.md) | 3 · Servers and Go interop | Structured async works and doesn't leak |
 | 7 · Go interop and stdlib | [wave-7-interop-stdlib.md](wave-7-interop-stdlib.md) | 3 · Servers and Go interop | Popular Go modules usable through `nisse bind` |
 | 8 · Measurement and release | [wave-8-measure-release.md](wave-8-measure-release.md) | 1 → 3 (runs alongside) | **Public 0.1:** suite 80% and baseline targets, HTTP 90% of Go |
-| 9 · npm escape hatch | [wave-9-npm.md](wave-9-npm.md) | 4 · npm (v2) | 20 popular pure-JS packages pass tests |
+| 9 · npm escape hatch | [wave-9-npm.md](wave-9-npm.md) | 4 · npm escape hatch | 20 popular pure-JS packages pass tests |
+| 10 · Language parity | [wave-10-language-parity.md](wave-10-language-parity.md) | 5 · Language parity | PRD [Language additions](../PRD.md#language-additions) done; built-in fidelity ≥ 95% |
+| 11 · Type-level parity | [wave-11-type-level-parity.md](wave-11-type-level-parity.md) | 5 · Language parity | Agreement with `tsc --strict` ≥ 98% on the supported subset |
+| 12 · Node and Web APIs | [wave-12-node-web-apis.md](wave-12-node-web-apis.md) | 6 · Runtime and npm parity | Ported Node tests ≥ 90% per module |
+| 13 · npm at scale | [wave-13-npm-at-scale.md](wave-13-npm-at-scale.md) | 6 · Runtime and npm parity | Every tier 1 dependency has a working track |
+| 14 · `nisse port` | [wave-14-port-tool.md](wave-14-port-tool.md) | 7 · Porting | Tier 1 app ported; automation ≥ 90% |
+| 15 · Test and verification | [wave-15-test-verification.md](wave-15-test-verification.md) | 7 · Porting | Original tests run; replay parity ≥ 99.9% |
+| 16 · Frameworks | [wave-16-frameworks.md](wave-16-frameworks.md) | 8 · Frameworks | Tier 2 backend passes its tests |
+| 17 · Frontend and SSR | [wave-17-frontend-ssr.md](wave-17-frontend-ssr.md) | 9 · Frontend and SSR | Research gate, then tier 3 as one binary |
+| 18 · Reference ports | [wave-18-reference-ports.md](wave-18-reference-ports.md) | 7 → 9 (one tier per phase) | Tier 3 shipped as one binary, tests passing |
 
 Open and proposed decisions live in [decisions.md](decisions.md).
 
@@ -35,10 +44,28 @@ flowchart LR
     W1 -. "suite drafts" .-> W8["8 Measure + release"]
     W6 --> W8
     W7 --> W8
-    W8 -. "only if suite data says so" .-> W9["9 npm (v2)"]
+    W7 --> W9["9 npm engine"]
+    W8 --> W10["10 Language parity"]
+    W8 --> W11["11 Type-level parity"]
+    W10 --> W12["12 Node + Web APIs"]
+    W9 --> W13["13 npm at scale"]
+    W11 --> W13
+    W12 --> W13
+    W10 --> W14["14 nisse port"]
+    W11 --> W14
+    W13 --> W14
+    W12 --> W15["15 Test + verification"]
+    W14 --> W18["18 Reference ports"]
+    W15 --> W18
+    W13 --> W16["16 Frameworks"]
+    W16 --> W18
+    W13 --> W17["17 Frontend + SSR"]
+    W17 --> W18
 ```
 
-Waves 3 and 4 move together one feature at a time: a feature is done when it is checked, lowered, golden-tested and run end to end, not when one side is written. Wave 8's harness and baselines start during Phase 1, because the Phase 1 gate needs them.
+**Release lines.** Waves 0–8 are v1, ending in the public 0.1. Waves 9–18 are the parity line; nothing in it starts before 0.1 except design notes. Wave 18 runs across phases 7–9: each tier's port is the gate of its phase.
+
+Waves 3 and 4 move together one feature at a time: a feature is done when it is checked, lowered, golden-tested and run end to end, not when one side is written. Wave 8's harness and baselines start during Phase 1, because the Phase 1 gate needs them. Likewise W15-01 (the Jest-compatible test API) starts in Phase 6, because compat packages port their tests with it.
 
 ## How to use it
 

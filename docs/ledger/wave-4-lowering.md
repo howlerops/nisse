@@ -52,6 +52,11 @@ PRD phase 1. The `rt` runtime library, lowering from the checked tree to Go, and
 - [ ] **W4-22** Range analysis to drop overflow checks on loop counters, indexes bounded by length, and constants.
   *Needs:* W4-11. *Done when:* goldens show elided checks; benchmark recorded.
 
+- [ ] **W4-28** Tuples as generated structs with positional fields.
+  *Needs:* W3-33. *Done when:* goldens and end-to-end tests.
+- [ ] **W4-29** Destructuring and spread: field reads, struct construction from spreads, `rt` array helpers.
+  *Needs:* W3-34, W4-10. *Done when:* goldens show plain field reads (no reflection) and end-to-end tests pass.
+
 ## Generated-Go guarantees
 
 - [ ] **W4-19** The emitter never produces unused imports or variables, or anything else `go build` or `go vet` rejects.

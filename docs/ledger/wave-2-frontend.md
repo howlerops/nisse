@@ -10,7 +10,7 @@ PRD phase 1. The full grammar, module system and the diagnostics machinery every
   *Needs:* W1-13. *Done when:* every construct in the PRD's language table appears in it.
 - [ ] **W2-02** Full lexer: all operators, template literals, numeric literal forms (int vs float, `_` separators, hex/octal/binary), comments, CRLF input.
   *Needs:* W2-01. *Done when:* token goldens cover every form, and fuzzing (W2-11) runs clean for an hour.
-- [ ] **W2-03** Full parser: declarations, statements, expressions with TS precedence, type syntax, `inout`/`&x`, `spawn`, `test(...)`.
+- [ ] **W2-03** Full parser: declarations, statements, expressions with TS precedence, type syntax, tuples, destructuring patterns and spread, `inout`/`&x`, `spawn`, `test(...)`.
   *Needs:* W2-02. *Done when:* AST goldens exist for each construct in the grammar.
 - [ ] **W2-04** Parser error recovery, so one run reports several syntax errors instead of stopping at the first.
   *Needs:* W2-03. *Done when:* a file with five unrelated syntax errors reports all five.

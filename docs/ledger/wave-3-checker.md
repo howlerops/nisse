@@ -86,6 +86,13 @@ PRD phase 1. The type checker and every rule in the PRD's [Semantics](../PRD.md#
 - [ ] **W3-29** `try`/`catch`: `e` typed as the union thrown by the block, narrowing, rethrow, unhandled types must escape legally.
   *Needs:* W3-28, W3-21. *Done when:* tests for full handling, partial handling with rethrow, and an illegal escape.
 
+## Tuples, destructuring and spread
+
+- [ ] **W3-33** Tuples: fixed-length tuple types, indexing with literal indexes, tuple returns.
+  *Needs:* W3-16. *Done when:* tests for construction, indexing, an out-of-range literal index error, and `Object.entries`-style tuple use in `for...of`.
+- [ ] **W3-34** Destructuring and spread: object and array patterns with defaults and `...rest` in bindings and parameters; object spread into records; array spread in literals and calls.
+  *Needs:* W3-33, W3-02. *Done when:* tests for each form, including type errors for missing fields and spreading a non-record.
+
 ## Quality and performance
 
 - [ ] **W3-30** Checker test corpus organised by code; CI fails if a registered code has no test.

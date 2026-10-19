@@ -1,13 +1,14 @@
 # Wave 9 · npm escape hatch (v2)
 
-PRD phase 4. Pure-JS npm packages run in an embedded QuickJS-on-wazero engine. Starts only if suite data shows npm access is a top blocker.
+PRD phase 4. Pure-JS npm packages run in an embedded QuickJS-on-wazero engine. No longer conditional since the parity scope change (D-14); [wave 13](wave-13-npm-at-scale.md) builds on it for apps with heavy npm use.
 
 **Gate:** 20 popular pure-JS packages pass their tests through Nisse.
 
-- [ ] **W9-01** Go/no-go: review suite data and user requests; record the decision in [decisions.md](decisions.md).
-  *Needs:* W8-05. *Done when:* the decision is logged.
+- [x] ~~**W9-01** Go/no-go: review suite data and user requests.~~ Dropped: the parity scope change (D-14) commits to npm support; wave 9 is no longer conditional.
+- [ ] **W9-10** Size the engine track against the npm triage of the tier 1 reference app (W13-01): which packages actually need the engine rather than a compat package.
+  *Needs:* W13-01. *Done when:* the list is recorded and drives the W9-06 shim scope.
 - [ ] **W9-02** Engine spike: QuickJS compiled to WASM running on wazero, compared with goja for startup, call overhead and memory.
-  *Needs:* W9-01. *Done when:* numbers recorded and the engine chosen.
+  *Needs:* —. *Done when:* numbers recorded and the engine chosen.
 - [ ] **W9-03** `npm:` import specifier, bundled at build time with esbuild's Go API (D-13) and embedded in the binary.
   *Needs:* W9-02, W2-12. *Done when:* a program importing one package builds into a single binary with no Node installed.
 - [ ] **W9-04** `Js` type: checked conversion with `as T` (traps on mismatch), every call into JS marked `try`.
