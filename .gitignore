@@ -1,0 +1,11 @@
+# Go
+/bin/
+*.test
+*.out
+coverage.*
+# Nisse emit output
+/.nisse/
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
