@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"unicode"
@@ -122,6 +123,7 @@ type tr struct {
 	lastNestedCaps int
 	lastAstral     bool
 	lastOK         bool
+	lastCapNull    bool // last atom is a capturing group whose body can match empty
 	ncaps          int
 }
 
@@ -285,7 +287,7 @@ func (t *tr) term() {
 }
 
 func (t *tr) setAtom(nested int, astral bool) {
-	t.lastNestedCaps, t.lastAstral, t.lastOK = nested, astral, true
+	t.lastNestedCaps, t.lastAstral, t.lastOK, t.lastCapNull = nested, astral, true, false
 }
 
 func (t *tr) quantifier() {
@@ -316,6 +318,9 @@ func (t *tr) quantifier() {
 	}
 	if t.lastNestedCaps > 0 {
 		panic(ineligible("capture inside quantified group"))
+	}
+	if t.lastCapNull {
+		panic(ineligible("quantified capturing group that can match empty"))
 	}
 	if t.lastAstral && !t.u {
 		panic(ineligible("quantified astral literal without u"))
@@ -361,6 +366,7 @@ func (t *tr) braceQuant() (lo, hi, n int, ok bool) {
 func (t *tr) group() {
 	t.i++ // (
 	capsBefore := t.ncaps
+	outStart := t.out.Len()
 	capturing := false
 	switch {
 	case t.peek(0) == '?' && t.peek(1) == ':':
@@ -398,6 +404,12 @@ func (t *tr) group() {
 		nested--
 	}
 	t.setAtom(nested, false)
+	if capturing {
+		frag := t.out.String()[outStart:]
+		re, err := regexp.Compile(`^(?:` + frag + `)`)
+		t.lastCapNull = err != nil || re.MatchString("") || strings.Contains(frag, `\b`) || strings.Contains(frag, `\B`) ||
+			strings.Contains(frag, `\A`) || strings.Contains(frag, `\z`) || strings.Contains(frag, `(?m:`)
+	}
 }
 
 func (t *tr) literal(c rune) {

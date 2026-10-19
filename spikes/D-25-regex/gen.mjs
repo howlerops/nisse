@@ -21,7 +21,9 @@ function inputsFor(p, f) {
 }
 const corpus = JSON.parse(fs.readFileSync(corpusFile, "utf8"));
 for (let i = corpus.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); [corpus[i], corpus[j]] = [corpus[j], corpus[i]]; }
-const picked = corpus.slice(0, +maxP).map(r => ({ src: "npm:" + r.pkg, p: r.pattern, f: r.flags }));
+// Cap patterns per package so one package (date-fns ships hundreds of locale files) can't dominate.
+const perPkg = {}; const picked = [];
+for (const r of corpus) { if (picked.length >= +maxP) break; perPkg[r.pkg] = (perPkg[r.pkg] || 0) + 1; if (perPkg[r.pkg] <= 150) picked.push({ src: "npm:" + r.pkg, p: r.pattern, f: r.flags }); }
 // Feature probes: hand-picked from test262 feature areas so every feature has coverage.
 const probes = [
   ["named-groups", "(?<year>\\d{4})-(?<month>\\d{2})", ""], ["named-groups", "(?<a>x)|(?<b>y)", "g"], ["named-groups", "\\k<w>(?<w>a)", ""],

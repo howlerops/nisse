@@ -5,3 +5,5 @@ bin/
 *.jsonl
 vendored/internal/
 vendored/go.sum
+vendored/go.mod
+vendored/nissedump

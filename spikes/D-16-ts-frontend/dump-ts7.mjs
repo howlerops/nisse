@@ -4,8 +4,10 @@
 // Same output schema as dump-ts6.mjs.
 // TS7_PKG selects the package: ts7 (7.0.2, default) or ts7next (typescript@next).
 const pkg = process.env.TS7_PKG ?? "ts7";
-const { API } = await import(`${pkg}/unstable/sync`);
-const { SyntaxKind } = await import(`${pkg}/unstable/ast`);
+// 7.0.x exports the API under ./unstable/*; 7.1 nightlies moved it to ./sync and ./ast.
+const imp = async (sub) => { try { return await import(`${pkg}/unstable/${sub}`); } catch { return await import(`${pkg}/${sub}`); } };
+const { API } = await imp("sync");
+const { SyntaxKind } = await imp("ast");
 import fs from "node:fs";
 import path from "node:path";
 
@@ -14,7 +16,8 @@ const configPath = path.resolve(configArg);
 const root = path.dirname(configPath);
 const t0 = performance.now();
 const api = new API({ cwd: root, collectTiming: true });
-const snapshot = api.updateSnapshot({ openProjects: [configPath] });
+// 7.0.x: api.updateSnapshot(params); 7.1 nightlies: api.createSnapshot(params).
+const snapshot = api.createSnapshot ? api.createSnapshot({ openProjects: [configPath] }) : api.updateSnapshot({ openProjects: [configPath] });
 const project = snapshot.getProject(configPath);
 const { program, checker } = project;
 const tLoad = performance.now();

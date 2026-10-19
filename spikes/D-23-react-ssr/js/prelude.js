@@ -55,16 +55,24 @@
     };
   }
   if (typeof g.TextDecoder === "undefined") {
-    g.TextDecoder = function () {};
-    g.TextDecoder.prototype.decode = function (b) {
-      if (!b) return "";
+    // UTF-8 decoder; with { stream: true } an incomplete trailing sequence
+    // is kept for the next call, as the real TextDecoder does.
+    g.TextDecoder = function () { this._pending = []; };
+    g.TextDecoder.prototype.decode = function (input, opts) {
+      const b = this._pending.concat(Array.from(input || []));
+      this._pending = [];
+      const stream = !!(opts && opts.stream);
       let s = "", i = 0;
       while (i < b.length) {
-        let c = b[i++];
-        if (c >= 0xf0) c = ((c & 7) << 18) | ((b[i++] & 63) << 12) | ((b[i++] & 63) << 6) | (b[i++] & 63);
-        else if (c >= 0xe0) c = ((c & 15) << 12) | ((b[i++] & 63) << 6) | (b[i++] & 63);
-        else if (c >= 0xc0) c = ((c & 31) << 6) | (b[i++] & 63);
+        const c0 = b[i];
+        const need = c0 >= 0xf0 ? 4 : c0 >= 0xe0 ? 3 : c0 >= 0xc0 ? 2 : 1;
+        if (i + need > b.length && stream) { this._pending = b.slice(i); break; }
+        let c = c0;
+        if (need === 4) c = ((c0 & 7) << 18) | ((b[i + 1] & 63) << 12) | ((b[i + 2] & 63) << 6) | (b[i + 3] & 63);
+        else if (need === 3) c = ((c0 & 15) << 12) | ((b[i + 1] & 63) << 6) | (b[i + 2] & 63);
+        else if (need === 2) c = ((c0 & 31) << 6) | (b[i + 1] & 63);
         s += String.fromCodePoint(c);
+        i += need;
       }
       return s;
     };

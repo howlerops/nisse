@@ -65,6 +65,12 @@ func main() {
 		bench(*engine, *cases, *harness, *text, *runs, *out)
 	case "redos":
 		redos(*engine, *harness)
+	case "re2cov":
+		re2cov(*cases, *out)
+	case "t262":
+		t262(*engine, *text, *out)
+	case "t262report":
+		t262Report(fs.Args(), *out)
 	default:
 		fmt.Fprintln(os.Stderr, "unknown command", cmd)
 		os.Exit(2)
@@ -177,6 +183,13 @@ func classify(engine, truthJSON, gotJSON string) string {
 	if _, ok := tv["to"]; ok {
 		return "skip" // Node itself timed out
 	}
+	if _, ok := tv["ce"]; ok {
+		// Node rejects the pattern; the engine must reject it too.
+		if _, ok := gv["ce"]; ok {
+			return "pass"
+		}
+		return "fail"
+	}
 	if ce, ok := gv["ce"]; ok {
 		if s, _ := ce.(string); strings.HasPrefix(s, "ineligible") || strings.HasPrefix(s, "runtime fallback") {
 			return "na"
@@ -189,7 +202,7 @@ func classify(engine, truthJSON, gotJSON string) string {
 	if _, ok := gv["err"]; ok {
 		return "fail"
 	}
-	native := engine == "regexp2v1" || engine == "regexp2v2" || engine == "re2fast" || engine == "hybrid"
+	native := engine == "regexp2v1" || engine == "regexp2v2" || engine == "re2fast" || engine == "hybrid" || engine == "libregexp" || engine == "hybridlre"
 	if native {
 		if reflect.DeepEqual(tv["m"], gv["m"]) {
 			return "pass"
@@ -225,7 +238,10 @@ func diff(casesPath, truthPath string, engines []string, out string) {
 		r := &row{engine: name, byFeat: map[string]*tally{}, pats: map[string][2]int{}}
 		for i, c := range cs {
 			var feats []string
-			if strings.HasPrefix(c.Src, "probe:") {
+			post22 := c.Src == "probe:duplicate-named-groups" || c.Src == "probe:modifiers"
+			if post22 {
+				feats = []string{"zz ES2025, not in Node 22: " + strings.TrimPrefix(c.Src, "probe:")}
+			} else if strings.HasPrefix(c.Src, "probe:") {
 				feats = []string{"probe/" + strings.TrimPrefix(c.Src, "probe:")}
 			} else {
 				feats = []string{"npm (all)"}
@@ -266,7 +282,9 @@ func diff(casesPath, truthPath string, engines []string, out string) {
 				}
 				r.pats[f] = pp
 			}
-			r.total.add(pt)
+			if !post22 {
+				r.total.add(pt)
+			}
 		}
 		rows = append(rows, r)
 	}

@@ -40,6 +40,10 @@ func newEngine(name string, harness string) (Engine, error) {
 		return &nativeEngine{kind: "re2"}, nil
 	case "hybrid":
 		return &nativeEngine{kind: "hybrid"}, nil
+	case "libregexp":
+		return newLRE(), nil
+	case "hybridlre":
+		return &hybridLRE{re2: &nativeEngine{kind: "re2"}, lre: newLRE()}, nil
 	}
 	return nil, fmt.Errorf("unknown engine %q", name)
 }
@@ -234,7 +238,7 @@ func (n *nativeEngine) compile(p, f string) *compiled {
 			pat = astralToSurrogateEscapes(p)
 		}
 		if n.kind == "v1" {
-			o := regexp2.ECMAScript
+			o := regexp2.RegexOptions(regexp2.ECMAScript)
 			if strings.Contains(f, "i") {
 				o |= regexp2.IgnoreCase
 			}
@@ -295,11 +299,11 @@ func astralToSurrogateEscapes(p string) string {
 }
 
 type rec struct {
-	I  int        `json:"i"`
-	C  []*string  `json:"c"`
-	Li int        `json:"li"`
-	G  [][]any    `json:"g,omitempty"`
-	D  [][]int    `json:"d,omitempty"`
+	I  int       `json:"i"`
+	C  []*string `json:"c"`
+	Li int       `json:"li"`
+	G  [][]any   `json:"g,omitempty"`
+	D  [][]int   `json:"d,omitempty"`
 }
 
 // match is one engine-neutral match: utf16 start/end per group (-1 if unset) plus text.
@@ -592,3 +596,33 @@ func (in *input) execRegexp2(c *compiled, start int) (*match, error) {
 }
 
 var _ = os.Stderr
+
+// hybridLRE is the candidate design: the RE2 fast path when the translator and
+// the runtime checks allow it, QuickJS libregexp otherwise.
+type hybridLRE struct {
+	re2 *nativeEngine
+	lre *lreEngine
+}
+
+func (h *hybridLRE) useRE2(p, f, s string) (*compiled, bool) {
+	c := h.re2.compile(p, f)
+	if c.re2 == nil {
+		return c, false
+	}
+	if c.plan.astralUnsafe && strings.IndexFunc(s, func(r rune) bool { return r > 0xFFFF }) >= 0 {
+		return c, false
+	}
+	if c.plan.lineTermMode && strings.ContainsAny(s, "\r\u2028\u2029") {
+		return c, false
+	}
+	return c, true
+}
+
+func (h *hybridLRE) Run(p, f, s string) string {
+	if _, ok := h.useRE2(p, f, s); ok {
+		return h.re2.Run(p, f, s)
+	}
+	return h.lre.Run(p, f, s)
+}
+
+func (h *hybridLRE) Close() { h.lre.Close() }
