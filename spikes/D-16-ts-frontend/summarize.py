@@ -22,6 +22,7 @@ print()
 print("| Comparison | Identifiers | Exact | Cosmetic | Type-position (API) | Real difference | Symbols agree |")
 print("| --- | --- | --- | --- | --- | --- | --- |")
 for p in sorted(glob.glob(os.path.join(out, "cmp-*.json"))):
+    if not __import__("re").fullmatch(r"cmp-(rw|im)-(ts6|ts7|ts7next|vend)-(ts7next|vend|vend-j4)\.json", os.path.basename(p)): continue  # bench.sh pairs only
     d = json.load(open(p)); c = d.get("classes", {}); g = lambda k: f"{c[k]['pct']:.2f}%" if k in c else "0%"
     name = os.path.basename(p)[4:-5]
     print(f"| {name} | {d['common']} | {g('exact')} | {g('cosmetic (order or lib path)')} | {g('type-position identifier, same symbol (API difference)')} | {g('real difference')} | {d['s']['agree_pct']:.2f}% |")

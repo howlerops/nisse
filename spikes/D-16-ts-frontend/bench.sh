@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 # Run every option RUNS times on each project, then compare outputs.
 # Usage: WORK=... RUNS=5 ./bench.sh      (run ./setup.sh first with the same WORK)
+#        ONLY=B ./bench.sh appends runs of one option family (A, B or C) to the existing log.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 WORK="${WORK:-${TMPDIR:-/tmp}/nisse-d16}"
 RUNS="${RUNS:-5}"
-out="$here/out"; mkdir -p "$out"; log="$out/bench.log"; : > "$log"
+out="$here/out"; mkdir -p "$out"; log="$out/bench.log"
+ONLY="${ONLY:-}"; [ -z "$ONLY" ] && : > "$log"
 declare -A cfg=([rw]="$WORK/proj/rw/tsconfig.app.json" [im]="$WORK/proj/immich/server/tsconfig.json")
 run() { # label outfile cmd...
   local label=$1 file=$2; shift 2
-  "$here/bin/measure" "$label" "$@" 2>&1 | grep -E '^\{"option"|^MEASURE' | sed "s/^/$label\t/" >> "$log"
+  [ -n "$ONLY" ] && [[ "$label" != *" $ONLY"* ]] && return 0
+  "$here/bin/measure" "$label" "$@" 2>&1 | grep -E '^\{"|^MEASURE' | sed "s/^/$label\t/" >> "$log"
 }
 for p in rw im; do
   for i in $(seq "$RUNS"); do

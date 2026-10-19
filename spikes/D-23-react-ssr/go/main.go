@@ -36,7 +36,14 @@ func main() {
 	dump := flag.String("dump", "", "write one render's HTML here")
 	rows := flag.Int("rows", 800, "table rows: 800 (~220 KB page) or 100 (~28 KB page)")
 	bundle := flag.String("bundle", "ssr.js", "bundle in dist to render: ssr.js (stock) or ssr-join.js (join patch)")
+	poolOnly := flag.Int("pool-only", 0, "if > 0, only measure a pool of this many instances (scaling check)")
 	flag.Parse()
+	if *poolOnly > 0 {
+		f, err := newFactory(*engine, *dist+"/"+*bundle, *rows)
+		check(err)
+		fmt.Printf("{\"engine\":%q,\"bundle\":%q,\"rows\":%d,\"pool\":%d,\"rendersPerSec\":%.1f}\n", *engine, *bundle, *rows, *poolOnly, pool(f, *poolOnly, *dur))
+		return
+	}
 
 	f, err := newFactory(*engine, *dist+"/"+*bundle, *rows)
 	check(err)
@@ -115,8 +122,16 @@ func main() {
 	}
 
 	// Pool: 4 goroutines, one instance each.
+	res.Pool4PerSec = pool(f, 4, *dur)
+
+	out, _ := json.Marshal(res)
+	fmt.Println(string(out))
+}
+
+// pool runs n instances on n goroutines and returns total renders per second.
+func pool(f factory, n int, d time.Duration) float64 {
 	var wg sync.WaitGroup
-	counts := make([]int, 4)
+	counts := make([]int, n)
 	for i := range counts {
 		e, err := f()
 		check(err)
@@ -124,8 +139,8 @@ func main() {
 		go func() {
 			defer wg.Done()
 			defer e.Close()
-			loop(e, *dur/5) // warm-up
-			counts[i] = len(loop(e, *dur))
+			loop(e, d/5) // warm-up
+			counts[i] = len(loop(e, d))
 		}()
 	}
 	wg.Wait()
@@ -133,10 +148,7 @@ func main() {
 	for _, c := range counts {
 		total += c
 	}
-	res.Pool4PerSec = float64(total) / dur.Seconds()
-
-	out, _ := json.Marshal(res)
-	fmt.Println(string(out))
+	return float64(total) / d.Seconds()
 }
 
 func loop(e Engine, d time.Duration) []float64 {
