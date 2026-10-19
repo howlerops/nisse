@@ -6,10 +6,17 @@ PRD phase 7. The TypeScript → Nisse translator described in the PRD's [How a p
 
 ## Foundations
 
-- [ ] **W14-01** TypeScript front end (D-16): spike typescript-go through its API against our own TS-shaped parser plus a type dump from `tsc`; choose on fidelity, speed and API stability.
-  *Needs:* W11-14. *Done when:* the choice is recorded in D-16 with the spike numbers.
+- [x] **W14-01** TypeScript front end (D-16): spike the options and choose. Done by the [D-16 spike](../spikes/D-16-ts-frontend.md): vendor TypeScript 7's Go compiler.
+- [ ] **W14-19** Vendoring pipeline: script that copies TypeScript's `tsc/internal/` at a release tag into the module with no source patches, keeps LICENSE and NOTICE, marks modified files, and records the upstream commit.
+  *Needs:* W0-01. *Done when:* upgrading to a new TypeScript minor is one script run plus fixing compile errors.
+- [ ] **W14-20** Type cross-check in CI: compare the vendored compiler's types against the official TypeScript 7 API on the port corpus, for every TypeScript upgrade.
+  *Needs:* W14-19, W14-18. *Done when:* runs in CI; any difference fails the upgrade.
+- [ ] **W14-21** TSX fidelity: repeat the D-16 comparison on a TSX project (the tier 2 app), since neither spike project used JSX.
+  *Needs:* W14-19. *Done when:* zero type differences between the vendored compiler and the API.
+- [ ] **W14-22** Binary size and license audit: measure what the vendored compiler adds to the `nisse` binary, and have the Apache-2.0 NOTICE handling reviewed.
+  *Needs:* W14-19. *Done when:* both are recorded in the report.
 - [ ] **W14-02** Project loader: `tsconfig.json` (including `extends`, `paths`, strictness flags, module settings), `package.json`, monorepos and workspaces.
-  *Needs:* W14-01. *Done when:* the three reference app candidates load with full type information.
+  *Needs:* W14-19. *Done when:* the three reference app candidates load with full type information.
 - [ ] **W14-03** Translation rules table: one entry per TypeScript construct, marked direct, rewrite-with-record, or `port` diagnostic. It drives the translator, the port report and the docs.
   *Needs:* waves 10–11. *Done when:* covers every construct in the TypeScript grammar; generated into `docs/spec/port-rules.md`.
 - [ ] **W14-04** Translator core: TypeScript AST plus types → Nisse AST → printed `.nis`, keeping comments, blank lines and layout through `nisse fmt` (D-06).

@@ -67,8 +67,16 @@ PRD phase 5. The TypeScript features v1 leaves out, added back with Go lowerings
 
 ## Strings, regex, dates
 
-- [ ] **W10-20** Regex literals and `nisse:regex` with JavaScript semantics: flags `d g i m s u v y`, named groups, lookbehind, backreferences; RE2 fast path when the pattern allows; `replace`/`match`/`matchAll`/`split`/`search` with regexes (D-25).
-  *Needs:* W3-08. *Done when:* test262 `RegExp` subset at ≥ 95%.
+- [ ] **W10-20** Regex literals and `nisse:regex` with JavaScript semantics: flags `d g i m s u v y`, named groups, lookbehind, backreferences; `replace`/`match`/`matchAll`/`split`/`search` with regexes. Engine per D-25: RE2 for eligible patterns, `libregexp` for the rest.
+  *Needs:* W3-08, W10-35, W10-36. *Done when:* test262 `RegExp` subset at ≥ 95%, and the D-25 corpus matches Node 100%.
+- [ ] **W10-35** RE2 fast path: vendored Go `regexp` with the mid-string start patch, the eligibility rule from the D-25 report (no lookaround, backreferences, captures in loops, `v` flag or divergent case folding; `\p{…}` goes to `libregexp`), and the per-input checks for astral characters and line terminators.
+  *Needs:* W4-01. *Done when:* differential tests against Node show identical results on every pattern RE2 accepts.
+- [ ] **W10-36** `libregexp` integration: transpile only the regex sources (not all of QuickJS) to cut the 3.2 MB size cost; one engine context per worker; fuzz the wrapper.
+  *Needs:* W4-01. *Done when:* size cost under 1 MB, and 24 hours of fuzzing find no memory errors.
+- [ ] **W10-37** Regex prefilters: sticky compilation for `^`-anchored patterns, required-literal and end-anchor skips, to close the p90 gap to Node.
+  *Needs:* W10-36. *Done when:* p90 slowdown vs Node on the D-25 benchmark halves.
+- [ ] **W10-38** Regex timeout policy: optional per-regex match timeout (JavaScript has none, so off by default), and a `W`-code lint for patterns at risk of catastrophic backtracking that RE2 cannot take.
+  *Needs:* W10-35. *Done when:* the four D-25 catastrophic patterns are flagged or bounded.
 - [ ] **W10-21** UTF-16 string views and JavaScript-compatible string methods: `utf16Length()`, `utf16At(i)`, `charCodeAt`, `codePointAt`, `normalize`, `localeCompare`, `padStart`, and the rest of `String.prototype`.
   *Needs:* W3-08. *Done when:* test262 `String` subset at ≥ 95%.
 - [ ] **W10-22** `Date` with JavaScript semantics: parsing formats, local time and UTC, `toISOString`, getters and setters, invalid dates.

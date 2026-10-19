@@ -23,6 +23,8 @@ PRD phase 6. The four npm tracks from the PRD's [npm at scale](../PRD.md#npm-at-
   *Needs:* W13-04. *Done when:* each passes ≥ 90% of tests ported from the original package.
 - [ ] **W13-06** Compat packages, second batch: the list comes from the tier 2 and tier 3 triage reports.
   *Needs:* W13-01, W13-05. *Done when:* each passes ≥ 90% of its ported tests.
+- [ ] **W13-14** Media for tier 3: a `sharp` compat package on a cgo-free Go image pipeline, with the HEIC/RAW gap measured; `exiftool` and `ffmpeg` stay external programs.
+  *Needs:* W13-04. *Done when:* Immich's thumbnail tests pass, or the gap is recorded and the Hoppscotch fallback is triggered.
 - [ ] **W13-10** Fidelity tests: tooling to port a package's own test suite (Jest, Mocha, Vitest) against its compat package.
   *Needs:* W15-01. *Done when:* used by every package in W13-05.
 

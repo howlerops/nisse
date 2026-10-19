@@ -4,6 +4,15 @@ PRD phase 8. The backend frameworks and libraries complex apps are built on, as 
 
 **Gate (with wave 18):** the tier 2 reference app's backend passes its tests.
 
+## Tier 1 minimums (Phase 7)
+
+The tier 1 port gates Phase 7, before the full framework work in Phase 8, so it needs early, narrow versions of two items.
+
+- [ ] **W16-14** Express, tier 1 subset: routing, routers, middleware chain, error middleware, JSON body parsing and the `req`/`res` members the tier 1 app uses. W16-01 extends it.
+  *Needs:* W12-09, W13-04. *Done when:* the tier 1 app's routes run on it.
+- [ ] **W16-15** Prisma client, tier 1 subset: client generated from the tier 1 `schema.prisma` on Postgres, covering the queries that app makes. W16-05 extends it.
+  *Needs:* W13-04. *Done when:* the tier 1 app's data layer passes its tests on it.
+
 ## HTTP frameworks
 
 - [ ] **W16-01** Express: routing, middleware chain, `req`/`res` API, error middleware, routers, static files, body parsers; on `node:http` (W12-09).

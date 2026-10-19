@@ -248,7 +248,7 @@ The target is a complex TypeScript app reproduced on the Go runtime: a Node back
 
 ### How a port works
 
-1. **Load** the TypeScript project (`tsconfig.json`, `package.json`, workspaces) and get full type information from TypeScript's own checker (D-16).
+1. **Load** the TypeScript project (`tsconfig.json`, `package.json`, workspaces) and get full type information from TypeScript's own checker: the TypeScript 7 Go compiler, vendored into the Nisse module and called as a library (D-16).
 2. **Translate** construct by construct from a rules table. Each rule either emits Nisse directly, emits Nisse with a recorded semantic rewrite (for example `s.length` → `s.utf16Length()`), or leaves a `port` diagnostic for an agent or a human.
 3. **Resolve dependencies.** Every npm package goes to the first track that works: a Go-native compat package, a port of its TypeScript source, the embedded JS engine, or a flagged blocker (see [npm at scale](#npm-at-scale)).
 4. **Translate the tests.** Jest and Vitest suites become `nisse test` suites with the same API.
@@ -276,7 +276,7 @@ The target is a complex TypeScript app reproduced on the Go runtime: a Node back
 | Generators, iterators, `for await`, async generators | `iter.Seq` and `iter.Pull`; channels with a context for async | |
 | `.then`/`.catch`/`.finally`, `new Promise((resolve, reject) => …)` | `rt.Future` methods; resolver functions bridged to the future | Needed to port callback-style APIs |
 | Decorators: TC39 standard, plus legacy `experimentalDecorators` with `emitDecoratorMetadata` | Registration code and static metadata tables generated at compile time | NestJS, TypeORM and class-validator need the legacy form |
-| Regex literals and JavaScript regex semantics | `nisse:regex`: Go's RE2 when the pattern is compatible, an ECMAScript-compatible backtracking engine otherwise | Lookbehind, backreferences and named groups behave as in JavaScript |
+| Regex literals and JavaScript regex semantics | `nisse:regex`: Go's RE2 when the pattern provably gives identical results, QuickJS's `libregexp` (transpiled to Go, no cgo) otherwise (D-25) | Lookbehind, backreferences and named groups behave as in JavaScript |
 | UTF-16 string views | `utf16Length()`, `utf16At(i)`, `charCodeAt` | Used by `nisse port` unless it can prove the text is ASCII |
 | `Date` and an `Intl` subset | `nisse:time` with JavaScript `Date` semantics; `Intl` on `golang.org/x/text` | |
 | Default exports, `import * as`, re-exports, barrels, `tsconfig` path aliases, JSON imports, top-level `await` | Module graph resolved by the compiler; an `rt` init sequence reproduces ESM evaluation order | |
@@ -335,23 +335,28 @@ Backend frameworks and libraries a complex app is built on, as compat packages w
 
 ### Frontend and SSR
 
-This is the highest-risk part of the plan and is gated on a research spike (D-23). The approach:
+This is the highest-risk part of the plan. The D-23 spike ([report](spikes/D-23-react-ssr.md)) measured React 19 server rendering: a Go renderer produced byte-identical HTML 7.5× faster than Node, while the best cgo-free embedded JS engine was about 50× slower than Node. So the main path renders in Go, and the embedded engine is only a fallback. The approach:
 
-- **TSX in Nisse**, with JSX components rendered to streaming HTML in Go on the server: for templates and server components without client state.
+- **TSX in Nisse, rendered in Go.** JSX components, including the first render of client components, lower to Go that streams HTML byte-identical to `react-dom/server`, so React hydrates it in the browser without mismatches.
 - **Client code stays TypeScript and React.** The build bundles it with an embedded esbuild and embeds the assets in the binary, so a full-stack app still ships as one binary.
 - **Shared modules** (types, validation, utilities) compile to both Go and JavaScript, through a small second emitter from Nisse to JS, plus `.d.ts` output for Nisse types.
-- **React SSR with hydration** runs React in the embedded JS engine, for apps that need the React tree rendered on the server. It is measured against Node before the scope is committed.
+- **Embedded-engine fallback** for components that cannot be translated, typically JS-only npm component libraries: React runs in QuickJS on wazero, with a build-time patch for a quadratic string-building hotspot in `react-dom/server`. It must reach 25 pages/s per core with p99 ≤ 100 ms on the benchmark page before production use; until then it serves low-traffic routes and development.
+- **Node sidecar** only as an opt-in, off by default, for apps whose server rendering depends on untranslatable components and needs more throughput than the fallback gives.
 - **Next.js-style apps** (file-system routing, route handlers, middleware, server components, server actions) port onto a Nisse framework. The exact scope is decided after the tier 2 reference port.
 
 ### Reference apps
 
-Each parity phase is gated on porting a public open-source TypeScript app. Candidates, to confirm for license, size and test suite in W18-01 (D-15):
+Each parity phase is gated on porting a public open-source TypeScript app. Chosen by measuring 13 candidates in the D-15 spike ([report](spikes/D-15-reference-apps.md)), each pinned to a commit:
 
-| Tier | Candidate | Why |
+| Tier | App | Why |
 | --- | --- | --- |
-| 1 | A RealWorld ("Conduit") backend in TypeScript (Express or NestJS, with Prisma) | Published API spec and API test collection, ideal for replay testing |
-| 2 | A mid-sized full-stack Next.js and Prisma app, such as Umami | SSR, a real ORM schema, a moderate dependency tree |
-| 3 | A large production app, such as Immich's NestJS server or Outline (Koa and React) | Hundreds of dependencies, queues, websockets, a large frontend |
+| 1 | [gothinkster/node-express-realworld-example-app](https://github.com/gothinkster/node-express-realworld-example-app) (Express, Prisma; MIT; 2.1k lines) | Small, no decorators, Postgres only. Its test oracle is the RealWorld API collection from Jan 2024, which it passes 309/311 on Node; the current collection follows a 2026 spec change it predates |
+| 1b (optional) | [mutoe/nestjs-realworld-example-app](https://github.com/mutoe/nestjs-realworld-example-app) (NestJS, TypeORM; MIT) | Same API with decorators: an early check of the NestJS and decorator work |
+| 2 | [umami-software/umami](https://github.com/umami-software/umami) (Next.js, Prisma 7; MIT; 121k lines) | The React SSR test case; smallest dependency tree in its tier; ~1,100 unit tests and its own API test runner |
+| 3 | [immich-app/immich](https://github.com/immich-app/immich) server and web (NestJS, Kysely, BullMQ, socket.io; AGPL-3.0; 103k-line server) | Queues, websockets, Postgres and Valkey, ~3,500 tests. Its web app is a static Svelte SPA, so tier 3 tests scale, not React SSR |
+| 3 fallback | [hoppscotch/hoppscotch](https://github.com/hoppscotch/hoppscotch) backend (NestJS, GraphQL, Prisma 7, Passport; MIT) | Used if Immich's media pipeline blocks the port |
+
+Outline was ruled out: its Business Source License is not open source. Immich's image and video handling uses `sharp` (native libvips) and calls the external `exiftool` and `ffmpeg` programs, so for tier 3 "one binary" means one binary plus those tools.
 
 ### Never supported
 
@@ -423,9 +428,9 @@ The public 0.1 lands after Phase 3, about 22 weeks in. Phases 4–9 are the pari
 | 4 · npm escape hatch | 23–28 | QuickJS on wazero, engine pool, `Js` type, minimal Node shim; pure-JS packages only | 9 | 20 popular pure-JS packages pass tests |
 | 5 · Language parity | 29–38 | [Language additions](#language-additions), [type-level features](#type-level-features), strict and compat profiles | 10, 11 | Type-checker parity ≥ 98%; built-in fidelity ≥ 95% |
 | 6 · Runtime and npm parity | 39–50 | `node:` modules and Web globals; event-loop executor; npm tracks, compat packages, lock file | 12, 13 | Node API fidelity ≥ 90%; every dependency of the tier 1 app has a working track |
-| 7 · Porting | 51–60 | `nisse port`, port report, test translation, replay harness; tier 1 reference port | 14, 15, 18 | Tier 1 app passes its tests and ≥ 99.9% replay parity |
+| 7 · Porting | 51–60 | `nisse port`, port report, test translation, replay harness; minimal Express and Prisma support; tier 1 reference port | 14, 15, 18 | Tier 1 app passes its tests and ≥ 99.9% replay parity |
 | 8 · Frameworks | 61–72 | Express, Fastify, Koa, Hono, NestJS, Prisma and other ORMs, GraphQL, websockets, queues; tier 2 backend | 16, 18 | Tier 2 backend passes its tests |
-| 9 · Frontend and SSR | 73–88 | TSX, server rendering, embedded client bundling, Nisse→JS for shared modules, React SSR, Next.js-style port path; tier 2 frontend and tier 3 | 17, 18 | Tier 3 app ships as one binary and passes its tests |
+| 9 · Frontend and SSR | 73–88 | TSX, server rendering, embedded client bundling, Nisse→JS for shared modules, React SSR, Next.js-style port path; tier 2 frontend and tier 3 | 17, 18 | Tier 2 app renders React in Go with hydration; tier 3 app ships as one binary (plus the media tools it already calls) and passes its tests |
 
 **First two weeks (Phase 0)** — tracked in detail as [wave 0](ledger/wave-0-foundations.md) and [wave 1](ledger/wave-1-spike.md)
 
@@ -453,23 +458,30 @@ The public 0.1 lands after Phase 3, about 22 weeks in. Phases 4–9 are the pari
 | Tov or a big player ships the same thing | Reduced differentiation | Lead on Go interop and Windows; keep the diagnostics contract compatible in spirit |
 | npm demand outweighs Go-first story | Adoption stalls | Ship Phase 4 early as a preview if task-suite data shows npm is the top blocker |
 | Parity work dilutes the v1 bet | The strict, agent-first language never ships | Parity line starts after 0.1; v1 gates unchanged; `strict` stays the default for new code; each parity phase gated on a reference port |
-| TypeScript's Go-based checker has no stable API for `nisse port` to use | Port tool blocked or brittle | D-16: spike both its API and our own TS-shaped parser plus a `tsc` type dump, before building the translator |
+| TypeScript's Go compiler is internal code that changes between releases | Port tool breaks on TypeScript upgrades | D-16: vendor it at a release branch and upgrade deliberately (7.0 → 7.1 cost 8 mechanical compile errors); cross-check types against the official TypeScript 7 API in CI |
 | Ported code depends on subtle JavaScript semantics (aliasing, UTF-16, `null` vs `undefined`, single-threaded execution, regex, `Date`, number formatting) | Port compiles and behaves differently | `Shared<T>`, UTF-16 views, distinct `null`, event-loop executor, ECMAScript regex; test262 and differential fuzzing against Node; replay testing every port |
 | npm long tail | Ports stall on one dependency | Four tracks with a lock file; dependency triage is the first step of every port, so blockers surface on day one |
-| React SSR in an embedded engine is too slow | Frontend parity unusable | Research gate D-23 before committing; Go-rendered server components for the common case |
+| Re-implementing React's server rendering in Go drifts from `react-dom/server` | Hydration mismatches in ported frontends | Byte-for-byte HTML comparison against `react-dom/server` and browser hydration tests in CI, per React release |
+| Transpiled C (`libregexp`, QuickJS) corrupts memory instead of panicking on a bug | Crashes in production | Fuzz the wrappers; one engine context per worker; track upstream QuickJS |
 | Scope too large for one builder | Dates slip by quarters | Gates, not dates; waves 12, 13 and 16 are many small independent items suited to contributors and agents |
 
 **Decisions**
 
 - [x] Name: Nisse. Go module path `github.com/howlerops/nisse` (only a Maven build plugin shares the name; no language does).
 - [ ] Secure a domain for docs and `llms.txt`.
-- [x] Compiler implementation language: Go. Contributors need one language, `nisse bind` reads Go packages directly through `go/types` and `go/packages`, and the tool installs with `go install`. TypeScript's own compiler is being ported to Go for speed, so the 500 ms check target is realistic.
+- [x] Compiler implementation language: Go. Contributors need one language, `nisse bind` reads Go packages directly through `go/types` and `go/packages`, and the tool installs with `go install`. TypeScript's own compiler now ships in Go (TypeScript 7), which keeps the 500 ms check target realistic and lets `nisse port` use it as a library.
 - [x] Integers: `int` is 64-bit and is the default. It lowers to Go `int`, which is 64-bit on every v1 target, so values pass to and from Go's standard library (`len`, indexes, `strconv`) without conversions. Sized types `i8`–`i64` and `u8`–`u64` exist for Go interop and byte work, and `nisse bind` maps Go's sized types onto them. Overflow traps for every integer type. *(Revised in review: previously `int64`.)*
 - [x] Targets: `amd64` and `arm64` on Linux, macOS and Windows. `nisse build` refuses 32-bit targets.
 - [x] Codegen: build Go as `go/ast`, print it with `go/format`; `nisse build` hands generated files to `go build -overlay` and `nisse emit` writes them to disk.
 - [x] Semantics: values and aliasing, mutability, numbers, strings, equality, collections, unions, errors, classes, concurrency and naming as specified in [Semantics](#semantics). Value semantics and the string rules are revisited with Phase 1 benchmark and suite data.
 - [x] License: MIT. QuickJS (MIT) and wazero (Apache-2.0) are compatible for the npm phase.
 - [x] Parity model: Nisse stays strict and widens towards TypeScript with Go lowerings; `nisse port` translates existing apps; a `strict`/`compat` profile sets how strict the checker is (D-14, D-22). Targets: Node backends, heavy npm use, and SSR frontends, measured on public reference apps.
+
+- [x] Decided by spike, Oct 19, 2026 (reports in [docs/spikes](spikes/)):
+  - **Reference apps** (D-15): RealWorld Express+Prisma, Umami, Immich, Hoppscotch as fallback. See [Reference apps](#reference-apps).
+  - **TypeScript front end for `nisse port`** (D-16): vendor TypeScript 7's Go compiler and call it as a library; the official TypeScript 7 API is the fallback and the CI cross-check. On Immich's 93k-line server it was 2.8× faster than the API, with identical types. Nisse's minimum Go version follows TypeScript's (D-09).
+  - **Frontend** (D-23): render TSX in Go; embedded QuickJS as a fallback only; Node sidecar opt-in. See [Frontend and SSR](#frontend-and-ssr).
+  - **Regex** (D-25): RE2 fast path plus QuickJS's `libregexp`, the only engine that matched Node 22 on all 64,585 real-world cases and every test262 test Node passes.
 
 Open and proposed decisions are tracked in the [ledger's decision log](ledger/decisions.md).
 

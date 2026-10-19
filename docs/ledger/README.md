@@ -23,7 +23,7 @@ Every piece of work needed to ship Nisse v1 and then the TypeScript parity line 
 | 14 · `nisse port` | [wave-14-port-tool.md](wave-14-port-tool.md) | 7 · Porting | Tier 1 app ported; automation ≥ 90% |
 | 15 · Test and verification | [wave-15-test-verification.md](wave-15-test-verification.md) | 7 · Porting | Original tests run; replay parity ≥ 99.9% |
 | 16 · Frameworks | [wave-16-frameworks.md](wave-16-frameworks.md) | 8 · Frameworks | Tier 2 backend passes its tests |
-| 17 · Frontend and SSR | [wave-17-frontend-ssr.md](wave-17-frontend-ssr.md) | 9 · Frontend and SSR | Research gate, then tier 3 as one binary |
+| 17 · Frontend and SSR | [wave-17-frontend-ssr.md](wave-17-frontend-ssr.md) | 9 · Frontend and SSR | Tier 2 React renders in Go and hydrates; tier 3 as one binary |
 | 18 · Reference ports | [wave-18-reference-ports.md](wave-18-reference-ports.md) | 7 → 9 (one tier per phase) | Tier 3 shipped as one binary, tests passing |
 
 Open and proposed decisions live in [decisions.md](decisions.md).
