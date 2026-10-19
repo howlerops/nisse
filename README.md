@@ -2,7 +2,7 @@
 
 A strict, TypeScript-shaped language for coding agents that compiles to readable Go and ships as a single static binary.
 
-> **Status:** pre-alpha. Nothing to install yet — this repo currently holds the design. See [docs/PRD.md](docs/PRD.md) for the full PRD and build plan.
+> **Status:** pre-alpha. Nothing to install yet — this repo currently holds the design. See [docs/PRD.md](docs/PRD.md) for the full PRD and build plan, and [docs/ledger](docs/ledger/README.md) for the work ledger.
 
 ## Why
 
