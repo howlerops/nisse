@@ -165,3 +165,21 @@ ROUNDS=2 DUR=8s ./scale.sh         # multicore scaling, after run.sh
 ```
 
 Needs Node 22+, Go 1.26+ and network access to npm and the Go proxy on the first run. Results land in `$WORK/results/*.jsonl` (one line per run), `html-check.txt` and `load.txt`; the script prints medians. `go test -run TestQuick -v ./go` with `DIST=$WORK/dist` gives a one-minute sanity check per engine, including streaming.
+
+## Quiet-machine re-run (Oct 20, 2026)
+
+The parent session re-ran `run.sh` (3 runs, 10 s, both page sizes) and `scale.sh` alone on the machine after all spikes finished; the only load was the benchmark's own pool. All 54 HTML checks were again byte-identical to Node. Medians are in `results-quiet/`.
+
+Typical 28 KB page (`ROWS=100`), one core:
+
+| Engine | Pages/s | p99 (ms) | vs Node | Pool of 4, pages/s |
+| --- | ---: | ---: | ---: | ---: |
+| Go-native | 11,357 | 0.43 | 7.8× faster | 15,555 |
+| Node 22 | 1,461 | 1.28 | — | 5,292 |
+| modernc QuickJS (join) | 29.2 | 53 | 1/50 | 33.8 |
+| goja (join) | 18.6 | 75 | 1/79 | 46.8 |
+| QuickJS on wazero (join) | 18.2 | 197 | 1/80 | 55.9 |
+
+223 KB stress page (`ROWS=800`): Go-native 3,418 pages/s, Node 145 (23.6×), modernc 3.8, QuickJS on wazero 2.4, goja 2.2.
+
+Scaling to 4 instances confirms the parallel-run finding: QuickJS on wazero scales 3.2× and goja 2.7×, while modernc stays at 1.1–1.3× because of its process-wide allocator lock. Against the fallback gate (25 pages/s per core, p99 ≤ 100 ms), modernc passes on one core but cannot scale, and QuickJS on wazero still misses on p99. The recommendation stands: Go-native rendering is the main path, and QuickJS on wazero is the fallback for its scaling and isolation, kept to low-traffic routes until it passes the gate.

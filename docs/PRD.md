@@ -335,7 +335,7 @@ Backend frameworks and libraries a complex app is built on, as compat packages w
 
 ### Frontend and SSR
 
-This is the highest-risk part of the plan. The D-23 spike ([report](spikes/D-23-react-ssr.md)) measured React 19 server rendering: a Go renderer produced byte-identical HTML 7.5× faster than Node, while the best cgo-free embedded JS engine was about 50× slower than Node. So the main path renders in Go, and the embedded engine is only a fallback. The approach:
+This is the highest-risk part of the plan. The D-23 spike ([report](spikes/D-23-react-ssr.md)) measured React 19 server rendering: a Go renderer produced byte-identical HTML 7.8× faster than Node on a typical page (23.6× on a large one), while the best cgo-free embedded JS engine was about 50× slower than Node. So the main path renders in Go, and the embedded engine is only a fallback. The approach:
 
 - **TSX in Nisse, rendered in Go.** JSX components, including the first render of client components, lower to Go that streams HTML byte-identical to `react-dom/server`, so React hydrates it in the browser without mismatches.
 - **Client code stays TypeScript and React.** The build bundles it with an embedded esbuild and embeds the assets in the binary, so a full-stack app still ships as one binary.
@@ -479,7 +479,7 @@ The public 0.1 lands after Phase 3, about 22 weeks in. Phases 4–9 are the pari
 
 - [x] Decided by spike, Oct 19, 2026 (reports in [docs/spikes](spikes/)):
   - **Reference apps** (D-15): RealWorld Express+Prisma, Umami, Immich, Hoppscotch as fallback. See [Reference apps](#reference-apps).
-  - **TypeScript front end for `nisse port`** (D-16): vendor TypeScript 7's Go compiler and call it as a library; the official TypeScript 7 API is the fallback and the CI cross-check. On Immich's 93k-line server it was 2.8× faster than the API, with identical types. Nisse's minimum Go version follows TypeScript's (D-09).
+  - **TypeScript front end for `nisse port`** (D-16): vendor TypeScript 7's Go compiler and call it as a library; the official TypeScript 7 API is the fallback and the CI cross-check. On Immich's 93k-line server it was 3.3× faster than the API (11.8 s vs 39.5 s, quiet machine), with identical types. Nisse's minimum Go version follows TypeScript's (D-09).
   - **Frontend** (D-23): render TSX in Go; embedded QuickJS as a fallback only; Node sidecar opt-in. See [Frontend and SSR](#frontend-and-ssr).
   - **Regex** (D-25): RE2 fast path plus QuickJS's `libregexp`, the only engine that matched Node 22 on all 64,585 real-world cases and every test262 test Node passes.
 

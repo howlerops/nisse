@@ -268,3 +268,7 @@ A second, from-scratch run in a fresh directory reproduced the conclusions:
 - **test262:** identical.
 
 `run.sh` now pins the top-level npm versions from `corpus-packages.json`; transitive versions can still drift.
+
+## Quiet-machine re-run (Oct 20, 2026)
+
+The parent session re-ran the benchmark step alone on the machine after all spikes finished. Results are in `results-quiet/bench.md`. The benchmarks are single-threaded, so they moved little: the recommended RE2 + `libregexp` setup measured 0.30 µs per line (12× Node at the median, 37× at p90) and 2.3 µs for a global match over 16 KB (8.2× Node), against 0.30 µs, 12×, 39× and 3.0 µs before. regexp2 v2 still compiles the corpus about 25× slower than `libregexp` (692 ms vs 25–27 ms). The recommendation stands.

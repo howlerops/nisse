@@ -169,3 +169,17 @@ GOTOOLCHAIN=auto go run . $WORK/old-apr17/internal $WORK/ts/tsc/internal checker
 ```
 
 Needs Node 22, pnpm and Go with `GOTOOLCHAIN=auto` (the vendored compiler needs Go 1.27).
+
+## Quiet-machine re-run (Oct 20, 2026)
+
+The parent session re-ran `bench.sh` (5 rounds) alone on the machine, after all spikes finished; load average stayed under 2.6. `out/summary.md` now holds these numbers. Immich, medians:
+
+| Option | Wall (s), parallel run | Wall (s), quiet run | Peak RSS (MB), quiet |
+| --- | ---: | ---: | ---: |
+| B vendored, 4 goroutines | 15.9 | **11.8** | 3421 |
+| B vendored, 1 goroutine | 19.5 | 15.6 | 3264 |
+| A, TS 7.1 nightly | 43.9 | 39.5 | 3311 |
+| A, TS 7.0.2 | 49.2 | 47.8 | 3717 |
+| C, TS 6.0.3 | 109.1 | 91.5 | 2471 |
+
+B is 3.3× faster than A on the quiet machine (2.8× before) and 7.8× faster than C. Fidelity tables are identical to the parallel run. The recommendation stands.
