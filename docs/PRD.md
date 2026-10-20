@@ -85,6 +85,8 @@ Nisse keeps TypeScript's syntax and drops what makes programs hard to reason abo
 
 **Removed from TypeScript in v1:** `any`, `null`, `==`/`!=`, implicit coercion (including truthiness), `var`, prototypes, class inheritance (`extends` on classes), decorators, `enum` (use literal unions), function overloads, declaration merging, getters/setters with side effects, `eval`. Each removed construct has a dedicated diagnostic with a fix or a pointer to the replacement. Most of them come back in the parity waves ([Language additions](#language-additions)); the rest are [never supported](#never-supported).
 
+**Semicolons:** optional, following TypeScript's automatic semicolon insertion rules exactly, so code agents write parses the same as in TypeScript (D-12).
+
 **Source mapping:** every generated Go file carries `//line` directives, so panics, stack traces, `go vet` output and the debugger point at Nisse lines.
 
 ### Semantics
@@ -198,8 +200,8 @@ The diagnostics are the product: every requirement here serves a tight write →
 | `nisse emit [-o dir]` | Write the generated Go for inspection |
 | `nisse bind <go-module>` | Generate typed Nisse declarations for a Go package |
 | `nisse --watch` | Rebuild and restart on change |
-
-Proposed additions, to confirm in Phase 2: `nisse fmt` (one canonical layout, so fixes and diffs stay small) and `nisse init` (scaffold `go.mod`, `main.nis` and `AGENTS.md`).
+| `nisse fmt [path]` | Rewrite files in the one canonical layout, so fixes and diffs stay small |
+| `nisse init` | Scaffold `go.mod`, `main.nis` and `AGENTS.md` in an empty directory |
 
 **Diagnostics contract**
 
@@ -228,7 +230,7 @@ Go packages are the default library story; npm is an opt-in escape hatch for pur
   - An overrides file per package corrects nilability, marks borrowed (zero-copy) slice parameters such as `[]byte` writers, and renames awkward identifiers. Overrides for the Go standard library ship with Nisse.
   - Anything that does not map (channels, unsafe, cgo types) is left out, with a comment in the `.d.nis` file saying why.
 - Bound declarations are cached by module version and Go version, so a warm `check` never loads Go packages.
-- A curated standard library (`nisse:http`, `nisse:fs`, `nisse:json`, `nisse:process`, `nisse:context`) wraps Go's stdlib with TS-familiar names, so agents can lean on what they already know. Candidates for v1, to confirm by task-suite demand: `nisse:time`, `nisse:crypto`.
+- A curated standard library (`nisse:http`, `nisse:fs`, `nisse:json`, `nisse:process`, `nisse:context`) wraps Go's stdlib with TS-familiar names, so agents can lean on what they already know. v1 also ships `nisse:time` (instants, durations, time zones, formatting) and `nisse:crypto` (`randomUUID`, hashes, HMAC), since nearly every backend needs them.
 - `nisse:json` uses generated code, not reflection: `json.parse<T>(s)` decodes and validates records, tagged unions (dispatching on the tag), literal unions, optionals and integer ranges, and throws `JsonError` with a path to the bad field.
 
 **npm packages (v2, opt-in)**
@@ -413,7 +415,7 @@ Suite runs pin the agent and model versions and are committed with their dates, 
 | Built-in fidelity | test262 pass rate for the supported built-ins | ≥ 95% |
 | Node API fidelity | Ported Node tests passing for each implemented `node:` module | ≥ 90% |
 | npm coverage | Top 500 npm packages with a working track | ≥ 80% |
-| Ported performance | Reference app throughput and memory vs the original on Node | ≥ 1.5× throughput; ≤ Node's memory |
+| Ported performance | Reference app throughput and memory vs the original on Node, and vs the same API on Encore.ts | ≥ 1.5× Node's throughput; ≤ Node's memory; reported against Encore.ts, no target until measured |
 
 ## Build plan
 
@@ -456,6 +458,7 @@ The public 0.1 lands after Phase 3, about 22 weeks in. Phases 4–9 are the pari
 | Loading Go package types is slow | Misses the 500 ms check target | `.d.nis` declaration cache keyed by module version; warm checks never call `go/packages` |
 | `nisse bind` nil heuristics are wrong for some APIs | Traps at runtime, or needless `Option` noise | Boundary nil checks trap with a clear message; per-package overrides; curated stdlib overrides; interop tests against popular modules |
 | Tov or a big player ships the same thing | Reduced differentiation | Lead on Go interop and Windows; keep the diagnostics contract compatible in spirit |
+| Encore.ts offers a cheaper way to a fast TypeScript backend: keep Node and npm, move HTTP, validation and infrastructure into a multi-threaded Rust runtime (its own benchmarks: 9× Express on routing; third parties estimate 1.2–1.5× in real apps) | Teams choose a framework swap over a port | Benchmark ported apps against Encore.ts, not just Node; lead on what it can't offer: one binary without Node, handler code on every core, the agent-safe checker, and Go modules alongside npm |
 | npm demand outweighs Go-first story | Adoption stalls | Ship Phase 4 early as a preview if task-suite data shows npm is the top blocker |
 | Parity work dilutes the v1 bet | The strict, agent-first language never ships | Parity line starts after 0.1; v1 gates unchanged; `strict` stays the default for new code; each parity phase gated on a reference port |
 | TypeScript's Go compiler is internal code that changes between releases | Port tool breaks on TypeScript upgrades | D-16: vendor it at a release branch and upgrade deliberately (7.0 → 7.1 cost 8 mechanical compile errors); cross-check types against the official TypeScript 7 API in CI |
@@ -468,7 +471,7 @@ The public 0.1 lands after Phase 3, about 22 weeks in. Phases 4–9 are the pari
 **Decisions**
 
 - [x] Name: Nisse. Go module path `github.com/howlerops/nisse` (only a Maven build plugin shares the name; no language does).
-- [ ] Secure a domain for docs and `llms.txt`.
+- [x] Docs and `llms.txt` domain: `nisselang.dev` (`nisse.dev` is taken). Still to register; a registry lookup found it free on Oct 20, 2026.
 - [x] Compiler implementation language: Go. Contributors need one language, `nisse bind` reads Go packages directly through `go/types` and `go/packages`, and the tool installs with `go install`. TypeScript's own compiler now ships in Go (TypeScript 7), which keeps the 500 ms check target realistic and lets `nisse port` use it as a library.
 - [x] Integers: `int` is 64-bit and is the default. It lowers to Go `int`, which is 64-bit on every v1 target, so values pass to and from Go's standard library (`len`, indexes, `strconv`) without conversions. Sized types `i8`–`i64` and `u8`–`u64` exist for Go interop and byte work, and `nisse bind` maps Go's sized types onto them. Overflow traps for every integer type. *(Revised in review: previously `int64`.)*
 - [x] Targets: `amd64` and `arm64` on Linux, macOS and Windows. `nisse build` refuses 32-bit targets.

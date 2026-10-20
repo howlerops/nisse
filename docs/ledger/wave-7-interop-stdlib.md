@@ -39,8 +39,8 @@ PRD phase 3. `go:` imports through `nisse bind`, and the curated `nisse:` standa
   *Needs:* W7-08. *Done when:* tests on all three operating systems.
 - [ ] **W7-16** `console` and `Math` globals, including `Math.idiv` and the wrapping-arithmetic functions.
   *Needs:* W4-11. *Done when:* documented and tested.
-- [ ] **W7-13** (proposed, D-08) `nisse:time` and `nisse:crypto` (`randomUUID`, hashes, HMAC).
-  *Needs:* W7-08. *Done when:* decided in D-08, then documented and tested.
+- [ ] **W7-13** `nisse:time` (instants, durations, time zones, formatting) and `nisse:crypto` (`randomUUID`, hashes, HMAC) (D-08).
+  *Needs:* W7-08. *Done when:* documented and tested on all three operating systems.
 - [ ] **W7-17** Stdlib reference docs generated from declarations and included in `llms.txt` within the token budget.
   *Needs:* W5-10. *Done when:* generated in CI.
 

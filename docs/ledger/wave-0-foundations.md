@@ -16,6 +16,8 @@ PRD phase 0 (week 1). The repo, build and test scaffolding everything else stand
   *Needs:* W0-04. *Done when:* runs in CI on all three operating systems.
 - [ ] **W0-06** Contributor guide for agents and humans (`AGENTS.md`/`CLAUDE.md` at repo root): how to build, test, update goldens, add a diagnostic code, and where the ledger is.
   *Needs:* W0-02. *Done when:* a fresh agent session can add a golden test using only that file.
+- [ ] **W0-09** Register `nisselang.dev` (D-01).
+  *Needs:* —. *Done when:* registered, with DNS pointing somewhere we control.
 - [ ] **W0-07** `CONTRIBUTING.md` and `SECURITY.md`.
   *Needs:* —. *Done when:* both are linked from the README.
 - [ ] **W0-08** Line-ending and path hygiene: `.gitattributes` forcing LF in `testdata`, path handling tested on Windows.

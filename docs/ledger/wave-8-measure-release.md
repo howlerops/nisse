@@ -19,7 +19,7 @@ Runs alongside phases 1–3: the agent suite, baselines and benchmarks that the 
 
 ## Benchmarks and budgets
 
-- [ ] **W8-06** HTTP benchmark: a JSON route in Nisse vs hand-written Go `net/http`, same machine, published method.
+- [ ] **W8-06** HTTP benchmark: a JSON route with request validation in Nisse vs hand-written Go `net/http` and vs Encore.ts (D-27), same machine, published method.
   *Needs:* W7-11, W7-14. *Done when:* results recorded per release; ≥ 90% of Go for 0.1.
 - [ ] **W8-07** Binary size check: stripped hello-world HTTP server vs plain Go, in CI.
   *Needs:* W1-10. *Done when:* CI fails above 10% overhead.
@@ -38,7 +38,7 @@ Runs alongside phases 1–3: the agent suite, baselines and benchmarks that the 
   *Needs:* W0-03. *Done when:* in CI.
 - [ ] **W8-14** Windows coverage: CRLF sources, backslash paths in `//line` directives, process and signal behaviour.
   *Needs:* W0-08, W4-23. *Done when:* dedicated end-to-end tests pass on the Windows runner.
-- [ ] **W8-15** Docs site: language spec, stdlib reference, explain pages, `llms.txt` hosted at a stable URL (D-01).
+- [ ] **W8-15** Docs site: language spec, stdlib reference, explain pages, `llms.txt` hosted at `nisselang.dev` (D-01).
   *Needs:* W5-04, W5-10, W7-17. *Done when:* published and linked from the README.
 - [ ] **W8-16** Example projects: an HTTP JSON service, a CLI, and a service using a `go:` database driver.
   *Needs:* W7-10, W7-11. *Done when:* each builds in CI.

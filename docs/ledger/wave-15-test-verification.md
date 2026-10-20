@@ -29,5 +29,5 @@ PRD phase 7. A port is only trustworthy if the original tests run against it and
   *Needs:* W15-07. *Done when:* works for Postgres in the tier 1 setup.
 - [ ] **W15-09** Differential fuzzing of built-ins against Node: random inputs to string, regex, number formatting, JSON and `Date` functions, comparing results.
   *Needs:* W10-32. *Done when:* runs nightly; findings fixed or listed as documented divergences.
-- [ ] **W15-10** Performance comparison harness: the original on Node vs the port, for throughput, p99 latency, memory and startup time.
+- [ ] **W15-10** Performance comparison harness: the original on Node, the same API on Encore.ts (D-27), and the port, for throughput, p99 latency, memory and startup time.
   *Needs:* W15-07. *Done when:* report generated for each reference port.

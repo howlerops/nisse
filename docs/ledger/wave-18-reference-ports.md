@@ -19,5 +19,7 @@ PRD phases 7–9. Real public TypeScript apps ported end to end. Each port is th
   *Needs:* W18-05. *Done when:* the app ships as one binary, its tests pass, replay parity ≥ 99.9%, port automation ≥ 80%.
 - [ ] **W18-07** Port write-up per tier: what the tool did, what the agent did, what humans did, and the new rules and ledger items it produced.
   *Needs:* each port. *Done when:* committed under `docs/ports/` for every tier.
+- [ ] **W18-10** Encore.ts baseline for tier 1 (D-27): Encore's own RealWorld implementation if one exists, otherwise a small Encore.ts port of the tier 1 API, benchmarked next to the original and the Nisse port.
+  *Needs:* W15-10. *Done when:* it passes the same Jan 2024 API collection and its numbers are in the tier 1 performance report (W18-03).
 - [ ] **W18-08** Publish the ports as public examples and case studies.
   *Needs:* W18-07. *Done when:* each is a public repository linked from the docs.

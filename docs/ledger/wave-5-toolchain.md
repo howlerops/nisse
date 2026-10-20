@@ -32,9 +32,9 @@ PRD phase 2. The write → check → fix loop and everything an agent or human u
   *Needs:* waves 3–4 complete. *Done when:* under ~15k tokens (checked in CI), and every example compiles in CI.
 - [ ] **W5-11** `AGENTS.md` template users drop into their repos.
   *Needs:* W5-10. *Done when:* an agent given only the template and `llms.txt` completes 3 suite tasks.
-- [ ] **W5-08** (proposed, D-07) `nisse init`: scaffold `go.mod`, `main.nis`, `AGENTS.md`.
+- [ ] **W5-08** `nisse init` (D-07): scaffold `go.mod`, `main.nis`, `AGENTS.md`.
   *Needs:* W5-11. *Done when:* `nisse init && nisse run main.nis` works in an empty directory.
-- [ ] **W5-14** (proposed, D-06) `nisse fmt`: one canonical layout; fixes produce formatted edits.
+- [ ] **W5-14** `nisse fmt` (D-06): one canonical layout; fixes produce formatted edits.
   *Needs:* W2-03. *Done when:* formatting is idempotent across the whole test corpus.
 
 ## Editor support
