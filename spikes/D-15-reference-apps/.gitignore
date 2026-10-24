@@ -1,0 +1,5 @@
+# Clones, installs and raw outputs never land in git
+clones/
+node_modules/
+*.log
+results/*.raw.json

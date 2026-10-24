@@ -1,0 +1,9 @@
+node_modules/
+package-lock.json
+out/*
+bin/
+*.jsonl
+vendored/internal/
+vendored/go.sum
+vendored/go.mod
+!out/summary.md

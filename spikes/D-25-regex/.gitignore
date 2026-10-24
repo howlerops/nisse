@@ -1,0 +1,6 @@
+node_modules/
+test262/
+bin/
+out/
+*.test
+out/
