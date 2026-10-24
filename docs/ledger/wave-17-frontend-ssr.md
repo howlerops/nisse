@@ -11,7 +11,7 @@ PRD phase 9. Full-stack apps as one binary, as described in the PRD's [Frontend 
 ## Server rendering in Go
 
 - [ ] **W17-02** TSX syntax and typing: intrinsic elements, components, props, `children`, fragments, keys.
-  *Needs:* W17-01. *Done when:* React's JSX typing tests from the TypeScript conformance suite pass at ≥ 98%.
+  *Needs:* W17-01. *Done when:* TSX in `strict` code checks with Nisse's checker, TSX in ported code checks with TypeScript 7's (D-34), and both lower.
 - [ ] **W17-03** Server JSX rendering in Go, the main SSR path: components, including the first render of client components (initial state, `useId`, context, `Suspense` boundaries), lowered to Go that streams HTML with React's escaping, attribute, style and comment-marker rules.
   *Needs:* W17-02. *Done when:* output matches `react-dom/server` byte for byte on a corpus that includes the D-23 benchmark app, at ≥ 1.5× Node's throughput with p99 no worse than Node's.
 - [ ] **W17-14** Hydration tests: render in Go, hydrate with React in a headless browser, fail on any hydration warning; run for every supported React release.

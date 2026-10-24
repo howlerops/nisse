@@ -6,7 +6,7 @@ A strict, TypeScript-shaped language for coding agents that compiles to readable
 
 ## Why
 
-Agents write TypeScript well. Go runs servers well. Nisse sits in between: TS syntax agents already know, a strict checker (no `any`, `null` or `==`; every fallible call marked `try`), and diagnostics that return machine-applicable fixes. Everything after type-checking is handed to Go's toolchain, so you get Go's runtime, cross-compilation and ecosystem for free.
+For teams that run Go and let agents write the code. Agents know TypeScript syntax; Go runs servers well. Nisse sits in between: TS syntax agents already know, a strict checker (no `any`, `null` or `==`; every fallible call marked `try`), and diagnostics that return machine-applicable fixes. Everything after type-checking is handed to Go's toolchain, so you get Go's runtime, cross-compilation and ecosystem for free.
 
 ```ts
 type Shape =

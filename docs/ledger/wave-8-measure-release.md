@@ -2,15 +2,15 @@
 
 Runs alongside phases 1–3: the agent suite, baselines and benchmarks that the PRD's gates depend on, then the 0.1 release. The harness and baselines (W8-01–W8-05) must exist before the Phase 1 gate.
 
-**Gate (public 0.1):** suite ≥ 80% and the baseline targets in the PRD's [Success metrics](../PRD.md#success-metrics); HTTP ≥ 90% of Go; binary size within 10%; zero generated-Go errors.
+**Gate (public 0.1 preview, D-33):** the 25-task suite at or above the Go baseline with confidence intervals excluding zero, per the PRD's [Success metrics](../PRD.md#success-metrics); HTTP ≥ 90% of Go; binary size within 10%; zero generated-Go errors. **0.2** adds all 50 tasks, the TypeScript baseline and the held-out tasks.
 
 ## Agent suite
 
 - [ ] **W8-01** Suite harness: task format (prompt, starter files, hidden tests), sandboxed runner, scoring, saved transcripts, at least 5 runs per task and language with 95% confidence intervals and paired comparisons. Language-agnostic, so the same task runs in Nisse, TypeScript and Go.
   *Needs:* W1-12, W1-14. *Done when:* one task runs end to end in all three languages and the report shows intervals.
-- [ ] **W8-02** 50 tasks: 35 development tasks, plus 15 held out and written in Phase 3, after the spec freezes at the end of Phase 2. Include tasks that probe each TS divergence (aliasing, strings, division, map order) and each accepted divergence; set difficulty so strict TypeScript passes 50–65%.
+- [ ] **W8-02** 50 tasks, of which 25 development tasks run against Go for the 0.1 preview and the rest arrive in 0.2 (D-33): 35 development tasks, plus 15 held out and written in Phase 3, after the spec freezes at the end of Phase 2. Include tasks that probe each TS divergence (aliasing, strings, division, map order) and each accepted divergence; set difficulty so strict TypeScript passes 50–65%.
   *Needs:* W8-01. *Done when:* all 50 committed with hidden tests; held-out tasks stored apart and never shown to the model during development.
-- [ ] **W8-03** Baselines: run the suite in strict TypeScript (`tsc --strict` in the loop) and plain Go (`go vet` and `staticcheck` in the loop) with the same agent, model and harness.
+- [ ] **W8-03** (0.2) Baselines: run the suite in strict TypeScript (`tsc --strict` in the loop) and plain Go (`go vet` and `staticcheck` in the loop) with the same agent, model and harness.
   *Needs:* W8-02. *Done when:* baseline results committed with intervals.
 - [ ] **W8-04** Pinned runs: agent and model versions recorded; results committed with dates under `suite/results/`.
   *Needs:* W8-01. *Done when:* two runs on different dates can be compared from the repo alone.

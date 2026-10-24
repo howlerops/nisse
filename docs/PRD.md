@@ -6,6 +6,8 @@ Oct 19, 2026 · revised Oct 20 after design review and the spike decisions, and 
 
 Nisse is a strict, TypeScript-shaped language for coding agents that compiles to readable Go and ships as a single static binary. It keeps the agent-friendly ideas introduced by [Tov](https://github.com/richiemcilroy/Tov): familiar TS syntax, no `any`/`null`/`==`, every fallible call marked `try`, and compiler errors that return machine-applicable fixes. Unlike Tov, it does not own a native runtime. Go provides the GC, scheduler, networking, TLS and cross-compilation.
 
+**Positioning (D-35):** Nisse is for teams that run, or want to run, Go services and whose agents write TypeScript more reliably than Go. It leads with what a JavaScript runtime cannot offer: typed imports of any Go module, readable Go output, no JS engine in the binary, and a strict checker built for agents. It does not compete on "fast TypeScript" with Bun, Deno, Encore or Tov.
+
 The bet: agents know TypeScript syntax deeply, Go runs servers well, and a strict checker with stable error codes and machine-applicable fixes, run in a tight loop, raises agent task success more than either language's own toolchain does. The evidence ([evaluation](evaluation/2026-10-24-worth-it.md)) supports the loop but not TypeScript fluency as the source of the gain: on repository-level agent benchmarks TypeScript is among the weakest languages and Go is roughly level with it (SWE-bench Multilingual: JS/TS 34.9%, Go 31.0%). So the advantage has to come from the checker and its fixes, and it is unproven until the Phase 0 experiment (W1-14) measures it. v1 targets backend services and CLIs written fresh in Nisse. Go packages are first-class imports; npm is an opt-in escape hatch through an embedded JS engine.
 
 The long-term goal goes further: take a complex existing TypeScript app (a Node backend, its npm dependencies, even its SSR frontend) and reproduce it on the Go runtime. Two things get there together. `nisse port` translates a TypeScript codebase into Nisse, and later waves widen Nisse towards TypeScript parity without giving up the strict checker. See [TypeScript parity](#typescript-parity-v2-and-later).
@@ -250,7 +252,7 @@ Go packages are the default library story; npm is an opt-in escape hatch for pur
   - An overrides file per package corrects nilability, marks borrowed (zero-copy) slice parameters such as `[]byte` writers, and renames awkward identifiers. Overrides for the Go standard library ship with Nisse.
   - Anything that does not map (channels, unsafe, cgo types) is left out, with a comment in the `.d.nis` file saying why.
 - Bound declarations are cached by module version and Go version, so a warm `check` never loads Go packages.
-- A curated standard library (`nisse:http`, `nisse:fs`, `nisse:json`, `nisse:process`, `nisse:context`) wraps Go's stdlib with TS-familiar names, so agents can lean on what they already know. v1 also ships `nisse:time` (instants, durations, time zones, formatting) and `nisse:crypto` (`randomUUID`, hashes, HMAC), since nearly every backend needs them.
+- A curated standard library (`nisse:http`, `nisse:fs`, `nisse:json`, `nisse:process`, `nisse:context`) wraps Go's stdlib with TS-familiar names, so agents can lean on what they already know. v1 (from 0.2) also ships `nisse:time` (instants, durations, time zones, formatting) and `nisse:crypto` (`randomUUID`, hashes, HMAC), since nearly every backend needs them.
 - `nisse:json` uses generated code, not reflection: `json.parse<T>(s)` decodes and validates records, tagged unions (dispatching on the tag), literal unions, optionals and integer ranges, and throws `JsonError` with a path to the bad field. v1 has no `null`: a JSON `null` for an optional field decodes to `undefined`, and anywhere else it is a `JsonError`.
 
 **npm packages (v2, opt-in)**
@@ -310,9 +312,9 @@ The target is a complex TypeScript app reproduced on the Go runtime: a Node back
 
 `keyof`, `typeof` in types, indexed access types, mapped types (with modifiers and key remapping), conditional types with `infer`, template literal types, the standard utility types (`Partial`, `Pick`, `Omit`, `ReturnType`, `Awaited`, …), `satisfies`, `as const`, type predicates, assertion functions, branded types, and reading `.d.ts` files.
 
-All of this is computed in the checker; Go only ever sees concrete types. Generic code that applies type-level operators to its own type parameters is monomorphised (one Go function per instantiation) instead of lowered to Go generics.
+For ported code these are checked by the vendored TypeScript 7 checker, not by Nisse's (D-34): the `compat` profile type-checks with TypeScript's own Go compiler and lowers from its typed AST, so agreement with `tsc` holds by construction. Nisse's own checker stays the checker for `strict` code, and learns a type-level feature only where `strict` code has to consume a type that ported code exports. Go only ever sees concrete types: generic code that applies type-level operators to its own type parameters is monomorphised (one Go function per instantiation) instead of lowered to Go generics.
 
-Parity is measured against TypeScript itself: on TypeScript's conformance tests that fall within the supported subset, Nisse accepts and rejects what `tsc --strict` does, apart from documented divergences.
+Conformance is therefore not re-measured against TypeScript's test suite; what is measured is that the lowering is correct for every construct the reference apps use (W11-16).
 
 ### Strict and compat profiles
 
@@ -321,7 +323,7 @@ Parity features must not weaken the agent-first default. A project profile in `n
 - `strict` is the default for new projects. Those features are errors with fixes towards the strict idiom.
 - `compat` is the default for `nisse port` output. They are warnings, so ported code compiles first and is tightened later with `nisse port --tighten`.
 
-Both profiles use the same compiler. The profile changes diagnostic severity and one lowering: `compat` async code targets the event-loop executor (D-26), and `strict` code targets goroutines.
+The profiles share the parser, lowering, runtime and diagnostics contract, but not the checker: `strict` code is checked by Nisse's checker and `compat` code by the vendored TypeScript 7 checker (D-34), with Nisse's rules from the strict list reported on top. The profile also selects one lowering: `compat` async code targets the event-loop executor (D-26), and `strict` code targets goroutines.
 
 ### Runtime parity: Node and Web APIs
 
@@ -412,7 +414,7 @@ The headline metric is how often an agent gets from a task to a passing build wi
 
 | Metric | How measured | v1 target |
 | --- | --- | --- |
-| Agent task success | 50 backend tasks (35 development; 15 held out, written in Phase 3 after the spec freezes at the end of Phase 2), agent given only `llms.txt`, hidden tests, difficulty set so the strict-TypeScript baseline passes 50–65% | ≥ Go baseline + 5 points; ≥ TypeScript baseline; absolute pass rate reported, no fixed target (the best published type-feedback gains are 4–9 points, so +10 over Go was above anything measured) |
+| Agent task success | 50 backend tasks (35 development; 15 held out, written in Phase 3 after the spec freezes at the end of Phase 2), agent given only `llms.txt` (the 0.1 preview runs 25 of them against Go only; all 50 and the TypeScript baseline arrive in 0.2), hidden tests, difficulty set so the strict-TypeScript baseline passes 50–65% | ≥ Go baseline + 5 points; ≥ TypeScript baseline; absolute pass rate reported, no fixed target (the best published type-feedback gains are 4–9 points, so +10 over Go was above anything measured) |
 | Escaped bugs | Hidden-test failures on builds that pass `check`, vs the TS baseline | Fewer than TS |
 | Silent divergences | Hidden-test failures on builds that pass `check`, traced to a TypeScript habit (aliasing, string offsets, division, truthiness, an unmarked throw, an [accepted divergence](#accepted-divergences)) | 0 |
 | First-check diagnostics | Median diagnostics on an agent's first `check` per task, and the share that are TypeScript-habit divergences | Reported; ≤ 6 after Phase 2 |
@@ -422,7 +424,7 @@ The headline metric is how often an agent gets from a task to a passing build wi
 | Check latency | 10k-line project, warm (long-running process) and cold (fresh CLI run) | < 500 ms warm; < 2 s cold |
 | HTTP throughput | JSON route vs hand-written Go `net/http` | ≥ 90% of Go |
 | Binary size | Hello-world HTTP server, stripped | Within 10% of plain Go |
-| Adoption | GitHub stars, weekly active installs, external repositories with Nisse code | Tracked from launch; the parity line starts only if, within 90 days of 0.1, more than 25 external projects use Nisse |
+| Adoption | GitHub stars, weekly active installs, external repositories with Nisse code | Tracked from launch; reviewed 90 days after 0.1, before Phase 4 starts |
 
 Suite runs pin the agent and model versions and are committed with their dates, so results are comparable across releases.
 
@@ -433,7 +435,7 @@ Suite runs pin the agent and model versions and are committed with their dates, 
 | Port automation | Share of TypeScript constructs in a reference app translated without a `port` diagnostic | ≥ 90% tier 1; ≥ 85% tier 2; ≥ 80% tier 3 |
 | Port test pass | Original test suite passing right after `nisse port`, and after one agent pass over the port report | ≥ 70%; 100% of the tests that pass on Node at the pinned commit |
 | Replay parity | Recorded HTTP requests that get identical responses from the original and the port, ignoring declared volatile fields, over a corpus of at least 10,000 requests per app generated by replaying its API collection with randomised data | Zero unexplained differences: every difference is fixed or listed as a documented divergence |
-| Type-checker parity | Agreement with `tsc --strict` on conformance tests within the supported subset | ≥ 98% |
+| Lowering coverage | Constructs used by the reference apps that the `compat` lowering handles from TypeScript 7's typed AST | 100% for the app gating each phase |
 | Built-in fidelity | test262 pass rate for the supported built-ins | ≥ 95% |
 | Node API fidelity | Ported Node tests passing for each implemented `node:` module | ≥ 90% |
 | npm coverage | The 200 most common runtime dependencies of backend apps, measured from the reference apps' lockfiles (build tools, `@types/*` and browser polyfills excluded), with a working track | ≥ 80% at the end of Phase 8 |
@@ -441,20 +443,21 @@ Suite runs pin the agent and model versions and are committed with their dates, 
 
 ## Build plan
 
-The week counts were re-estimated on Oct 24, 2026 after the [evaluation](evaluation/2026-10-24-worth-it.md) compared them with similar projects: Gleam took five years to 1.0, a solo Rust-like-to-Go language (Borgo) was "in no way complete" after a year, and Microsoft's TypeScript port to Go took about two years with a full test suite to port against. As scoped, the public 0.1 lands after Phase 3, about 45–55 weeks in, for one full-time builder working with a coding agent. Phases 4–9 are the parity line; comparable work (Node API compatibility in Bun and Deno) took funded teams about five years, so the full line is a multi-year effort, and its later phases are candidates rather than commitments. The gates, not the dates, decide when a phase ends.
+The week counts were re-estimated on Oct 24, 2026 after the [evaluation](evaluation/2026-10-24-worth-it.md) compared them with similar projects: Gleam took five years to 1.0, a solo Rust-like-to-Go language (Borgo) was "in no way complete" after a year, and Microsoft's TypeScript port to Go took about two years with a full test suite to port against. The public 0.1 is a preview (D-33): the full language and checker, Go lowering, JSON diagnostics with fixes, the language server's diagnostics and quick-fixes, the core CLI, Go standard-library imports, four `nisse:` modules, structured async, and a 25-task suite against Go. It lands after Phase 3, about 29–31 weeks in, for one full-time builder working with a coding agent. Phase 3b finishes v1 for 0.2. Phases 4–9 are the parity line, committed in full (D-32). Comparable work (Node API compatibility in Bun and Deno) took funded teams about five years, so it is a multi-year effort for one builder; the estimates below say so rather than compress it. The gates, not the dates, decide when a phase ends.
 
 | Phase | Weeks | Scope | Ledger waves | Gate to move on |
 | --- | --- | --- | --- | --- |
 | 0 · Spike and bet check | 1–4 | Repo, CI, golden tests; tiny subset to Go: functions, records, loops; hello-world HTTP server through `net/http`; the paper-compiler experiment (W1-14) testing the agent bet before the compiler exists | 0, 1 | Binary builds on Linux, macOS, Windows; W1-14 passes its decision rule |
-| 1 · Core language | 5–24 | Full parser; checker with the semantics above; `//line` maps; `rt` runtime; diagnostics with codes and JSON; suite v0 with TS and Go baselines | 2, 3, 4, start of 8 | Suite runs against both baselines with Nisse at or above the Go baseline on development tasks; no generated-Go errors; copy-on-write and checked arithmetic benchmarked |
-| 2 · Agent toolchain | 25–32 | Safe fixes, `nisse fix`, `nisse explain`, `llms.txt`, `AGENTS.md` template; LSP diagnostics and code actions, `--watch`, `test()` via `go test` | 5 | Median fix loop of 2; 60% safe-fix coverage |
-| 3 · Servers and Go interop | 33–52 | `async`/`await`/`spawn` on goroutines; `nisse:http`, `nisse:fs`, `nisse:json`, `nisse:process`, `nisse:context`; `nisse bind` and cache; full LSP; benchmarks against plain Go | 6, 7, 8 | **Public 0.1 release:** suite targets met with confidence intervals, HTTP 90% of Go |
-| 4 · npm escape hatch | 53–58 | QuickJS on wazero, engine pool, `Js` type, minimal Node shim; pure-JS packages only | 9 | 20 popular pure-JS packages pass tests |
-| 5 · Language parity | 59–70 | [Language additions](#language-additions), [type-level features](#type-level-features), strict and compat profiles | 10, 11 | Type-checker parity ≥ 98%; built-in fidelity ≥ 95% |
-| 6 · Runtime and npm parity | 71–94 | `node:` modules and Web globals; event-loop executor; npm tracks, compat packages, lock file | 12, 13 | Node API fidelity ≥ 90% for the modules the tier 1 and 1b apps use; every tier 1 dependency has a track assigned in the lock file, and every compat or engine package except the Prisma client (W16-15, Phase 7) passes its ported tests |
-| 7 · Porting | 95–110 | `nisse port`, port report, test translation, replay harness; minimal Express and Prisma support; tier 1 reference port | 14, 15, 18, W16-14, W16-15 | Tier 1 app passes its tests, replay parity has zero unexplained differences, port automation ≥ 90% |
-| 8 · Frameworks | candidate | Express, Fastify, Koa, Hono, NestJS, Prisma and other ORMs, GraphQL, websockets, queues; tier 2 backend | 16, 18 | Tier 2 backend passes its tests |
-| 9 · Frontend and SSR | candidate | TSX, server rendering, embedded client bundling, Nisse→JS for shared modules, React SSR, Next.js-style port path; tier 2 frontend and tier 3 | 17, 18 | Tier 2 server-rendered pages hydrate without warnings for the routes in the fixed scope; tier 3 app ships as one binary (plus the media tools it already calls) and passes its tests |
+| 1 · Core language | 5–18 | Full parser; checker with the semantics above; `//line` maps; `rt` runtime; diagnostics with codes and JSON; suite v0 against the Go baseline | 2, 3, 4, start of 8 | Nisse at or above the Go baseline on development tasks; no generated-Go errors; copy-on-write and checked arithmetic benchmarked |
+| 2 · Agent toolchain | 19–24 | Safe fixes, `nisse fix`, `nisse explain`, `nisse init`, `llms.txt`, `AGENTS.md` template; language server diagnostics and quick-fixes; `test()` via `go test` | 5 | Median fix loop of 2; 60% safe-fix coverage |
+| 3 · Servers and Go interop | 25–31 | `async`/`await`/`spawn`/`Promise.all` on goroutines; `nisse:http`, `nisse:json`, `nisse:fs`, `nisse:process`, `nisse:context`; `nisse bind` for the Go standard library; benchmarks against plain Go | 6, 7, 8 | **Public 0.1 preview:** 25-task suite at or above Go with confidence intervals, HTTP 90% of Go |
+| 3b · v1 complete (0.2) | 32–45 | `nisse fmt`, `--watch`, full language server, `nisse bind` for third-party modules and the interop set, `nisse:time`, `nisse:crypto`, 50-task suite with the TypeScript baseline, held-out tasks | 5, 7, 8 (items marked 0.2) | 50-task suite targets met against both baselines; held-out tasks pass at the development rate |
+| 4 · npm escape hatch | 46–51 | QuickJS on wazero, engine pool, `Js` type, minimal Node shim; pure-JS packages only | 9 | 20 popular pure-JS packages pass tests |
+| 5 · Language parity | 52–63 | [Language additions](#language-additions), [type-level features](#type-level-features), strict and compat profiles | 10, 11 | `compat` code type-checks with the vendored TypeScript 7 checker and lowers for every construct the tier 1 and 1b apps use; built-in fidelity ≥ 95% |
+| 6 · Runtime and npm parity | 64–87 | `node:` modules and Web globals; event-loop executor; npm tracks, compat packages, lock file | 12, 13 | Node API fidelity ≥ 90% for the modules the tier 1 and 1b apps use; every tier 1 dependency has a track assigned in the lock file, and every compat or engine package except the Prisma client (W16-15, Phase 7) passes its ported tests |
+| 7 · Porting | 88–103 | `nisse port`, port report, test translation, replay harness; minimal Express and Prisma support; tier 1 reference port | 14, 15, 18, W16-14, W16-15 | Tier 1 app passes its tests, replay parity has zero unexplained differences, port automation ≥ 90% |
+| 8 · Frameworks | 104–143 | Express, Fastify, Koa, Hono, NestJS, Prisma and other ORMs, GraphQL, websockets, queues; tier 2 backend | 16, 18 | Tier 2 backend passes its tests |
+| 9 · Frontend and SSR | 144–195 | TSX, server rendering, embedded client bundling, Nisse→JS for shared modules, React SSR, Next.js-style port path; tier 2 frontend and tier 3 | 17, 18 | Tier 2 server-rendered pages hydrate without warnings for the routes in the fixed scope; tier 3 app ships as one binary (plus the media tools it already calls) and passes its tests |
 
 **First two weeks (Phase 0)** — tracked in detail as [wave 0](ledger/wave-0-foundations.md) and [wave 1](ledger/wave-1-spike.md)
 
@@ -503,7 +506,7 @@ The week counts were re-estimated on Oct 24, 2026 after the [evaluation](evaluat
 - [x] Codegen: the Phase 0 spike chooses between building `go/ast` and printing with `go/format` (with `//line` directives added in a text pass, since `go/printer` places comments heuristically) and a small text printer run through `go/format` (W1-13). Generated files are written to `.nisse/gen/`; `nisse build` compiles them, optionally mapped into the user's module with `go build -overlay`, whose JSON points at those on-disk files. `//line` directives use absolute paths, because Go 1.27 resolves relative ones against the generated file's directory.
 - [x] Semantics: values and aliasing, mutability, numbers, strings, equality, collections, unions, errors, classes, concurrency and naming as specified in [Semantics](#semantics). Value semantics and the string rules are revisited with Phase 1 benchmark and suite data.
 - [x] License: MIT. QuickJS (MIT) and wazero (Apache-2.0) are compatible for the npm phase.
-- [x] Parity model: Nisse stays strict and widens towards TypeScript with Go lowerings; `nisse port` translates existing apps; a `strict`/`compat` profile sets how strict the checker is (D-14, D-22). Targets: Node backends, heavy npm use, and SSR frontends, measured on public reference apps.
+- [x] Parity model (Oct 24: kept in full, D-32; ported code checked by TypeScript 7's checker, D-34): Nisse stays strict and widens towards TypeScript with Go lowerings; `nisse port` translates existing apps; a `strict`/`compat` profile sets how strict the checker is (D-14, D-22). Targets: Node backends, heavy npm use, and SSR frontends, measured on public reference apps.
 
 - [x] Decided by spike, Oct 19–20, 2026 (reports in [docs/spikes](spikes/)):
   - **Reference apps** (D-15): RealWorld Express+Prisma, Umami, Immich, Hoppscotch as fallback. See [Reference apps](#reference-apps).
@@ -550,6 +553,6 @@ Oct 19, 2026 design review. Each finding and where it is resolved:
 - The "loud, never silent" rule now counts traps as loud and lists four [accepted divergences](#accepted-divergences); parameters became `const`, closing the most common silent aliasing case.
 - Go 1.27 facts applied: generic methods on classes are allowed; relative `//line` paths changed; `-overlay` needs files on disk; `errgroup` is not standard library.
 - Names: public members are capitalised so classes can satisfy Go interfaces.
-- Schedule re-estimated: 0.1 at about 45–55 weeks as scoped; the parity line is a multi-year effort with phases 8–9 as candidates.
+- Schedule re-estimated: v1 as scoped was about 45–55 weeks; the parity line is a multi-year effort.
 - Competitive facts corrected: Tov is interest, not demand; Bun (Anthropic) and Deno (Cloudflare) own "one binary from TypeScript"; Encore's real-app figure was unsourced.
-- Strategic scope choices raised by the evaluation (cutting the parity line, a smaller 0.1, reusing TypeScript 7's checker for ported code, positioning) are tracked as D-32 to D-35.
+- Strategic scope choices raised by the evaluation (cutting the parity line, a smaller 0.1, reusing TypeScript 7's checker for ported code, positioning) were decided the same day: the parity line is kept in full (D-32); 0.1 is a preview with the language server (D-33, about 29–31 weeks); ported code is checked by TypeScript 7's checker (D-34); Nisse leads with Go interop (D-35). D-30 (Tov-compatible diagnostics) stays open.

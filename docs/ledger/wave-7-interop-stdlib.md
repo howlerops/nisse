@@ -8,7 +8,7 @@ PRD phase 3. `go:` imports through `nisse bind`, and the curated `nisse:` standa
 
 - [ ] **W7-01** `.d.nis` declaration file format: declarations only, with comments for skipped items.
   *Needs:* W2-03. *Done when:* specified in `docs/spec/declarations.md` and parsed by the checker.
-- [ ] **W7-02** `nisse bind <go-module>` using `go/packages` and `go/types`: functions, methods, structs, interfaces, constants, variables, generics, variadics.
+- [ ] **W7-02** `nisse bind <go-module>` using `go/packages` and `go/types`: functions, methods, structs, interfaces, constants, variables, generics, variadics. For 0.1, the Go standard library only; third-party modules in 0.2 (D-33).
   *Needs:* W7-01. *Done when:* binds `net/http`, `os` and `strings` without errors.
 - [ ] **W7-03** Type mapping rules: integer kinds, `float32` → `f32`, `float64`, `(T, error)` to `throws GoError`, struct pointers to classes and struct values (such as `time.Time`) to records, embedded fields and promoted methods, pointer vs value receivers, slices and maps copied at the boundary, function types with multiple returns, interfaces, Go constraints (`comparable`, `cmp.Ordered`, `~int | ~string`), Go → Nisse names lower-camel-cased, unexported members skipped; unmappable items skipped with a reason.
   *Needs:* W7-02. *Done when:* a table test per rule.
@@ -24,7 +24,7 @@ PRD phase 3. `go:` imports through `nisse bind`, and the curated `nisse:` standa
   *Needs:* W7-02, W4-18. *Done when:* generated Go calls the Go package directly.
 - [ ] **W7-09** `GoError` with `is`/`as` helpers over Go's `errors` package.
   *Needs:* W7-08. *Done when:* tests catching `os.ErrNotExist` and a typed Go error.
-- [ ] **W7-10** Interop test set against popular modules: chi, pgx, `log/slog`, cobra, google/uuid, and one gRPC client.
+- [ ] **W7-10** (0.2) Interop test set against popular modules: chi, pgx, `log/slog`, cobra, google/uuid, and one gRPC client.
   *Needs:* W7-08. *Done when:* a small program per module builds and passes in CI.
 
 ## Standard library (`nisse:`)
@@ -39,12 +39,12 @@ PRD phase 3. `go:` imports through `nisse bind`, and the curated `nisse:` standa
   *Needs:* W7-08. *Done when:* tests on all three operating systems.
 - [ ] **W7-16** `console` and `Math` globals, including `Math.idiv` and the wrapping-arithmetic functions.
   *Needs:* W4-11. *Done when:* documented and tested.
-- [ ] **W7-13** `nisse:time` (instants, durations, time zones, formatting) and `nisse:crypto` (`randomUUID`, hashes, HMAC) (D-08).
+- [ ] **W7-13** (0.2) `nisse:time` (instants, durations, time zones, formatting) and `nisse:crypto` (`randomUUID`, hashes, HMAC) (D-08).
   *Needs:* W7-08. *Done when:* documented and tested on all three operating systems.
 - [ ] **W7-17** Stdlib reference docs generated from declarations and included in `llms.txt` within the token budget.
   *Needs:* W5-10. *Done when:* generated in CI.
 
 ## Editor support
 
-- [ ] **W7-18** Language server, full: hover, completion, go-to-definition (including into `.d.nis` files), rename.
+- [ ] **W7-18** (0.2) Language server, full: hover, completion, go-to-definition (including into `.d.nis` files), rename.
   *Needs:* W5-12, W7-07. *Done when:* each feature works in VS Code on a multi-module project.

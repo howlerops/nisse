@@ -14,7 +14,7 @@ PRD phase 3. Structured `async`/`await` on goroutines, as specified in the PRD's
   *Needs:* W6-01, W4-01. *Done when:* goldens and end-to-end tests.
 - [ ] **W6-05** Structured scope join: an async function returns only after its spawned tasks finish; errors from tasks propagate.
   *Needs:* W6-03, W6-04. *Done when:* tests that a scope waits, and that a failing task's error reaches the caller.
-- [ ] **W6-06** `Promise.all` (an errgroup-style join written in `rt`, since `golang.org/x/sync` is outside the standard library; cancels siblings on first error, an accepted divergence), `Promise.race`, `Promise.allSettled` (keeps JavaScript's run-on behaviour).
+- [ ] **W6-06** `Promise.all` (an errgroup-style join written in `rt`, since `golang.org/x/sync` is outside the standard library; cancels siblings on first error, an accepted divergence), and, in 0.2, `Promise.race` and `Promise.allSettled` (which keeps JavaScript's run-on behaviour).
   *Needs:* W6-04. *Done when:* tests for cancellation of siblings, and `rt` still imports nothing outside the standard library.
 - [ ] **W6-07** `nisse:context`: `timeout`, `deadline`, `cancelled()`, and `sleep(ms)` that respects cancellation. No detached `setTimeout`/`setInterval`.
   *Needs:* W6-04. *Done when:* tests for timeout propagation through nested calls.

@@ -1,6 +1,6 @@
 # Wave 10 · Language parity
 
-PRD phase 5. The TypeScript features v1 leaves out, added back with Go lowerings, as listed in the PRD's [Language additions](../PRD.md#language-additions). Each item is done only when the feature is checked, lowered, golden-tested, run end to end, and reported correctly in both profiles.
+PRD phase 5. Since D-34, `compat` code is type-checked by the vendored TypeScript 7 checker, so for ported code these items are mainly lowering and runtime work; Nisse's own checker needs them only for `strict` code that uses them. The TypeScript features v1 leaves out, added back with Go lowerings, as listed in the PRD's [Language additions](../PRD.md#language-additions). Each item is done only when the feature is checked, lowered, golden-tested, run end to end, and reported correctly in both profiles.
 
 **Gate (with wave 11):** every row of the Language additions table done; built-in fidelity ≥ 95% on the test262 subsets (W10-32).
 

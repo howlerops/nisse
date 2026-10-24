@@ -49,7 +49,7 @@ PRD phase 1. The `rt` runtime library, lowering from the checked tree to Go, and
   *Needs:* W3-20. *Done when:* goldens for generic functions and types with constraints.
 - [ ] **W4-21** Copy elision: no copy when the source binding is never mutated after the copy (a `const` source or a last use), as proven by the checker.
   *Needs:* W4-14. *Done when:* goldens show elided copies, a `let` source mutated after a `const` copy still copies, and benchmarks improve on W4-04's baseline.
-- [ ] **W4-22** Range analysis to drop overflow checks on loop counters, indexes bounded by length, and constants.
+- [ ] **W4-22** (0.2) Range analysis to drop overflow checks on loop counters, indexes bounded by length, and constants.
   *Needs:* W4-11. *Done when:* goldens show elided checks; benchmark recorded.
 
 - [ ] **W4-28** Tuples as generated structs with positional fields.

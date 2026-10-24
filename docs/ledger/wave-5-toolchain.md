@@ -23,7 +23,7 @@ PRD phase 2. The write → check → fix loop and everything an agent or human u
 
 - [ ] **W5-07** `test("…", () => …)` lowered to `_test.go`; `nisse test [--race] [-run pattern]` wrapping `go test`, with failures mapped to `.nis` lines.
   *Needs:* W4-23. *Done when:* a failing test reports the Nisse location and assertion message.
-- [ ] **W5-09** `nisse --watch` for `run`, `test` and `check`, restarting servers on change.
+- [ ] **W5-09** (0.2) `nisse --watch` for `run`, `test` and `check`, restarting servers on change.
   *Needs:* W3-31. *Done when:* an edit triggers a re-run within the check latency budget plus Go build time.
 
 ## Agent docs
@@ -34,7 +34,7 @@ PRD phase 2. The write → check → fix loop and everything an agent or human u
   *Needs:* W5-10. *Done when:* an agent given only the template and `llms.txt` completes 3 suite tasks.
 - [ ] **W5-08** `nisse init` (D-07): scaffold `go.mod`, `main.nis`, `AGENTS.md`.
   *Needs:* W5-11. *Done when:* `nisse init && nisse run main.nis` works in an empty directory.
-- [ ] **W5-14** `nisse fmt` (D-06): one canonical layout; fixes produce formatted edits.
+- [ ] **W5-14** (0.2) `nisse fmt` (D-06): one canonical layout; fixes produce formatted edits.
   *Needs:* W2-03. *Done when:* formatting is idempotent across the whole test corpus.
 
 ## Editor support

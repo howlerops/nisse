@@ -1,8 +1,8 @@
 # Wave 11 · Type-level parity
 
-PRD phase 5. TypeScript's type-level features, as listed in the PRD's [Type-level features](../PRD.md#type-level-features). All of them are computed in the checker; Go only sees concrete types.
+PRD phase 5. TypeScript's type-level features, as listed in the PRD's [Type-level features](../PRD.md#type-level-features). Since D-34, ported (`compat`) code is type-checked by the vendored TypeScript 7 checker and lowered from its typed AST, so these features are checked by TypeScript itself. The items below are needed only where Nisse's own `strict` checker must consume a type that ported code exports, and where the lowering must turn a computed type into concrete Go.
 
-**Gate (with wave 10):** agreement with `tsc --strict` ≥ 98% on conformance tests within the supported subset (W11-14).
+**Gate (with wave 10):** `compat` code type-checks with the vendored TypeScript 7 checker and lowers for every construct the tier 1 and 1b apps use (W11-16); `strict` code can import the types those apps export (W11-17).
 
 - [ ] **W11-01** `keyof`, `typeof` in type positions, indexed access types (`T["k"]`, `T[number]`).
   *Needs:* W3-01. *Done when:* tests for each, including on generic parameters.
@@ -29,7 +29,11 @@ PRD phase 5. TypeScript's type-level features, as listed in the PRD's [Type-leve
   *Needs:* W11-05, W10-24. *Done when:* the `.d.ts` files of the top 50 npm packages load without checker errors.
 - [ ] **W11-13** Recursive types and an instantiation-depth limit like `tsc`'s, reported as a diagnostic instead of a hang.
   *Needs:* W11-03. *Done when:* a pathological type gives the diagnostic within the check time budget.
-- [ ] **W11-14** Conformance harness: run TypeScript's conformance tests filtered to the supported subset, compare accept/reject (and error positions) with `tsc --strict`, report agreement and keep a documented list of divergences.
-  *Needs:* W11-01. *Done when:* the report is generated in CI.
+- [x] ~~**W11-14** Conformance harness against `tsc --strict`.~~ Dropped by D-34: ported code is checked by TypeScript's own checker, so agreement holds by construction.
 - [ ] **W11-15** Checker performance with type-level features: the 500 ms target holds for a 10k-line `strict` project, and a separate budget is set and tracked for `compat` projects.
   *Needs:* W3-32. *Done when:* both budgets enforced in CI.
+
+- [ ] **W11-16** `compat` checking and lowering from TypeScript 7: run the vendored checker (W14-19) on ported code, report Nisse's strict-list rules on top as diagnostics, and lower from its typed AST, resolving computed types (mapped, conditional, template literal) to concrete Go types.
+  *Needs:* W14-19, W11-10. *Done when:* the tier 1 and 1b apps type-check and lower with no unhandled construct.
+- [ ] **W11-17** Strict and compat boundary: `strict` modules import types exported by `compat` modules, through declarations generated from TypeScript 7's types; types Nisse's checker cannot express are reported at the import.
+  *Needs:* W11-16. *Done when:* a `strict` module calls into a ported module with its types checked on both sides.
