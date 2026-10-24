@@ -12,8 +12,8 @@ PRD phase 1. The `rt` runtime library, lowering from the checked tree to Go, and
   *Needs:* W4-01. *Done when:* `go build -gcflags=-m` shows the helpers inline, and a benchmark against plain arithmetic is recorded.
 - [ ] **W4-03** `rt.Option[T]`.
   *Needs:* W4-01. *Done when:* unit tests and a benchmark against a plain pointer.
-- [ ] **W4-04** `rt.Array[T]` with copy-on-write (sticky shared bit) and the array intrinsics.
-  *Needs:* W4-01. *Done when:* aliasing tests pass under `-race`, and benchmarks against plain slices for read, append and copy-heavy loops are recorded (feeds D-02).
+- [ ] **W4-04** `rt.Array[T]` with copy-on-write (sticky shared bit in the backing-store header) and the array intrinsics. First enumerate every Go copy site the lowering must mark (assignment, call, return, `range`, closure capture, interface boxing, container insert) and measure the cost.
+  *Needs:* W4-01. *Done when:* the copy-site list is in `docs/spec/values.md`, aliasing tests pass under `-race`, and benchmarks against plain slices for read, append and copy-heavy loops are recorded (feeds D-02).
 - [ ] **W4-05** Intrinsics implementation driven by the W3-17 table: `rt` free functions, with inline loops for the hottest (`map`, `filter`, `forEach`).
   *Needs:* W4-04, W3-17. *Done when:* every intrinsic has an end-to-end test.
 - [ ] **W4-06** `rt.Map[K,V]` and `rt.Set[T]` with insertion order and copy-on-write, including deletion during iteration.
@@ -25,8 +25,8 @@ PRD phase 1. The `rt` runtime library, lowering from the checked tree to Go, and
 
 ## Lowering
 
-- [ ] **W4-09** Name mangling from the PRD's [Names](../PRD.md#names-in-generated-go) rules, including Go keyword and predeclared clashes.
-  *Needs:* W2-15. *Done when:* a golden that uses every rule.
+- [ ] **W4-09** Name mangling from the PRD's [Names](../PRD.md#names-in-generated-go) rules: exported names capitalised, public members of every type capitalised so classes satisfy Go interfaces, Go keyword and predeclared clashes.
+  *Needs:* W2-15. *Done when:* a golden that uses every rule, plus a class whose `serveHTTP` method satisfies `http.Handler`.
 - [ ] **W4-10** Records: named structs, generated names for anonymous shapes (deduplicated by shape), `json` tags, field-wise conversion between equal shapes.
   *Needs:* W4-09, W3-02. *Done when:* goldens plus a cross-module record test.
 - [ ] **W4-11** Numbers: checked arithmetic calls, conversions, literals.
@@ -43,12 +43,12 @@ PRD phase 1. The `rt` runtime library, lowering from the checked tree to Go, and
   *Needs:* W3-22–W3-25. *Done when:* goldens for each union kind.
 - [ ] **W4-17** Optionals: `rt.Option`, `?.`, `??`.
   *Needs:* W4-03, W3-26. *Done when:* goldens and tests.
-- [ ] **W4-18** Errors: `(T, error)` returns, `try` as early return, error types with `Error() string`, `catch` as an `errors.As` chain, rethrow.
+- [ ] **W4-18** Errors: `(T, error)` returns, `try` as early return, error types with `Error() string`, `catch` as a type switch on Nisse error types (no reflection) with `errors.As` only for `GoError`, rethrow.
   *Needs:* W3-27–W3-29. *Done when:* goldens and tests, including errors that cross modules.
 - [ ] **W4-20** Generics to Go type parameters.
   *Needs:* W3-20. *Done when:* goldens for generic functions and types with constraints.
-- [ ] **W4-21** Copy elision: no copy for `const` values and last uses.
-  *Needs:* W4-14. *Done when:* goldens show elided copies and benchmarks improve on W4-04's baseline.
+- [ ] **W4-21** Copy elision: no copy when the source binding is never mutated after the copy (a `const` source or a last use), as proven by the checker.
+  *Needs:* W4-14. *Done when:* goldens show elided copies, a `let` source mutated after a `const` copy still copies, and benchmarks improve on W4-04's baseline.
 - [ ] **W4-22** Range analysis to drop overflow checks on loop counters, indexes bounded by length, and constants.
   *Needs:* W4-11. *Done when:* goldens show elided checks; benchmark recorded.
 
@@ -60,14 +60,14 @@ PRD phase 1. The `rt` runtime library, lowering from the checked tree to Go, and
 ## Generated-Go guarantees
 
 - [ ] **W4-19** The emitter never produces unused imports or variables, or anything else `go build` or `go vet` rejects.
-  *Needs:* W2-14. *Done when:* covered by W4-24.
-- [ ] **W4-23** `//line` directives on every statement; stack traces, `go vet` output and Delve breakpoints point at `.nis` lines.
-  *Needs:* W1-07. *Done when:* end-to-end tests for traces and vet output; Delve checked by hand once per release.
+  *Needs:* W2-14. *Done when:* a golden corpus of unused-import and unused-variable cases produces Go that `go vet` accepts, inside W4-24.
+- [ ] **W4-23** `//line` directives with absolute paths on every statement; stack traces, `go vet` output and Delve breakpoints point at `.nis` lines.
+  *Needs:* W1-07. *Done when:* end-to-end tests for traces and vet output, including Windows paths and `-trimpath`; Delve checked by hand once per release.
 - [ ] **W4-24** CI invariant: every checker test that passes `check` is lowered, built and vetted; any Go error fails CI as a compiler bug.
   *Needs:* W3-30. *Done when:* in CI, and a deliberately broken lowering fails it.
-- [ ] **W4-25** Program fuzzer: generate random well-typed Nisse programs, compile them, require `go build` to succeed and the program not to crash outside expected traps.
+- [ ] **W4-25** Fuzzing: mutate the golden corpus (edit, re-check, build when it checks) and require `go build` to succeed; a generator of random well-typed programs follows after 0.1.
   *Needs:* W4-24. *Done when:* runs nightly; first findings fixed.
 - [ ] **W4-26** Readability review checklist for emitted Go, applied to every golden before release.
   *Needs:* —. *Done when:* checklist committed in `docs/spec/emit-style.md`.
-- [ ] **W4-27** Build driver: `go build -overlay` from memory, generated module layout under `.nisse/`, `go.mod`/`go.sum` handling for the user's project.
+- [ ] **W4-27** Build driver: generated Go written to `.nisse/gen/`, built as its own module or mapped into the user's module with `-overlay` (whose JSON points at those on-disk files), `go.mod`/`go.sum` handling for the user's project.
   *Needs:* W1-08. *Done when:* `nisse build` writes nothing outside `.nisse/` and the output binary.

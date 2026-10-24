@@ -24,16 +24,16 @@ PRD phase 9. Full-stack apps as one binary, as described in the PRD's [Frontend 
 - [ ] **W17-05** `.d.ts` output for Nisse modules, so TypeScript client code can import their types.
   *Needs:* W17-04. *Done when:* a client imports a Nisse API's types and `tsc` checks it.
 - [ ] **W17-06** Client bundling: embedded esbuild builds client TS/TSX/CSS; assets embedded with `embed.FS`; a dev server with hot reload in `--watch`.
-  *Needs:* W17-01, D-13. *Done when:* a Vite-style React SPA and its API ship as one binary with no Node at runtime.
+  *Needs:* W17-01, W9-03 (shared esbuild integration). *Done when:* a Vite-style React SPA and its API ship as one binary with no Node at runtime.
 - [ ] **W17-12** CSS tooling: Tailwind and PostCSS as a build step or embedded plugins.
   *Needs:* W17-06. *Done when:* a Tailwind app builds without Node installed.
 
 ## React SSR and frameworks
 
-- [ ] **W17-07** Embedded-engine fallback for components that cannot be translated: React in QuickJS on wazero with the join patch, streaming render, engine pool, data from Nisse loaders.
+- [ ] **W17-07** Embedded-engine fallback for components that cannot be translated: React in QuickJS on wazero with the join patch, streaming render, engine pool with proven time and memory limits (W9-02), data from Nisse loaders.
   *Needs:* W17-06, W9-02. *Done when:* an untranslatable component renders inside a Go-rendered page, and the fallback meets D-23's production gate (25 pages/s per core, p99 ≤ 100 ms) or is limited to development and low-traffic routes.
-- [ ] **W17-15** (proposed) Node sidecar for SSR: opt-in, off by default, for apps whose untranslatable components need more than the fallback's throughput.
-  *Needs:* W17-07. *Done when:* decided after the tier 2 port.
+- [ ] **W17-15** Node sidecar for SSR (D-23): an opt-in deployment mode, off by default, built only if a reference port needs it.
+  *Needs:* W17-07. *Done when:* built for the port that needs it, or recorded as not needed in the tier 2 write-up (W18-07).
 - [ ] **W17-08** Port path for Vite SPAs: the client keeps building from its Vite config (common plugins supported), the server side ports with `nisse port`.
   *Needs:* W17-06, W14-04. *Done when:* a Vite + Express app ports to one binary.
 - [ ] **W17-09** Port path for Next.js-style apps onto a Nisse framework: file-system routing (pages and app router), route handlers, middleware, data loading, server components, server actions, static assets.

@@ -6,8 +6,8 @@ PRD phase 6. Node's APIs and the Web globals, implemented in Go as `node:` modul
 
 ## Groundwork
 
-- [ ] **W12-01** API coverage plan: rank `node:` APIs by use in the reference apps' dependency trees and by npm popularity; generate a coverage report from it.
-  *Needs:* W13-01. *Done when:* the ranked list and report are committed and regenerated in CI.
+- [ ] **W12-01** API coverage plan: rank `node:` APIs by use in the reference apps (start from the D-15 scan of Node built-in imports, refreshed by W13-01) and by npm popularity; generate a coverage report from it.
+  *Needs:* —. *Done when:* the ranked list and report are committed and regenerated in CI.
 - [ ] **W12-02** Node test harness: port the relevant tests from Node's own test suite (written against `node:test` and `node:assert`) per module, and report pass rates.
   *Needs:* W5-07, W10-32. *Done when:* runs in CI for every implemented module.
 - [ ] **W12-15** Event-loop executor for the `compat` profile (D-26): one task at a time per loop, I/O on goroutines off the loop, Node's ordering of `process.nextTick`, promise microtasks, `setImmediate` and timers; several loops for apps without shared state.
@@ -55,5 +55,6 @@ PRD phase 6. Node's APIs and the Web globals, implemented in Go as `node:` modul
   *Needs:* W12-07, W12-11. *Done when:* the relevant Web Platform Tests subsets pass at ≥ 90%.
 - [ ] **W12-20** `console` parity: format specifiers and `util.inspect` output byte-identical to Node, so replay tests and logs match.
   *Needs:* W12-16. *Done when:* a fixed corpus of values prints identically to Node.
+- [x] ~~**W12-21**~~ Never assigned; the number is skipped.
 - [ ] **W12-22** Per-module fidelity report in CI, feeding the PRD's Node API fidelity metric.
   *Needs:* W12-02. *Done when:* the report is published per release.

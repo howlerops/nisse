@@ -10,7 +10,7 @@ PRD phase 3. `go:` imports through `nisse bind`, and the curated `nisse:` standa
   *Needs:* W2-03. *Done when:* specified in `docs/spec/declarations.md` and parsed by the checker.
 - [ ] **W7-02** `nisse bind <go-module>` using `go/packages` and `go/types`: functions, methods, structs, interfaces, constants, variables, generics, variadics.
   *Needs:* W7-01. *Done when:* binds `net/http`, `os` and `strings` without errors.
-- [ ] **W7-03** Type mapping rules: integer kinds, `float32`/`float64`, `(T, error)` to `throws GoError`, struct pointers to classes, slices and maps copied at the boundary, function types, interfaces; unmappable items skipped with a reason.
+- [ ] **W7-03** Type mapping rules: integer kinds, `float32` → `f32`, `float64`, `(T, error)` to `throws GoError`, struct pointers to classes and struct values (such as `time.Time`) to records, embedded fields and promoted methods, pointer vs value receivers, slices and maps copied at the boundary, function types with multiple returns, interfaces, Go constraints (`comparable`, `cmp.Ordered`, `~int | ~string`), Go → Nisse names lower-camel-cased, unexported members skipped; unmappable items skipped with a reason.
   *Needs:* W7-02. *Done when:* a table test per rule.
 - [ ] **W7-04** Nil rules (non-nil with a nil error, `New*` constructors, overrides; slices and maps never optional) and boundary nil checks that trap with a clear message.
   *Needs:* W7-03. *Done when:* tests for each rule and for a trapping wrong assumption.
@@ -29,11 +29,11 @@ PRD phase 3. `go:` imports through `nisse bind`, and the curated `nisse:` standa
 
 ## Standard library (`nisse:`)
 
-- [ ] **W7-11** `nisse:http`: server (routes, handlers, request and response, middleware, JSON helpers, graceful shutdown) and a `fetch`-like client.
-  *Needs:* W7-08, W6-04. *Done when:* the benchmark route (W8-06) and suite HTTP tasks run on it.
+- [ ] **W7-11** `nisse:http`: server (routes, handlers, request and response, middleware, JSON helpers, graceful shutdown, a trap hook so a trap aborts only its request with the Nisse location logged) and a `fetch`-like client.
+  *Needs:* W7-08, W6-04. *Done when:* the benchmark route (W8-06) and suite HTTP tasks run on it, and a trapping handler leaves the server running.
 - [ ] **W7-12** `nisse:fs`: read, write, directory walk, paths, with typed errors.
   *Needs:* W7-08. *Done when:* tests on all three operating systems.
-- [ ] **W7-14** `nisse:json`: generated codecs for records, tagged unions, literal unions, optionals and integer ranges; `parse<T>` and `stringify`; `JsonError` with a field path; unknown-field policy.
+- [ ] **W7-14** `nisse:json`: generated codecs for records, tagged unions, literal unions, optionals and integer ranges; `parse<T>` and `stringify`; `JsonError` with a field path; unknown-field policy; JSON `null` decodes to `undefined` for optional fields and is an error elsewhere.
   *Needs:* W4-10, W4-16. *Done when:* round-trip and rejection tests, and decoding beats `encoding/json` reflection in a benchmark.
 - [ ] **W7-15** `nisse:process`: args, env, exit codes, signals, running child processes.
   *Needs:* W7-08. *Done when:* tests on all three operating systems.

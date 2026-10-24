@@ -12,6 +12,8 @@ The tier 1 port gates Phase 7, before the full framework work in Phase 8, so it 
   *Needs:* W12-09, W13-04. *Done when:* the tier 1 app's routes run on it.
 - [ ] **W16-15** Prisma client, tier 1 subset: client generated from the tier 1 `schema.prisma` on Postgres, covering the queries that app makes. W16-05 extends it.
   *Needs:* W13-04. *Done when:* the tier 1 app's data layer passes its tests on it.
+- [ ] **W16-16** Prisma route check: test running Prisma 7's own query compiler inside the embedded engine behind a pgx driver adapter, before writing a query compiler in Go (the official Prisma Go client stayed alpha and was archived in Jul 2025).
+  *Needs:* W9-03. *Done when:* the tier 1 app's queries run this way, or the reason they can't is recorded and W16-15 proceeds in Go.
 
 ## HTTP frameworks
 

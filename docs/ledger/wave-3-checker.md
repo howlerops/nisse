@@ -17,9 +17,9 @@ PRD phase 1. The type checker and every rule in the PRD's [Semantics](../PRD.md#
 
 ## Numbers and conditions
 
-- [ ] **W3-05** Numeric types: `int`, `f64`, sized ints, contextual literal typing, explicit conversions (`f64(x)`, `i32(x)`, `Math.trunc`).
+- [ ] **W3-05** Numeric types: `int`, `f64`, sized ints, `f32`, contextual literal typing, explicit conversions (`f64(x)`, `i32(x)`, and `int(x)`, which traps on a fraction or overflow).
   *Needs:* W3-01. *Done when:* `const x: f64 = 1` passes, `const y: int = 1.5` fails, conversions type-check.
-- [ ] **W3-06** Mixed arithmetic error with `f64(a)`/`Math.trunc(b)` fixes; `int / int` error with `f64(a) / f64(b)` and `Math.idiv(a, b)` fixes.
+- [ ] **W3-06** Mixed arithmetic error with `f64(a)`/`int(b)` fixes; `int / int` error with `f64(a) / f64(b)` and `Math.idiv(a, b)` fixes.
   *Needs:* W3-05. *Done when:* applying each fix yields code that checks clean.
 - [ ] **W3-07** Conditions must be `bool`: truthiness on optionals, numbers and strings is an error with a `safe` fix.
   *Needs:* W3-05. *Done when:* tests for each operand type, fixes applied in tests.
@@ -50,17 +50,17 @@ PRD phase 1. The type checker and every rule in the PRD's [Semantics](../PRD.md#
 
 - [ ] **W3-16** Array, `Map` and `Set` types with literal syntax and the indexing rules (`xs[i]` → `T`, `xs.at(i)`/`m.get(k)` → `T | undefined`).
   *Needs:* W3-02. *Done when:* tests for literals, indexing and iteration.
-- [ ] **W3-17** Intrinsics table: generic signatures for built-in methods on arrays, `Map`, `Set`, strings, optionals and promises (`map`, `filter`, `reduce`, `find`, `flatMap`, `some`, `every`, `sort`, `join`, `includes`, …). One table drives the checker, lowering (W4-05) and docs.
+- [ ] **W3-17** Intrinsics table: generic signatures for built-in methods on arrays, `Map`, `Set`, strings, optionals and promises (`map`, `filter`, `reduce`, `find`, `flatMap`, `some`, `every`, `sort`, `join`, `includes`, `clone`, …). One table drives the checker, lowering (W4-05) and docs.
   *Needs:* W3-16, W3-20. *Done when:* every intrinsic has a signature and a test; the list is generated into `docs/spec/intrinsics.md`.
 
 ## Classes, interfaces and generics
 
-- [ ] **W3-18** Classes: fields, constructors, methods, `private`/`#` fields, `this`, `implements` checks, method values binding their receiver; `extends` error pointing at composition.
-  *Needs:* W3-02. *Done when:* tests for each, including a missing `implements` member.
+- [ ] **W3-18** Classes: fields, constructors, methods (generic methods allowed, lowering to Go 1.27 generic methods), `private`/`#` fields, `this`, `implements` checks, method values binding their receiver; `extends` error pointing at composition.
+  *Needs:* W3-02. *Done when:* tests for each, including a missing `implements` member and a generic method that is rejected as an interface implementation.
 - [ ] **W3-19** Interfaces: structural, assignability, no generic methods.
   *Needs:* W3-02. *Done when:* tests for each.
-- [ ] **W3-20** Generics: type parameters on functions and types, constraints, inference at calls; generic methods rejected with a fix to a free function; any generic shape Go can't express is a Nisse error.
-  *Needs:* W3-03. *Done when:* inference tests plus a test for each Go-representability error.
+- [ ] **W3-20** Generics: type parameters on functions, types and class methods, constraints, inference at calls; generic methods on interfaces rejected with a fix to a free function. Decide and implement field-constrained generics (`T extends { name: string }`, which Go type parameters cannot express): monomorphise them or reject them with a fix.
+  *Needs:* W3-03. *Done when:* inference tests, a test for each Go-representability error, and the field-constraint decision recorded and tested.
 
 ## Unions, optionals and narrowing
 
@@ -89,15 +89,19 @@ PRD phase 1. The type checker and every rule in the PRD's [Semantics](../PRD.md#
 ## Tuples, destructuring and spread
 
 - [ ] **W3-33** Tuples: fixed-length tuple types, indexing with literal indexes, tuple returns.
-  *Needs:* W3-16. *Done when:* tests for construction, indexing, an out-of-range literal index error, and `Object.entries`-style tuple use in `for...of`.
+  *Needs:* W3-16. *Done when:* tests for construction, indexing, an out-of-range literal index error, and `for (const [k, v] of pairs)` over an array of tuples.
 - [ ] **W3-34** Destructuring and spread: object and array patterns with defaults and `...rest` in bindings and parameters; object spread into records; array spread in literals and calls.
   *Needs:* W3-33, W3-02. *Done when:* tests for each form, including type errors for missing fields and spreading a non-record.
+- [ ] **W3-35** Parameters are `const`: mutating a value-typed parameter is an error with fixes `inout` (plus `&x` at call sites) or copying into a `let`.
+  *Needs:* W3-11, W3-13. *Done when:* `function add(xs: int[]) { xs.push(1) }` is rejected and both fixes check clean.
+- [ ] **W3-36** Accepted-divergence warnings: a `W`-code when a non-ASCII string literal, or an offset computed from one, reaches a byte-offset string method.
+  *Needs:* W3-08. *Done when:* the warning fires on `"é".indexOf(...)`-style cases and not on ASCII-only code.
 
 ## Quality and performance
 
 - [ ] **W3-30** Checker test corpus organised by code; CI fails if a registered code has no test.
   *Needs:* W2-07. *Done when:* the CI check exists and passes.
-- [ ] **W3-31** Incremental checking: cache results per module, recheck only changed modules and dependents, check modules in parallel.
+- [ ] **W3-31** Incremental checking: cache results per module, recheck only changed modules and dependents, check modules in parallel. Needed by `--watch` and the language server (Phase 2), not by the Phase 1 gate.
   *Needs:* W3-01. *Done when:* a one-line change in a 10k-line project rechecks only the affected modules.
 - [ ] **W3-32** Checker benchmark on a synthetic 10k-line project, warm and cold.
   *Needs:* W3-31. *Done when:* the benchmark runs in CI and reports numbers against the 500 ms target (enforced in W8-08).

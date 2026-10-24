@@ -1,25 +1,27 @@
 # Wave 18 · Reference app ports
 
-PRD phases 7–9. Real public TypeScript apps ported end to end. Each port is the gate for its phase, and its write-up feeds the rules table and the next waves. Candidates are in the PRD's [Reference apps](../PRD.md#reference-apps).
+PRD phases 7–9. Real public TypeScript apps ported end to end. Each port is the gate for its phase, and its write-up feeds the rules table and the next waves. The chosen apps are in the PRD's [Reference apps](../PRD.md#reference-apps).
 
-**Gate:** tier 3 shipped as one binary, passing its tests, with replay parity ≥ 99.9%.
+**Gate:** tier 3 shipped as one binary (plus the external media tools it already calls: `ffmpeg`, `exiftool`), passing its tests, with zero unexplained replay differences.
 
-- [x] **W18-01** Select the reference apps (D-15). Done by the [D-15 spike](../spikes/D-15-reference-apps.md); re-pin the commits when Phase 7 starts.
+- [x] **W18-01** Select the reference apps (D-15). Done by the [D-15 spike](../spikes/D-15-reference-apps.md); re-pinning is W18-11.
 - [ ] **W18-02** Tier 1 port (gothinkster Express+Prisma RealWorld): `nisse port`, agent pass, verification.
-  *Needs:* waves 14–15, W16-14, W16-15. *Done when:* the Jan 2024 RealWorld API collection passes as on Node (309/311), its own tests pass as on Node, replay parity ≥ 99.9%, port automation ≥ 90%.
+  *Needs:* waves 14–15, W16-14, W16-15. *Done when:* the Jan 2024 RealWorld API collection passes as on Node (309/311), its own tests pass as on Node, replay shows zero unexplained differences, port automation ≥ 90%.
 - [ ] **W18-09** (optional) Tier 1b port (mutoe NestJS RealWorld), as an early check of decorators and NestJS.
   *Needs:* W18-02, W10-19. *Done when:* the same API collection passes.
 - [ ] **W18-03** Tier 1 performance report vs the original on Node.
   *Needs:* W18-02, W15-10. *Done when:* published; feeds the PRD's ported-performance metric.
 - [ ] **W18-04** Tier 2 backend port (Umami's API and data layer).
-  *Needs:* W18-02, wave 16. *Done when:* its tests pass and replay parity ≥ 99.9%.
+  *Needs:* W18-02, wave 16. *Done when:* its tests pass, replay shows zero unexplained differences, port automation ≥ 85%.
 - [ ] **W18-05** Tier 2 frontend port, completing the app as one binary.
   *Needs:* W18-04, W17-09. *Done when:* the full app runs from one binary and its end-to-end tests pass.
 - [ ] **W18-06** Tier 3 port (Immich server and web; Hoppscotch if Immich's media pipeline blocks it).
-  *Needs:* W18-05. *Done when:* the app ships as one binary, its tests pass, replay parity ≥ 99.9%, port automation ≥ 80%.
+  *Needs:* W18-05. *Done when:* the app ships as one binary plus `ffmpeg` and `exiftool`, its tests pass, replay shows zero unexplained differences, port automation ≥ 80%.
 - [ ] **W18-07** Port write-up per tier: what the tool did, what the agent did, what humans did, and the new rules and ledger items it produced.
   *Needs:* each port. *Done when:* committed under `docs/ports/` for every tier.
-- [ ] **W18-10** Encore.ts baseline for tier 1 (D-27): Encore's own RealWorld implementation if one exists, otherwise a small Encore.ts port of the tier 1 API, benchmarked next to the original and the Nisse port.
-  *Needs:* W15-10. *Done when:* it passes the same Jan 2024 API collection and its numbers are in the tier 1 performance report (W18-03).
+- [ ] **W18-10** Baselines for tier 1 (D-27): Encore.ts (its own RealWorld implementation if one exists, otherwise a small Encore.ts port of the tier 1 API) and the original built with `bun build --compile`, benchmarked next to the original and the Nisse port.
+  *Needs:* W15-10. *Done when:* the Encore.ts version passes the same Jan 2024 API collection, and both baselines' numbers are in the tier 1 performance report (W18-03).
+- [ ] **W18-11** Re-pin the reference app commits and re-run the D-15 measurements at the start of Phase 7.
+  *Needs:* W14-02. *Done when:* D-15 is updated with the new commits.
 - [ ] **W18-08** Publish the ports as public examples and case studies.
   *Needs:* W18-07. *Done when:* each is a public repository linked from the docs.

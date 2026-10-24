@@ -2,12 +2,12 @@
 
 PRD phase 7. The TypeScript → Nisse translator described in the PRD's [How a port works](../PRD.md#how-a-port-works).
 
-**Gate (with waves 15 and 18):** the tier 1 reference app ports, passes its original tests and reaches ≥ 99.9% replay parity; port automation ≥ 90%.
+**Gate (with waves 15 and 18):** the tier 1 reference app ports, passes its original tests and reaches zero unexplained replay differences; port automation ≥ 90%.
 
 ## Foundations
 
 - [x] **W14-01** TypeScript front end (D-16): spike the options and choose. Done by the [D-16 spike](../spikes/D-16-ts-frontend.md): vendor TypeScript 7's Go compiler.
-- [ ] **W14-19** Vendoring pipeline: script that copies TypeScript's `tsc/internal/` at a release tag into the module with no source patches, keeps LICENSE and NOTICE, marks modified files, and records the upstream commit.
+- [ ] **W14-19** Vendoring pipeline: copy TypeScript's Go compiler packages at a tagged commit on its `release-7.x` branch into the module, with no source edits beyond import-path rewrites; keep LICENSE and NOTICE, mark the files modified, record the upstream commit. First confirm which repository is canonical: the D-16 spike found the code under `microsoft/TypeScript` (`tsc/internal/`) with `microsoft/typescript-go` archived, while the 7.1 beta post links pull requests in `typescript-go`.
   *Needs:* W0-01. *Done when:* upgrading to a new TypeScript minor is one script run plus fixing compile errors.
 - [ ] **W14-20** Type cross-check in CI: compare the vendored compiler's types against the official TypeScript 7 API on the port corpus, for every TypeScript upgrade.
   *Needs:* W14-19, W14-18. *Done when:* runs in CI; any difference fails the upgrade.
@@ -16,7 +16,7 @@ PRD phase 7. The TypeScript → Nisse translator described in the PRD's [How a p
 - [ ] **W14-22** Binary size and license audit: measure what the vendored compiler adds to the `nisse` binary, and have the Apache-2.0 NOTICE handling reviewed.
   *Needs:* W14-19. *Done when:* both are recorded in the report.
 - [ ] **W14-02** Project loader: `tsconfig.json` (including `extends`, `paths`, strictness flags, module settings), `package.json`, monorepos and workspaces.
-  *Needs:* W14-19. *Done when:* the three reference app candidates load with full type information.
+  *Needs:* W14-19. *Done when:* the tier 1, 2 and 3 reference apps (D-15) load with full type information.
 - [ ] **W14-03** Translation rules table: one entry per TypeScript construct, marked direct, rewrite-with-record, or `port` diagnostic. It drives the translator, the port report and the docs.
   *Needs:* waves 10–11. *Done when:* covers every construct in the TypeScript grammar; generated into `docs/spec/port-rules.md`.
 - [ ] **W14-04** Translator core: TypeScript AST plus types → Nisse AST → printed `.nis`, keeping comments, blank lines and layout through `nisse fmt` (D-06).
@@ -39,7 +39,7 @@ PRD phase 7. The TypeScript → Nisse translator described in the PRD's [How a p
 - [ ] **W14-11** Concurrency: ported projects run on the event-loop executor (D-26); a report lists code that would be safe to run in parallel, for later tightening.
   *Needs:* W12-15. *Done when:* the report runs on the tier 1 app.
 - [ ] **W14-12** Module graph: barrels, path aliases and cycles handed to the compiler (W10-24–W10-26) unchanged.
-  *Needs:* W10-26. *Done when:* the reference app candidates' module graphs build.
+  *Needs:* W10-26. *Done when:* the reference apps' module graphs build.
 - [ ] **W14-13** Dependencies: run triage (W13-01) and rewrite imports to the chosen tracks.
   *Needs:* W13-03. *Done when:* imports in ported code point at compat packages, ported sources or engine bundles as the lock file says.
 

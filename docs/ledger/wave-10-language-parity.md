@@ -8,8 +8,8 @@ PRD phase 5. The TypeScript features v1 leaves out, added back with Go lowerings
 
 - [ ] **W10-01** `nisse.json` with the `strict`/`compat` profile (D-22); every parity feature registers which profile reports it, and at what severity.
   *Needs:* W2-10. *Done when:* the same file gives errors under `strict` and warnings under `compat` for each parity feature.
-- [ ] **W10-33** Strict-profile diagnostics for every parity feature, with fixes towards the strict idiom (`null` → `undefined`, `Shared<T>` → value or class, `extends` → composition where possible).
-  *Needs:* W10-01. *Done when:* one test per feature; `safe` fixes where the rewrite is mechanical.
+- [ ] **W10-33** Strict-profile diagnostics for every feature on the PRD's strict list, with fixes towards the strict idiom (`null` → `undefined`, `Shared<T>` → value or class, `extends` → composition where possible).
+  *Needs:* W10-01. *Done when:* one test per listed feature; `safe` fixes where the rewrite is mechanical.
 
 ## Numbers and primitives
 
@@ -40,7 +40,7 @@ PRD phase 5. The TypeScript features v1 leaves out, added back with Go lowerings
   *Needs:* W11-01. *Done when:* key order matches JavaScript (declaration order) in tests.
 - [ ] **W10-13** `Shared<T>`: a reference box with forwarded methods for arrays, maps, sets and records, plus the alias-analysis API `nisse port` uses to insert it (D-17).
   *Needs:* W4-04, W4-10. *Done when:* aliasing tests produce the same results as TypeScript.
-- [ ] **W10-28** `globalThis`, module-level mutable state, `structuredClone`.
+- [ ] **W10-28** `globalThis`, module-level mutable state, `structuredClone` (an alias of the v1 `clone()` intrinsic, extended to classes).
   *Needs:* W10-25. *Done when:* tests for each.
 - [ ] **W10-30** Tuple extras: labelled, optional and rest elements; `readonly T[]` and `ReadonlyArray`.
   *Needs:* W3-33. *Done when:* tests for each.

@@ -23,7 +23,7 @@ Every piece of work needed to ship Nisse v1 and then the TypeScript parity line 
 | 14 · `nisse port` | [wave-14-port-tool.md](wave-14-port-tool.md) | 7 · Porting | Tier 1 app ported; automation ≥ 90% |
 | 15 · Test and verification | [wave-15-test-verification.md](wave-15-test-verification.md) | 7 · Porting | Original tests run; replay parity ≥ 99.9% |
 | 16 · Frameworks | [wave-16-frameworks.md](wave-16-frameworks.md) | 8 · Frameworks | Tier 2 backend passes its tests |
-| 17 · Frontend and SSR | [wave-17-frontend-ssr.md](wave-17-frontend-ssr.md) | 9 · Frontend and SSR | Tier 2 React renders in Go and hydrates; tier 3 as one binary |
+| 17 · Frontend and SSR | [wave-17-frontend-ssr.md](wave-17-frontend-ssr.md) | 9 · Frontend and SSR | Tier 2 React renders in Go and hydrates; tier 3 as one binary plus its media tools |
 | 18 · Reference ports | [wave-18-reference-ports.md](wave-18-reference-ports.md) | 7 → 9 (one tier per phase) | Tier 3 shipped as one binary, tests passing |
 
 Open and proposed decisions live in [decisions.md](decisions.md).
@@ -43,6 +43,7 @@ flowchart LR
     W5 --> W7["7 Go interop + stdlib"]
     W1 -. "suite drafts" .-> W8["8 Measure + release"]
     W6 --> W8
+    W6 --> W7
     W7 --> W8
     W7 --> W9["9 npm engine"]
     W8 --> W10["10 Language parity"]
@@ -54,12 +55,19 @@ flowchart LR
     W10 --> W14["14 nisse port"]
     W11 --> W14
     W13 --> W14
+    W14 --> W15
+    W10 --> W15
+    W13 -. "W13-01 refreshes" .-> W12
     W12 --> W15["15 Test + verification"]
     W14 --> W18["18 Reference ports"]
     W15 --> W18
     W13 --> W16["16 Frameworks"]
+    W10 --> W16
+    W12 --> W16
     W16 --> W18
     W13 --> W17["17 Frontend + SSR"]
+    W14 --> W17
+    W9 --> W17
     W17 --> W18
 ```
 

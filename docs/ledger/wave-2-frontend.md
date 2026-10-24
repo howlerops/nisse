@@ -15,7 +15,7 @@ PRD phase 1. The full grammar, module system and the diagnostics machinery every
 - [ ] **W2-04** Parser error recovery, so one run reports several syntax errors instead of stopping at the first.
   *Needs:* W2-03. *Done when:* a file with five unrelated syntax errors reports all five.
 - [ ] **W2-05** Diagnostics for every removed TypeScript feature: `any`, `null`, `==`/`!=`, `var`, `enum`, decorators, class `extends`, overloads, prototypes, declaration merging, side-effecting getters/setters, `eval`. Each has a code (`E0xxx`) and a fix or replacement pointer.
-  *Needs:* W2-03, W2-06. *Done when:* one negative test per feature, and `safe` fixes where the PRD says there is a direct replacement (`==` → `===`, `var` → `let`, `enum` → literal union).
+  *Needs:* W2-03, W2-06. *Done when:* one negative test per feature; `safe` fix for `var` → `let`; `maybe` fixes for `==` → `===` and `enum` → literal union (neither is meaning-preserving in every case).
 - [ ] **W2-11** Parser and lexer fuzzing with Go's native fuzzer.
   *Needs:* W2-03. *Done when:* a fuzz target runs in CI for a fixed time on each PR and the corpus is committed.
 
@@ -42,3 +42,5 @@ PRD phase 1. The full grammar, module system and the diagnostics machinery every
   *Needs:* W2-13. *Done when:* `W1xxx` warnings with `safe` fixes that remove them.
 - [ ] **W2-15** Export rules and export-collision error (`foo` and `Foo` both exported).
   *Needs:* W2-13. *Done when:* a negative test for the collision.
+- [ ] **W2-16** Newline hazards under TypeScript's semicolon rules: `return`, `throw` and `break` followed by a newline and a value are errors with a fix (D-12).
+  *Needs:* W2-03. *Done when:* negative tests for each, with fixes applied in tests.

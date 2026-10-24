@@ -1,6 +1,6 @@
 # Decision log
 
-Decisions that are open, proposed, or settled but scheduled for a second look. Settled decisions without a revisit date live in the PRD's [Decisions](../PRD.md#risks-and-decisions) list.
+Every numbered decision lives here, with its status and when to revisit it. The PRD's [Decisions](../PRD.md#risks-and-decisions) list summarises the headline ones and cites the D-ID.
 
 | ID | Decision | Status | Revisit or decide by | Notes |
 | --- | --- | --- | --- | --- |
@@ -12,22 +12,31 @@ Decisions that are open, proposed, or settled but scheduled for a second look. S
 | D-06 | `nisse fmt` | Decided: v1 | — | Smaller fix diffs, one layout for agents; `nisse port` reuses its comment-preserving printer (W14-04). See W5-14 |
 | D-07 | `nisse init` | Decided: v1 | — | Scaffolds `go.mod`, `main.nis`, `AGENTS.md`. See W5-08 |
 | D-08 | `nisse:time`, `nisse:crypto` in the v1 stdlib | Decided: both in v1 | — | Nearly every backend needs them, and `nisse:time` is the base for JavaScript `Date` parity (W10-22). See W7-13 |
-| D-09 | Minimum supported Go version | Decided | — | Follows the vendored TypeScript compiler's minimum (Go 1.27 today, per D-16), and never older than the two latest Go releases |
+| D-09 | Minimum supported Go version | Decided | — | Go 1.27 (Aug 2026), because v1 uses generic methods on classes (new in 1.27) and `iter`; after that, the two most recent Go releases, as Go itself supports. From W14-19 on, also at least the vendored TypeScript compiler's minimum |
 | D-10 | Project configuration file | Decided, revised by D-22 | — | None in v1: a project is a directory with `go.mod`. The parity line adds `nisse.json` for the profile |
 | D-11 | Parser strategy | Decided | — | Hand-written recursive descent with error recovery; best control over spans and diagnostics |
 | D-12 | Semicolons and newlines | Decided | — | TypeScript's automatic semicolon insertion rules exactly, so agent-written code and `nisse port` output parse as in TypeScript. Rejected: a stricter newline rule, required semicolons |
-| D-13 | Bundler for npm phase | Decided | — | esbuild's Go API; only matters in wave 9 |
+| D-13 | Bundler for npm phase | Decided | — | esbuild's Go API; used by wave 9 (`npm:` bundles) and W17-06 (client bundling) |
 | D-14 | Parity model | Decided | — | Nisse stays strict and widens towards TypeScript with Go lowerings; `nisse port` translates existing apps. Rejected: a separate loose `.ts` dialect, and making Nisse fully TypeScript |
-| D-15 | Reference apps | Decided by [spike](../spikes/D-15-reference-apps.md) | Re-pin commits at W18-01 | Tier 1 gothinkster Express+Prisma RealWorld `30b68e1` (oracle: Jan 2024 API collection, spec `a0767b8`); 1b mutoe NestJS RealWorld `0c30a18`; tier 2 Umami `ec0ff50`; tier 3 Immich `fff2bd7`, fallback Hoppscotch `63273f8`. Outline out (BSL 1.1) |
-| D-16 | TypeScript front end for `nisse port` | Decided by [spike](../spikes/D-16-ts-frontend.md) | Each TypeScript minor release | Vendor TypeScript 7's Go compiler (`tsc/internal/` of microsoft/TypeScript, Apache-2.0) at a release branch and call it as a library. Fallback and CI cross-check: the official TypeScript 7 API over IPC. Rejected: TS 6 JS API plus our own parser (7.8× slower, last release, ~1% type differences from TS 7) |
+| D-15 | Reference apps | Decided by [spike](../spikes/D-15-reference-apps.md) | Re-pin commits at W18-11 | Tier 1 gothinkster Express+Prisma RealWorld `30b68e1` (oracle: Jan 2024 API collection, spec `a0767b8`); 1b mutoe NestJS RealWorld `0c30a18`; tier 2 Umami `ec0ff50`; tier 3 Immich `fff2bd7`, fallback Hoppscotch `63273f8`. Outline out (BSL 1.1) |
+| D-16 | TypeScript front end for `nisse port` | Decided by [spike](../spikes/D-16-ts-frontend.md) | Each TypeScript minor release | Vendor TypeScript 7's Go compiler (`tsc/internal/` of microsoft/TypeScript, Apache-2.0) at a release branch and call it as a library. Fallback and CI cross-check: the official TypeScript 7 API over IPC (reworked in the 7.1 beta of Oct 20, 2026, not yet called stable). Which repository is canonical is checked at W14-19. Rejected: TS 6 JS API plus our own parser (7.8× slower, last release, ~1% type differences from TS 7) |
 | D-17 | Aliasing in ported code | Decided, revisit | End of Phase 7 | `Shared<T>` reference box inserted from alias analysis. Revisit if tier 1 ports are full of it |
 | D-18 | `null` | Decided | — | A distinct unit type in the parity line, so `x === null` and `x === undefined` keep their TypeScript meaning. Reported in the `strict` profile |
 | D-19 | `number` | Decided | — | Alias of `f64` with JavaScript semantics, including ToInt32 bitwise operators |
 | D-20 | Circular imports | Decided | — | Each strongly connected group of modules becomes one Go package. Error in `strict`, allowed in `compat` |
 | D-21 | Decorators | Decided | — | Compile-time lowering of TC39 and legacy decorators, with static metadata tables. No runtime reflection |
-| D-22 | Strict and compat profiles | Decided | — | `nisse.json` profile; `strict` for new projects, `compat` for `nisse port` output; same compiler and Go output |
+| D-22 | Strict and compat profiles | Decided | — | `nisse.json` profile; `strict` for new projects, `compat` for `nisse port` output; same compiler; the profile also selects the async executor (D-26) |
 | D-23 | Frontend strategy | Decided by [spike](../spikes/D-23-react-ssr.md) | After the tier 2 port | Render TSX in Go, including client components' first render, byte-identical to `react-dom/server` (7.8× Node in the spike). Fallback for untranslatable components: React in QuickJS on wazero (`fastschema/qjs`) with the join patch; production gate 25 pages/s per core, p99 ≤ 100 ms. Node sidecar: opt-in, off by default |
 | D-24 | npm track order | Decided | — | Go-native compat package, then port from TS source, then embedded engine, then flagged. Chosen per package and pinned in a lock file |
 | D-25 | Regex engine | Decided by [spike](../spikes/D-25-regex.md) | — | RE2 (vendored `regexp` with a 5-line patch) for eligible patterns, QuickJS `libregexp` via modernc transpilation for the rest. 100% match with Node 22 on 64,585 cases. Rejected: regexp2 (capture reset bug), goja (panics, missing flags), QuickJS-ng in WASM (timeouts ignored) |
 | D-26 | Concurrency model for ported code | Decided | — | `compat` code runs on an event-loop executor with Node's task ordering; `strict` code keeps goroutine parallelism |
-| D-27 | Positioning against Encore.ts | Decided | After the tier 1 port | Treat Encore.ts as the main alternative to porting: compare against it in the ported-performance metric (W8-06, W15-10) and benchmark the tier 1 API on it (W18-10) |
+| D-27 | Positioning against Encore.ts | Decided | After the tier 1 port | Treat Encore.ts as the main alternative to porting: compare against it in the ported-performance metric (W8-06, W15-10) and benchmark the tier 1 API on it (W18-10). Since Oct 24 also compare with `bun build --compile`, which already gives one binary for Node apps |
+
+| D-28 | Generating `Js`-boundary declarations from `.d.ts` (W9-08) | Open | After W9-04 | Proposed item; decide once the `Js` type exists |
+| D-29 | Nisse compiled to browser JavaScript for whole frontends (W17-11) | Open | After the tier 3 port | Proposed item; depends on D-32 |
+| D-30 | Diagnostics schema compatible with Tov's | Open, see [evaluation](../evaluation/2026-10-24-worth-it.md) | Before W2-09 | Tov's diagnostics have the same shape (codes, JSON fixes tagged safe/maybe, an explain command). A shared or compatible schema would let agent tooling target both |
+| D-31 | Accepted divergences from TypeScript | Decided | After the Phase 1 suite | Structural `===` on value types, value-keyed records in `Map`/`Set`, byte-offset string methods (with a warning), `Promise.all` cancellation. See the PRD's [Accepted divergences](../PRD.md#accepted-divergences) |
+| D-32 | Parity line scope | Open, see [evaluation](../evaluation/2026-10-24-worth-it.md) | Before Phase 4 | Three of five evaluations recommend cutting it to backends (phases 4–7 committed, 8–9 candidates) or dropping it |
+| D-33 | Scope of the public 0.1 | Open, see [evaluation](../evaluation/2026-10-24-worth-it.md) | Before Phase 1 | Full v1 (about 45–55 weeks) or a smaller preview (about 24–26 weeks, cutting the language server, `fmt`, `--watch`, third-party `bind`, some stdlib and part of the suite) |
+| D-34 | Type checker for ported code | Open, see [evaluation](../evaluation/2026-10-24-worth-it.md) | Before Phase 5 | Use the vendored TypeScript 7 checker for `compat` code and lower from its typed AST, which removes wave 11's tsc-agreement target, or keep widening Nisse's own checker |
+| D-35 | Positioning | Open, see [evaluation](../evaluation/2026-10-24-worth-it.md) | Before 0.1 | Lead with Go interop (typed Go imports, readable Go, no JS engine) for teams running Go, rather than "fast, safe TypeScript backends" |

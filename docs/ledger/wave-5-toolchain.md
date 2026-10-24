@@ -28,9 +28,9 @@ PRD phase 2. The write → check → fix loop and everything an agent or human u
 
 ## Agent docs
 
-- [ ] **W5-10** `llms.txt` v1: the spec as diffs from TypeScript, leading with "values are copied", then strings, numbers and the other [Semantics](../PRD.md#semantics) rules, then the command guide.
-  *Needs:* waves 3–4 complete. *Done when:* under ~15k tokens (checked in CI), and every example compiles in CI.
-- [ ] **W5-11** `AGENTS.md` template users drop into their repos.
+- [ ] **W5-10** `llms.txt` v1 in two layers: a ≤ 3k-token core of divergences as wrong → right pairs ordered by how often they fire (seeded by W1-14), and a ≤ 12k-token reference; TypeScript appears only on the wrong side of a pair.
+  *Needs:* waves 3–4 complete, W1-14. *Done when:* both token budgets checked in CI, and every example compiles in CI.
+- [ ] **W5-11** `AGENTS.md` template users drop into their repos, telling harnesses to run `nisse check --json` after every edit and show the result as a new message.
   *Needs:* W5-10. *Done when:* an agent given only the template and `llms.txt` completes 3 suite tasks.
 - [ ] **W5-08** `nisse init` (D-07): scaffold `go.mod`, `main.nis`, `AGENTS.md`.
   *Needs:* W5-11. *Done when:* `nisse init && nisse run main.nis` works in an empty directory.
@@ -46,5 +46,4 @@ PRD phase 2. The write → check → fix loop and everything an agent or human u
 
 ## Measurement
 
-- [ ] **W5-15** Fix-loop measurement in the suite harness: count `check` → `fix` iterations to a clean build, report the median.
-  *Needs:* W8-01. *Done when:* reported per suite run.
+- [x] ~~**W5-15** Fix-loop measurement in the suite harness.~~ Moved to W8-17, because the Phase 1 suite report needs it.

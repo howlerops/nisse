@@ -24,6 +24,7 @@ PRD phase 5. TypeScript's type-level features, as listed in the PRD's [Type-leve
   *Needs:* W11-09. *Done when:* brands are enforced by the checker and cost nothing in generated Go.
 - [ ] **W11-10** Monomorphisation: generic functions and types that apply type-level operators to their own type parameters are instantiated per concrete type, deduplicated, with a code-size report.
   *Needs:* W11-02, W11-03, W4-20. *Done when:* a generic using `Partial<T>` and `keyof T` lowers to one readable Go function per instantiation; code-size report in CI.
+- [x] ~~**W11-11**~~ Never assigned; the number is skipped.
 - [ ] **W11-12** Reading `.d.ts` files, including DefinitelyTyped packages, for the engine boundary and compat packages.
   *Needs:* W11-05, W10-24. *Done when:* the `.d.ts` files of the top 50 npm packages load without checker errors.
 - [ ] **W11-13** Recursive types and an instantiation-depth limit like `tsc`'s, reported as a diagnostic instead of a hang.
