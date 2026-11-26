@@ -24,6 +24,23 @@ pub fn write_bars(path: &Path, bars: &[Bar]) -> Result<(), BarsError> {
         return Ok(());
     }
     sql_path(path)?;
+    // A repeated bar is a data defect; found here it costs nothing, found by a backtest it
+    // costs a registered trial.
+    let mut keys: Vec<(&str, u64)> = Vec::with_capacity(bars.len());
+    let symbols: Vec<_> = bars
+        .iter()
+        .map(|bar| bar.bar_type.instrument_id().symbol)
+        .collect();
+    for (bar, symbol) in bars.iter().zip(&symbols) {
+        keys.push((symbol.as_str(), bar.ts_event.as_u64()));
+    }
+    keys.sort_unstable();
+    if let Some(pair) = keys.windows(2).find(|pair| pair[0] == pair[1]) {
+        return Err(BarsError::Data(format!(
+            "more than one bar for {} at {}",
+            pair[0].0, pair[0].1
+        )));
+    }
     if path.extension().is_none_or(|ext| ext != "parquet") {
         return Err(BarsError::Data(format!(
             "{} must end in .parquet, or the reader would never see it",
@@ -48,8 +65,16 @@ pub fn write_bars(path: &Path, bars: &[Bar]) -> Result<(), BarsError> {
 
     // A hard link fails when `path` already exists, where a rename would silently replace
     // it: two writers racing for one name cannot both win.
-    let result = write_temporary(tmp_text, bars)
-        .and_then(|()| std::fs::hard_link(&tmp, path).map_err(BarsError::from));
+    // (A file system without hard links fails every write here, which is the safe side.)
+    let result = write_temporary(tmp_text, bars).and_then(|()| {
+        std::fs::hard_link(&tmp, path).map_err(|err| {
+            if err.kind() == std::io::ErrorKind::AlreadyExists {
+                BarsError::Data(format!("{} already exists", path.display()))
+            } else {
+                BarsError::from(err)
+            }
+        })
+    });
     // Best effort: on success the data stays under `path`; on failure the temporary file
     // may not exist yet.
     let _ = std::fs::remove_file(&tmp);

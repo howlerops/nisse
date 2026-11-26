@@ -89,7 +89,10 @@ Long-only by construction: the target is never negative. If `position_qty` is ne
 3. For each symbol in universe order: build the features from its rolling window
    (`close`, `history_days`, `momentum` and `var_daily` when present), the position book
    plus the unfilled remainder of the engine's own unresolved orders for the symbol
-   (`position_qty`; so a rebalance repeated before the fills orders nothing twice), `equity` and `n_assets`; a symbol with no bar yet gets a decision too
+   (`position_qty`; so a rebalance repeated before the fills orders nothing twice; an order
+   with a provisional never-arrived verdict counts too until its recheck window passes,
+   which can delay a re-sent exit by one rebalance but never doubles an order), `equity` and `n_assets`; a symbol with no bar yet, or whose last bar is older than the newest bar in the
+   universe (a gap in its data), gets no price features and so a decision too
    (`Skip`, from the missing `close`). `decide_and_record` with seed `config.seed + n`.
 4. If the decision's `intended_qty` is non-zero: build an `OrderIntent` (market, `Day`, side
    from the sign, quantity `|intended_qty|`, client order id `nisse-<decision id>-0`, time

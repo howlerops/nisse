@@ -144,7 +144,9 @@ pub async fn run_backtest_job(
     let built = strategies::build(&job.strategy_params).map_err(strategy_error)?;
 
     let symbols: Vec<&str> = job.symbols.iter().map(String::as_str).collect();
-    let bars = BarReader::open(&job.bars_dir)?.read(&symbols, job.start, job.end)?;
+    let reader = BarReader::open(&job.bars_dir)?;
+    let bars_file = reader.snapshot_file_name()?;
+    let bars = reader.read(&symbols, job.start, job.end)?;
     let (Some(first), Some(last)) = (bars.first(), bars.last()) else {
         return Err(EvalError::InvalidJob("no bars in range".to_owned()));
     };
@@ -161,6 +163,19 @@ pub async fn run_backtest_job(
     {
         return Err(EvalError::InvalidJob(format!(
             "no bars in range for {missing}"
+        )));
+    }
+    // A symbol may start late (it is skipped until it has history), but its bars must reach
+    // the last session: one that stops early would sit in the universe unpriced.
+    let at_last_session: BTreeSet<Symbol> = bars
+        .iter()
+        .rev()
+        .take_while(|bar| bar.ts_event == last.ts_event)
+        .map(|bar| bar.bar_type.instrument_id().symbol)
+        .collect();
+    if let Some(short) = present.iter().find(|have| !at_last_session.contains(*have)) {
+        return Err(EvalError::InvalidJob(format!(
+            "the bars for {short} stop before the last session in range"
         )));
     }
     let data_start = first.ts_event;
@@ -220,6 +235,7 @@ pub async fn run_backtest_job(
         "git_sha": GIT_SHA,
         "dirty_build": !replayable,
         "data_snapshot_id": data_snapshot_id,
+        "bars_file": bars_file,
         "symbols": job.symbols,
         "requested_start": job.start.as_u64(),
         "requested_end": job.end.as_u64(),

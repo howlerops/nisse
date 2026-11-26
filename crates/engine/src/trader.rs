@@ -183,6 +183,10 @@ where
             return Err(EngineError::ForeignOrders(foreign));
         }
         let working = self.working_quantities();
+        // The newest bar any symbol has. A symbol whose last bar is older than that has a gap
+        // in its data: it is decided without its price features, so the strategy skips it
+        // instead of sizing an order from a stale close.
+        let newest_bar_ts = self.windows.values().filter_map(|w| w.last_bar_ts).max();
 
         let equity = self
             .gateway
@@ -202,7 +206,7 @@ where
         };
         for &symbol in &self.config.symbols {
             let working_qty = working.get(&symbol).copied().unwrap_or(Decimal::ZERO);
-            let features = self.features_for(symbol, equity, working_qty);
+            let features = self.features_for(symbol, equity, working_qty, newest_bar_ts);
             let context = DecisionContext {
                 strategy_version_id: self.config.strategy_version_id,
                 symbol,
@@ -251,8 +255,16 @@ where
 
     /// The features one decision is made from, for `symbol`. The symbol's close, history and
     /// momentum are absent until its window has bars, so the strategy skips it. The position
-    /// is the shares held plus `working_qty`, the shares its unresolved orders will add.
-    fn features_for(&self, symbol: Symbol, equity: Decimal, working_qty: Decimal) -> Features {
+    /// is the shares held plus `working_qty`, the shares its unresolved orders will add. The
+    /// price features are also left out when the symbol's last bar is older than
+    /// `newest_bar_ts`, the newest bar in the universe.
+    fn features_for(
+        &self,
+        symbol: Symbol,
+        equity: Decimal,
+        working_qty: Decimal,
+        newest_bar_ts: Option<UnixNanos>,
+    ) -> Features {
         let mut features = Features::new();
         features.insert(
             feature::POSITION_QTY.to_owned(),
@@ -261,7 +273,11 @@ where
         features.insert(feature::EQUITY.to_owned(), equity);
         let n_assets = u64::try_from(self.config.symbols.len()).unwrap_or(u64::MAX);
         features.insert(feature::N_ASSETS.to_owned(), Decimal::from(n_assets));
-        if let Some(stats) = self.windows.get(&symbol).and_then(|w| w.stats.stats()) {
+        let current = self
+            .windows
+            .get(&symbol)
+            .filter(|w| w.last_bar_ts == newest_bar_ts);
+        if let Some(stats) = current.and_then(|w| w.stats.stats()) {
             features.insert(feature::CLOSE.to_owned(), stats.close);
             features.insert(
                 feature::HISTORY_DAYS.to_owned(),

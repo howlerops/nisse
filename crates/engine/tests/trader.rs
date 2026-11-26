@@ -714,3 +714,30 @@ async fn orders_the_engine_did_not_send_block_the_rebalance() {
     ));
     assert!(store.decisions().is_empty());
 }
+
+#[tokio::test]
+async fn a_symbol_whose_bars_lag_the_universe_is_skipped() {
+    let store = MemoryStore::new();
+    let mut trader = engine(&store, &[AAA, BBB]);
+    let all = sessions(&[(AAA, &RISING_A), (BBB, &RISING_B)], 0);
+    let (last, before) = all.split_last().unwrap();
+    for session in before {
+        feed(&mut trader, session).await;
+    }
+    // The last session arrives for AAA only: BBB's newest close is a day old.
+    let only_aaa: Vec<Bar> = last
+        .iter()
+        .filter(|bar| bar.bar_type.instrument_id().symbol == sym(AAA))
+        .copied()
+        .collect();
+    feed(&mut trader, &only_aaa).await;
+
+    let report = trader.rebalance().await.unwrap();
+
+    assert_eq!(report.decisions[0].2, Action::Enter);
+    assert_eq!(report.decisions[1].2, Action::Skip);
+    assert_eq!(report.orders_submitted, 1);
+    let skipped = &store.decisions()[1];
+    assert!(!skipped.features.contains_key(feature::CLOSE));
+    assert!(skipped.features.contains_key(feature::POSITION_QTY));
+}

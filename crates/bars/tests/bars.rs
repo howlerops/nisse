@@ -414,6 +414,36 @@ fn a_path_that_does_not_end_in_parquet_is_rejected_without_writing() {
 }
 
 #[test]
+fn a_repeated_bar_is_rejected_without_writing() {
+    let dir = Scratch::new("repeat");
+    let file = dir.path().join("bars.parquet");
+    let bars = [
+        flat("AAA", 1, "1.0"),
+        flat("BBB", 1, "2.0"),
+        flat("AAA", 1, "1.5"),
+    ];
+    let err = write_bars(&file, &bars).unwrap_err();
+    assert!(
+        matches!(err, BarsError::Data(ref m) if m.contains("AAA")),
+        "got {err:?}"
+    );
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn the_snapshot_file_name_is_the_one_that_sorts_last() {
+    let dir = Scratch::new("snapshot_name");
+    let reader = BarReader::open(dir.path()).unwrap();
+    assert_eq!(reader.snapshot_file_name().unwrap(), None);
+    write_bars(&dir.path().join("b.parquet"), &[flat("AAA", 1, "1.0")]).unwrap();
+    write_bars(&dir.path().join("a.parquet"), &[flat("AAA", 1, "2.0")]).unwrap();
+    assert_eq!(
+        reader.snapshot_file_name().unwrap().as_deref(),
+        Some("b.parquet")
+    );
+}
+
+#[test]
 fn empty_slice_writes_no_file() {
     let dir = Scratch::new("empty_slice");
     let file = dir.path().join("nested").join("bars.parquet");

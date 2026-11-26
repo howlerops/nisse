@@ -112,6 +112,14 @@ impl BarReader {
         Ok(bars)
     }
 
+    /// The name of the file a `read` uses now (see [`Self::read`]), for recording which
+    /// snapshot a run was made from. `None` when the directory has no Parquet file.
+    pub fn snapshot_file_name(&self) -> Result<Option<String>, BarsError> {
+        Ok(self
+            .latest_file()?
+            .and_then(|path| path.file_name().map(|n| n.to_string_lossy().into_owned())))
+    }
+
     /// The `*.parquet` file in the directory whose name sorts last, if there is one.
     fn latest_file(&self) -> Result<Option<PathBuf>, BarsError> {
         let mut latest: Option<PathBuf> = None;

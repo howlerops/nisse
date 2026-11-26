@@ -121,6 +121,10 @@ fn parse_out(value: &str) -> Result<PathBuf, String> {
     if value.is_empty() {
         return Err("--out needs a file path".to_owned());
     }
+    // Checked here, before anything is fetched: `write_bars` refuses any other name.
+    if !value.ends_with(".parquet") {
+        return Err(format!("--out must end in .parquet: {value}"));
+    }
     Ok(PathBuf::from(value))
 }
 
@@ -466,6 +470,23 @@ mod tests {
             "iex",
             "--out",
             "",
+        ];
+        assert_error_names(parse(&items), "--out");
+    }
+
+    #[test]
+    fn an_out_path_that_does_not_end_in_parquet_names_the_flag() {
+        let items = [
+            "--symbols",
+            "SPY",
+            "--start",
+            "2015-01-01",
+            "--end",
+            "2015-01-02",
+            "--feed",
+            "iex",
+            "--out",
+            "data/bars/2015-01-02",
         ];
         assert_error_names(parse(&items), "--out");
     }

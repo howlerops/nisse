@@ -156,12 +156,18 @@ fn trader_on_bar(c: &mut Criterion) {
         trader.on_bar(bar).unwrap();
     }
 
+    // The trader refuses a bar that is not newer than the symbol's last one, so the cycled
+    // bars are restamped with an ever-increasing time (a copy of one small struct). The
+    // counter lives outside the closure because criterion calls it once per sample.
+    let mut ts = u64::MAX / 2;
     c.bench_function("trader_on_bar", |b| {
         let mut idx = WARM_UP * UNIVERSE;
         b.iter(|| {
-            let bar = &bars[idx];
+            let mut bar = bars[idx];
+            ts += 1;
+            bar.ts_event = UnixNanos::from(ts);
             idx = (idx + 1) % bars.len();
-            black_box(trader.on_bar(black_box(bar))).unwrap();
+            black_box(trader.on_bar(black_box(&bar))).unwrap();
         });
     });
 }

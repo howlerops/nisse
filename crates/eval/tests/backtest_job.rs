@@ -234,7 +234,8 @@ fn error_text<T>(result: Result<T, EvalError>) -> String {
     result.err().expect("an error").to_string()
 }
 
-const RESULT_FIELDS: [&str; 16] = [
+const RESULT_FIELDS: [&str; 17] = [
+    "bars_file",
     "requested_start",
     "requested_end",
     "costs",
@@ -306,6 +307,7 @@ async fn a_backtest_registers_runs_and_stores_its_result() {
         })
     );
     assert_eq!(result["summary_includes_warm_up"], json!(true));
+    assert!(result["bars_file"].as_str().unwrap().ends_with(".parquet"));
 
     // The snapshot id names the bars as they read back, not as they were written.
     let read_back = BarReader::open(dir.path())
@@ -473,6 +475,33 @@ async fn a_requested_symbol_without_bars_is_an_invalid_job_and_writes_nothing() 
 
     assert!(
         matches!(err, EvalError::InvalidJob(ref m) if m == "no bars in range for TYPO"),
+        "got {err:?}"
+    );
+    assert_eq!(trial_count(&client).await, trials_before);
+    assert_eq!(version_count(&client).await, versions_before);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_symbol_whose_bars_stop_early_is_an_invalid_job_and_writes_nothing() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let store = Store::new(db.client().await.unwrap());
+    // RISE loses its last ten sessions.
+    let mut bars = market();
+    let cut = bars[bars.len() - 20].ts_event;
+    bars.retain(|bar| symbol_of(bar).as_str() != "RISE" || bar.ts_event < cut);
+    let dir = bars_dir("stops-early", &bars);
+    let job = job(dir.path(), strategy_params());
+    let trials_before = trial_count(&client).await;
+    let versions_before = version_count(&client).await;
+
+    let err = run_backtest_job(&store, &job, true, false, now())
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, EvalError::InvalidJob(ref m) if m.contains("RISE") && m.contains("stop")),
         "got {err:?}"
     );
     assert_eq!(trial_count(&client).await, trials_before);
