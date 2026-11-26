@@ -23,7 +23,9 @@ mod sync;
 pub use decide::{DecisionContext, ReplayOutcome, decide, decide_and_record, replay};
 pub use error::{BoxError, EngineError};
 pub use gateway::{OrderGateway, Submitted};
-pub use order_service::{OrderBookState, reconcile_and_record, record_stream_update};
+pub use order_service::{
+    OrderBookState, reconcile_and_record, record_stream_update, submit_and_record,
+};
 pub use order_tracker::{Applied, OrderTracker, TrackedOrder};
 pub use positions::{Position, PositionBook};
 pub use reconcile::{Finding, reconcile};

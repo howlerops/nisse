@@ -2,13 +2,13 @@
 //! periodic reconciliation, the tracker, the position book and the store.
 
 use nisse_core::{
-    Broker, Clock, OrderEvent, OrderUpdate, RecordSink, StoreRecord,
+    Broker, Clock, IntentLog, OrderEvent, OrderIntent, OrderUpdate, RecordSink, StoreRecord,
     nautilus::{ClientOrderId, UnixNanos},
 };
 
 use crate::{
-    EngineError, Finding, OrderTracker, PositionBook, SyncOptions, SyncReport, TrackedOrder,
-    sync_with_broker,
+    EngineError, Finding, OrderGateway, OrderTracker, PositionBook, Submitted, SyncOptions,
+    SyncReport, TrackedOrder, sync_with_broker,
 };
 
 /// The engine's order state, kept together because every broker message touches both.
@@ -71,11 +71,79 @@ pub async fn record_stream_update<K: RecordSink>(
     Ok(true)
 }
 
+/// Submits an order through the gateway and records what came back.
+///
+/// The gateway has already written the intent row (write-ahead). This adds the row for what
+/// the broker answered, which no stream message will repeat:
+///
+/// - accepted, or already (partly) filled: one `StoreRecord::Order` with the order's row and
+///   the fill if there is one, and for a fill the position update and its
+///   `StoreRecord::Position`. Without this a market order that comes back filled would never
+///   get a fill row: the later stream message carries no new quantity.
+/// - definitely rejected, or the intent could not be recorded: one `StoreRecord::Order` with
+///   state `rejected`, so the store shows the order ended. The original error is returned.
+/// - outcome unknown: nothing is recorded; the order is still an intent and reconciliation
+///   resolves it.
+///
+/// If recording fails after a successful submit the error is `Store(..)`: the order is live
+/// at the broker and the caller must stop trading and reconcile.
+pub async fn submit_and_record<B: Broker, L: IntentLog, K: RecordSink>(
+    gateway: &OrderGateway<B, L>,
+    state: &mut OrderBookState,
+    sink: &K,
+    intent: &OrderIntent,
+) -> Result<Submitted, EngineError> {
+    match gateway.submit(&mut state.tracker, intent).await {
+        Ok(submitted) => {
+            let tracked = tracked_order(&state.tracker, intent.client_order_id)?;
+            emit(
+                sink,
+                StoreRecord::Order {
+                    event: order_row(&tracked, tracked.last_update_ts),
+                    fill: submitted.applied.fill,
+                },
+            )
+            .await?;
+            if let Some(fill) = submitted.applied.fill {
+                let event = state.positions.apply_fill(
+                    tracked.intent.symbol,
+                    tracked.intent.side,
+                    fill.qty.as_decimal(),
+                    fill.px.as_decimal(),
+                    fill.ts,
+                );
+                emit(sink, StoreRecord::Position(event)).await?;
+            }
+            Ok(submitted)
+        }
+        Err(
+            error @ (EngineError::OrderRejected { .. } | EngineError::IntentNotRecorded { .. }),
+        ) => {
+            let tracked = tracked_order(&state.tracker, intent.client_order_id)?;
+            // Best effort: when the intent could not be recorded the store is probably down,
+            // and the rejection that matters is the one returned to the caller.
+            let recorded = emit(
+                sink,
+                StoreRecord::Order {
+                    event: order_row(&tracked, tracked.last_update_ts),
+                    fill: None,
+                },
+            )
+            .await;
+            if let Err(record_error) = recorded {
+                tracing::error!(error = %record_error, "could not record a rejected order");
+            }
+            Err(error)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Runs one reconciliation pass against the broker and records everything it changed.
 ///
 /// 1. `sync_with_broker` with the tracker and `state.positions.quantities()`.
 /// 2. For every order with a state change or a fill in the report, emit one
-///    `StoreRecord::Order` (the tracked order's row at `now`, with its fill if it has one in
+///    `StoreRecord::Order` (the tracked order's row at its last update time, with its fill if it has one in
 ///    the report; an order with several fills in one pass gets one record per fill, and the
 ///    row's cumulative quantity is the tracker's current figure).
 /// 3. For every `Finding::PositionMismatch`, `PositionBook::adopt` the broker's quantity and
@@ -114,7 +182,10 @@ pub async fn reconcile_and_record<B: Broker, K: RecordSink, C: Clock>(
 
     for id in ids {
         let tracked = tracked_order(&state.tracker, id)?;
-        let event = order_row(&tracked, now);
+        // Stamped with the tracker's own time for the order: the broker's time when the state
+        // came from the broker, `now` only for a locally decided state. Mixing the engine's
+        // clock into broker-derived rows would let clock skew reorder an order's history.
+        let event = order_row(&tracked, tracked.last_update_ts);
         let mut has_fill = false;
         for fill in report
             .fills

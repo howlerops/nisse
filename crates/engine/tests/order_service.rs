@@ -433,7 +433,8 @@ async fn fill_found_by_the_pass_is_recorded_and_the_position_comes_from_the_brok
                 OrderState::Filled,
                 Some(filled.venue_order_id),
                 "10",
-                9_000,
+                // The broker's time for the order, not the engine clock.
+                filled.ts.as_u64(),
                 Some(fill),
             ),
             position_rec("10", "500.2", 9_000),
@@ -539,7 +540,7 @@ async fn revived_order_emits_a_row_with_its_new_state() {
                 OrderState::Accepted,
                 Some(live.venue_order_id),
                 "0",
-                9_000,
+                live.ts.as_u64(),
                 None,
             ),
         ]
@@ -586,4 +587,127 @@ async fn foreign_open_order_is_reported_but_records_nothing() {
     );
     assert!(sink.records().is_empty());
     assert!(state.tracker.get(cid("manual-7")).is_none());
+}
+
+// Regression tests for the Phase 2 independent review.
+
+#[tokio::test]
+async fn a_failed_lookup_does_not_lose_fills_already_found_in_the_pass() {
+    // Two orders. The first has drifted (a fill we missed); the second is not in the open
+    // list and its lookup fails. The first order's fill must still be recorded.
+    let first = intent("nisse-1-0", "10", Some("500.10"));
+    let second = intent("nisse-2-0", "10", Some("500.10"));
+    let mut state = OrderBookState::default();
+    state.tracker.track_intent(first).unwrap();
+    state.tracker.track_intent(second).unwrap();
+    state
+        .tracker
+        .apply_snapshot(&accepted_from(&second))
+        .unwrap();
+    let broker = broker();
+    broker.set_open_orders(vec![snapshot(
+        &first,
+        OrderState::PartiallyFilled,
+        "5",
+        Some("500.05"),
+    )]);
+    broker.fail_lookups("timeout");
+    let sink = MemorySink::new();
+
+    let report = reconcile_and_record(&broker, &mut state, &sink, &clock(), opts(0))
+        .await
+        .unwrap();
+    assert_eq!(report.fills.len(), 1);
+    assert_eq!(report.problems.len(), 1);
+    assert_eq!(report.problems[0].client_order_id, cid("nisse-2-0"));
+    let recorded_fills = sink
+        .records()
+        .iter()
+        .filter(|record| matches!(record, StoreRecord::Order { fill: Some(_), .. }))
+        .count();
+    assert_eq!(
+        recorded_fills, 1,
+        "the fill found before the failure is recorded"
+    );
+}
+
+#[tokio::test]
+async fn an_order_filled_on_submit_gets_its_fill_and_position_recorded() {
+    let log = support::new_call_log();
+    let broker = FakeBroker::new(std::sync::Arc::clone(&log));
+    let i = intent("nisse-1-0", "10", None);
+    broker.push_submit_result(Ok(snapshot(&i, OrderState::Filled, "10", Some("500.05"))));
+    let gateway = nisse_engine::OrderGateway::new(broker, support::MemoryIntentLog::new(log));
+    let mut state = OrderBookState::default();
+    let sink = MemorySink::new();
+
+    let submitted = nisse_engine::submit_and_record(&gateway, &mut state, &sink, &i)
+        .await
+        .unwrap();
+    let fill = submitted.applied.fill.unwrap();
+    let records = sink.records();
+    assert_eq!(records.len(), 2);
+    assert!(
+        matches!(&records[0], StoreRecord::Order { event, fill: Some(f) }
+            if event.state == OrderState::Filled && *f == fill)
+    );
+    assert_eq!(records[1], position_rec("10", "500.05", fill.ts.as_u64()));
+    assert_eq!(state.positions.get(spy()).qty, dec("10"));
+
+    // The stream then repeats the fill: nothing more is recorded or counted.
+    let repeat = update(submitted.order, None, submitted.order.ts.as_u64());
+    record_stream_update(&mut state, &sink, &repeat)
+        .await
+        .unwrap();
+    assert_eq!(sink.records().len(), 2);
+    assert_eq!(state.positions.get(spy()).qty, dec("10"));
+}
+
+#[tokio::test]
+async fn a_rejected_submit_records_the_rejection_and_returns_the_error() {
+    let log = support::new_call_log();
+    let broker = FakeBroker::new(std::sync::Arc::clone(&log));
+    broker.push_submit_result(Err(nisse_core::SubmitError::Rejected(support::FakeError(
+        "insufficient buying power".to_owned(),
+    ))));
+    let gateway = nisse_engine::OrderGateway::new(broker, support::MemoryIntentLog::new(log));
+    let i = intent("nisse-1-0", "10", Some("500.10"));
+    let mut state = OrderBookState::default();
+    let sink = MemorySink::new();
+
+    let err = nisse_engine::submit_and_record(&gateway, &mut state, &sink, &i)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::OrderRejected { .. }));
+    assert_eq!(
+        sink.records(),
+        vec![order_rec(
+            &i,
+            OrderState::Rejected,
+            None,
+            "0",
+            i.ts.as_u64(),
+            None
+        )]
+    );
+    assert_eq!(state.positions.get(spy()).qty, dec("0"));
+}
+
+#[tokio::test]
+async fn an_unknown_submit_outcome_records_nothing() {
+    let log = support::new_call_log();
+    let broker = FakeBroker::new(std::sync::Arc::clone(&log));
+    broker.push_submit_result(Err(nisse_core::SubmitError::Unknown(support::FakeError(
+        "timeout".to_owned(),
+    ))));
+    let gateway = nisse_engine::OrderGateway::new(broker, support::MemoryIntentLog::new(log));
+    let i = intent("nisse-1-0", "10", Some("500.10"));
+    let mut state = OrderBookState::default();
+    let sink = MemorySink::new();
+
+    let err = nisse_engine::submit_and_record(&gateway, &mut state, &sink, &i)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::OrderOutcomeUnknown { .. }));
+    assert!(sink.records().is_empty());
 }

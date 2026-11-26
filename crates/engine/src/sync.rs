@@ -86,9 +86,9 @@ pub struct SyncReport {
 ///    when the broker is flat).
 /// 6. `UnknownAtBroker`: nothing is changed; it is only reported.
 ///
-/// An order whose snapshot cannot be applied is listed in `problems` and skipped; it does not
-/// stop the pass. A failed broker request does: it aborts with `Broker(..)` and the tracker
-/// keeps whatever was applied so far. `now` is the caller's clock reading.
+/// An order whose snapshot cannot be applied, or whose lookup fails, is listed in `problems`
+/// and skipped; it does not stop the pass. Only a failure of the two opening reads (open
+/// orders, positions) aborts with `Broker(..)`, and at that point nothing has been changed. `now` is the caller's clock reading.
 pub async fn sync_with_broker<B: Broker>(
     broker: &B,
     tracker: &mut OrderTracker,
@@ -112,13 +112,16 @@ pub async fn sync_with_broker<B: Broker>(
         match finding {
             Finding::OrderDrift { order } => apply_snapshot(tracker, &order, &mut report),
             Finding::NotOpenAtBroker { client_order_id } => {
-                match broker
-                    .order_by_client_id(client_order_id)
-                    .await
-                    .map_err(broker_error)?
-                {
-                    Some(order) => apply_snapshot(tracker, &order, &mut report),
-                    None => not_found(tracker, client_order_id, now, options, &mut report)?,
+                // A failed lookup is a problem for this order only. Ending the pass here would
+                // throw away the report, and with it the fills already applied to the tracker,
+                // which no later pass would find again.
+                match broker.order_by_client_id(client_order_id).await {
+                    Ok(Some(order)) => apply_snapshot(tracker, &order, &mut report),
+                    Ok(None) => not_found(tracker, client_order_id, now, options, &mut report)?,
+                    Err(error) => report.problems.push(SyncProblem {
+                        client_order_id,
+                        reason: format!("lookup failed: {error}"),
+                    }),
                 }
             }
             Finding::PositionMismatch {
