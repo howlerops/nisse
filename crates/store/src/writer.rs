@@ -1,10 +1,16 @@
 //! The off-path writer: a bounded queue drained by one task into batched transactions.
 
-use nisse_core::{RecordSink, StoreRecord};
-use tokio::{sync::mpsc, task::JoinHandle};
+use nisse_core::{
+    Fill, MarketSnapshot, OrderEvent, PositionEvent, RecordSink, RiskCheck, StoreRecord,
+};
+use tokio::{
+    sync::{mpsc, oneshot},
+    task::JoinHandle,
+};
 use tokio_postgres::Client;
 
 use crate::StoreError;
+use crate::tables::{fill, market_snapshot, order_event, position_event, risk_check};
 
 /// Queue and batch sizes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,17 +31,15 @@ impl Default for WriterConfig {
 }
 
 /// What travels down the queue.
-#[allow(dead_code, reason = "stub: Phase 2 task S4 uses it")]
 pub(crate) enum Message {
     Record(StoreRecord),
     /// Answered once everything queued before it has been committed.
-    Flush(tokio::sync::oneshot::Sender<()>),
+    Flush(oneshot::Sender<()>),
 }
 
 /// A cheap, cloneable handle to the writer task.
 #[derive(Debug, Clone)]
 pub struct StoreWriter {
-    #[allow(dead_code, reason = "stub: Phase 2 task S4 uses it")]
     tx: mpsc::Sender<Message>,
 }
 
@@ -48,7 +52,108 @@ impl std::fmt::Debug for Message {
     }
 }
 
-#[allow(unused_variables, reason = "stub: Phase 2 task S4")]
+/// The records of one batch, sorted by table. The buffers are reused across batches:
+/// `clear` keeps their capacity.
+struct Buffers {
+    snapshots: Vec<MarketSnapshot>,
+    positions: Vec<PositionEvent>,
+    risks: Vec<RiskCheck>,
+    orders: Vec<(OrderEvent, Option<Fill>)>,
+}
+
+impl Buffers {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            snapshots: Vec::with_capacity(capacity),
+            positions: Vec::with_capacity(capacity),
+            risks: Vec::with_capacity(capacity),
+            orders: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn push(&mut self, record: StoreRecord) {
+        match record {
+            StoreRecord::Snapshot(row) => self.snapshots.push(row),
+            StoreRecord::Position(row) => self.positions.push(row),
+            StoreRecord::Risk(row) => self.risks.push(row),
+            StoreRecord::Order { event, fill } => self.orders.push((event, fill)),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.snapshots.clear();
+        self.positions.clear();
+        self.risks.clear();
+        self.orders.clear();
+    }
+}
+
+/// Writes one batch in a single transaction. Nothing is committed unless every row is.
+async fn write(client: &mut Client, buffers: &Buffers) -> Result<(), StoreError> {
+    let tx = client.transaction().await?;
+    market_snapshot::insert_many(&tx, &buffers.snapshots).await?;
+    position_event::insert_many(&tx, &buffers.positions).await?;
+    risk_check::insert_many(&tx, &buffers.risks).await?;
+    for (event, fill_row) in &buffers.orders {
+        order_event::insert(&tx, event).await?;
+        if let Some(fill_row) = fill_row {
+            // `false` means this execution id is already stored: recorded once, carry on.
+            fill::insert(&tx, fill_row).await?;
+        }
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// The writer task. Returns `Ok` when every handle is gone and the queue is drained, and the
+/// first database error otherwise (dropping the receiver and pending acks on the way out).
+async fn run(
+    mut client: Client,
+    mut rx: mpsc::Receiver<Message>,
+    config: WriterConfig,
+) -> Result<(), StoreError> {
+    let max_batch = config.max_batch.max(1);
+    let mut buffers = Buffers::with_capacity(max_batch);
+    let mut acks: Vec<oneshot::Sender<()>> = Vec::new();
+
+    while let Some(first) = rx.recv().await {
+        let mut message = first;
+        let mut records = 0;
+        loop {
+            match message {
+                Message::Record(record) => {
+                    buffers.push(record);
+                    records += 1;
+                }
+                Message::Flush(ack) => {
+                    acks.push(ack);
+                    break;
+                }
+            }
+            if records >= max_batch {
+                break;
+            }
+            match rx.try_recv() {
+                Ok(next) => message = next,
+                Err(_) => break,
+            }
+        }
+
+        if records > 0 {
+            if let Err(error) = write(&mut client, &buffers).await {
+                tracing::error!(%error, "store writer stopped");
+                return Err(error);
+            }
+            buffers.clear();
+        }
+        for ack in acks.drain(..) {
+            // The caller may have stopped waiting; that is not an error for the writer.
+            let _ = ack.send(());
+        }
+    }
+    Ok(())
+}
+
 impl StoreWriter {
     /// Starts the writer task on its own connection.
     ///
@@ -67,21 +172,30 @@ impl StoreWriter {
         client: Client,
         config: WriterConfig,
     ) -> (Self, JoinHandle<Result<(), StoreError>>) {
-        todo!("Phase 2 task S4")
+        let (tx, rx) = mpsc::channel(config.capacity.max(1));
+        let handle = tokio::spawn(run(client, rx, config));
+        (Self { tx }, handle)
     }
 
     /// Resolves once every record emitted before this call has been committed.
     pub async fn flush(&self) -> Result<(), StoreError> {
-        todo!("Phase 2 task S4")
+        let (ack, committed) = oneshot::channel();
+        self.tx
+            .send(Message::Flush(ack))
+            .await
+            .map_err(|_| StoreError::WriterStopped)?;
+        committed.await.map_err(|_| StoreError::WriterStopped)
     }
 }
 
-#[allow(unused_variables, reason = "stub: Phase 2 task S4")]
 impl RecordSink for StoreWriter {
     type Error = StoreError;
 
     /// Queues a record, waiting if the queue is full. Never drops a record.
     async fn emit(&self, record: StoreRecord) -> Result<(), StoreError> {
-        todo!("Phase 2 task S4")
+        self.tx
+            .send(Message::Record(record))
+            .await
+            .map_err(|_| StoreError::WriterStopped)
     }
 }
