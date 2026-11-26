@@ -649,7 +649,8 @@ async fn b3_unknown_outcome_with_the_order_at_the_broker_is_not_sent_twice() {
 }
 
 #[tokio::test]
-async fn b3b_unknown_outcome_that_never_reached_the_broker_is_resent_once() {
+async fn b3b_unknown_outcome_that_never_reached_the_broker_is_not_resent_within_the_recheck_window()
+{
     let store = MemoryStore::new();
     let sink = MemorySink::new();
     let mut trader = engine(&store, &sink, clock(), &[AAA, BBB]);
