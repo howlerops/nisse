@@ -31,17 +31,22 @@ There is no `main` baseline yet for these; this phase's numbers become the basel
 ## Trend strategy rules (`TrendVolTarget::decide`)
 
 Features read (all must be present, else `Skip` with reason `missing_feature`): `close`,
-`history_days`, `position_qty`, `equity`, `n_assets`. `momentum` and `var_daily` may be
-absent (not enough history).
+`history_days`, `position_qty`, `equity`, `n_assets`, `risk_scale`. `momentum` and `var_daily`
+may be absent (not enough history).
 
-1. `close <= 0`, `equity <= 0` or `n_assets < 1` → `Skip`, `bad_input`.
+`risk_scale` is the risk gate's exposure factor (1 normally, 0.5 after a 10% drawdown, 0 when
+flat or while the kill switch flattens). It multiplies the target weight in step 3, after the
+per-asset cap, so it never lifts a weight above `max_weight`.
+
+1. `close <= 0`, `equity <= 0`, `n_assets < 1`, or `risk_scale < 0` or `risk_scale > 1` →
+   `Skip`, `bad_input`.
 2. `momentum` or `var_daily` absent → `Skip`, `insufficient_history`.
 3. Target shares:
    - `momentum <= 0` → target 0 (`trend_down`).
    - else `asset_vol = sqrt(var_daily × sessions_per_year)` (in `f64`); if it is zero or not
      finite → `Skip`, `zero_vol`; else
      `weight = min(max_weight, (target_vol / asset_vol) / n_assets)`, converted to a
-     `Decimal` rounded half-even to 8 places, and
+     `Decimal` rounded half-even to 8 places, then multiplied by `risk_scale`, and
      `target = floor(weight × equity / close)` to 6 decimal places (`trend_up`).
 4. `delta = target − position_qty`. If `|delta × close| < min_trade_notional` → `Hold`,
    quantity 0, reason `within_band`.
