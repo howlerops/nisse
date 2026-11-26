@@ -393,6 +393,17 @@ fn a_path_with_a_single_quote_is_rejected_without_writing() {
 }
 
 #[test]
+fn a_directory_with_a_glob_character_cannot_be_opened() {
+    let dir = Scratch::new("glob");
+    for name in ["a*b", "a?b", "a[b]", "a{b}"] {
+        let sub = dir.path().join(name);
+        std::fs::create_dir(&sub).unwrap();
+        let err = BarReader::open(&sub).unwrap_err();
+        assert!(matches!(err, BarsError::Data(_)), "{name}: got {err:?}");
+    }
+}
+
+#[test]
 fn empty_slice_writes_no_file() {
     let dir = Scratch::new("empty_slice");
     let file = dir.path().join("nested").join("bars.parquet");

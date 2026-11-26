@@ -92,13 +92,18 @@ fn stored(value: Decimal) -> Result<Decimal, BarsError> {
     Ok(value)
 }
 
-/// `path` as the text of a SQL string literal: valid UTF-8 and free of single quotes.
+/// `path` as the text of a SQL string literal: valid UTF-8 and free of single quotes
+/// and glob characters.
 pub(crate) fn sql_path(path: &Path) -> Result<&str, BarsError> {
     let text = path
         .to_str()
         .ok_or_else(|| BarsError::Data(format!("{} is not valid UTF-8", path.display())))?;
-    if text.contains('\'') {
-        return Err(BarsError::Data(format!("{text} contains a single quote")));
+    // A quote would end the SQL literal; the others are glob characters, which would change
+    // which files `read_parquet` matches.
+    if text.contains(['\'', '*', '?', '[', ']', '{', '}']) {
+        return Err(BarsError::Data(format!(
+            "{text} contains a quote or a glob character"
+        )));
     }
     Ok(text)
 }
