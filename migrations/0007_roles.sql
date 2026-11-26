@@ -8,14 +8,21 @@
 --   there is no GRANT ... ON ALL TABLES and no ALTER DEFAULT PRIVILEGES.
 -- Nothing here grants UPDATE, DELETE, TRUNCATE, REFERENCES or TRIGGER (migrations/tests/0008_roles.sql).
 
+-- Two databases on one server can be migrated at the same moment (parallel test databases do
+-- exactly that), so "create if missing" must also survive losing that race.
 DO $$
+DECLARE
+  role_name text;
 BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'nisse_writer') THEN
-    CREATE ROLE nisse_writer NOLOGIN;
-  END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'nisse_reader') THEN
-    CREATE ROLE nisse_reader NOLOGIN;
-  END IF;
+  FOREACH role_name IN ARRAY ARRAY['nisse_writer', 'nisse_reader'] LOOP
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = role_name) THEN
+      BEGIN
+        EXECUTE format('CREATE ROLE %I NOLOGIN', role_name);
+      EXCEPTION WHEN duplicate_object OR unique_violation THEN
+        NULL;
+      END;
+    END IF;
+  END LOOP;
 END $$;
 
 GRANT USAGE ON SCHEMA public TO nisse_writer, nisse_reader;
