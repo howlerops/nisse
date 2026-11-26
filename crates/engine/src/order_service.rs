@@ -1,9 +1,15 @@
 //! Turning broker order activity into store rows: the glue between the order stream, the
 //! periodic reconciliation, the tracker, the position book and the store.
 
-use nisse_core::{Broker, Clock, OrderUpdate, RecordSink};
+use nisse_core::{
+    Broker, Clock, OrderEvent, OrderUpdate, RecordSink, StoreRecord,
+    nautilus::{ClientOrderId, UnixNanos},
+};
 
-use crate::{EngineError, OrderTracker, PositionBook, SyncOptions, SyncReport};
+use crate::{
+    EngineError, Finding, OrderTracker, PositionBook, SyncOptions, SyncReport, TrackedOrder,
+    sync_with_broker,
+};
 
 /// The engine's order state, kept together because every broker message touches both.
 #[derive(Debug, Default)]
@@ -25,13 +31,44 @@ pub struct OrderBookState {
 ///
 /// Returns `Ok(true)` when the update belonged to a tracked order. A sink failure is
 /// `Store(..)`: the caller must stop trading.
-#[allow(unused_variables, reason = "stub: Phase 2 task E3")]
 pub async fn record_stream_update<K: RecordSink>(
     state: &mut OrderBookState,
     sink: &K,
     update: &OrderUpdate,
 ) -> Result<bool, EngineError> {
-    todo!("Phase 2 task E3")
+    let applied = match state
+        .tracker
+        .apply(&update.order, update.fill.as_ref(), update.ts)
+    {
+        Ok(applied) => applied,
+        Err(EngineError::UnknownOrder(_)) => return Ok(false),
+        Err(err) => return Err(err),
+    };
+    if applied.state_change.is_none() && applied.fill.is_none() {
+        return Ok(true);
+    }
+
+    let tracked = tracked_order(&state.tracker, update.order.client_order_id)?;
+    emit(
+        sink,
+        StoreRecord::Order {
+            event: order_row(&tracked, update.ts),
+            fill: applied.fill,
+        },
+    )
+    .await?;
+
+    if let Some(fill) = applied.fill {
+        let event = state.positions.apply_fill(
+            tracked.intent.symbol,
+            tracked.intent.side,
+            fill.qty.as_decimal(),
+            fill.px.as_decimal(),
+            fill.ts,
+        );
+        emit(sink, StoreRecord::Position(event)).await?;
+    }
+    Ok(true)
 }
 
 /// Runs one reconciliation pass against the broker and records everything it changed.
@@ -50,7 +87,6 @@ pub async fn record_stream_update<K: RecordSink>(
 ///
 /// Returns the report. A broker failure is `Broker(..)` (nothing was changed or recorded
 /// beyond what the sync applied before failing); a sink failure is `Store(..)`.
-#[allow(unused_variables, reason = "stub: Phase 2 task E3")]
 pub async fn reconcile_and_record<B: Broker, K: RecordSink, C: Clock>(
     broker: &B,
     state: &mut OrderBookState,
@@ -58,5 +94,110 @@ pub async fn reconcile_and_record<B: Broker, K: RecordSink, C: Clock>(
     clock: &C,
     options: SyncOptions,
 ) -> Result<SyncReport, EngineError> {
-    todo!("Phase 2 task E3")
+    let now = clock.now();
+    let mut quantities = state.positions.quantities();
+    let report =
+        sync_with_broker(broker, &mut state.tracker, &mut quantities, now, options).await?;
+
+    // Each order once, in first-appearance order: state changes first, then fills.
+    let mut ids: Vec<ClientOrderId> = Vec::with_capacity(report.state_changes.len());
+    let changed = report
+        .state_changes
+        .iter()
+        .map(|change| change.client_order_id);
+    let filled = report.fills.iter().map(|fill| fill.client_order_id);
+    for id in changed.chain(filled) {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+
+    for id in ids {
+        let tracked = tracked_order(&state.tracker, id)?;
+        let event = order_row(&tracked, now);
+        let mut has_fill = false;
+        for fill in report
+            .fills
+            .iter()
+            .filter(|fill| fill.client_order_id == id)
+        {
+            has_fill = true;
+            emit(
+                sink,
+                StoreRecord::Order {
+                    event,
+                    fill: Some(*fill),
+                },
+            )
+            .await?;
+        }
+        if !has_fill {
+            emit(sink, StoreRecord::Order { event, fill: None }).await?;
+        }
+    }
+
+    // The broker's position already includes the fills found above, so only the position
+    // figures are adopted here, never the fills.
+    for finding in &report.findings {
+        if let Finding::PositionMismatch {
+            symbol,
+            broker,
+            broker_avg_px,
+            ..
+        } = *finding
+            && let Some(event) = state.positions.adopt(symbol, broker, broker_avg_px, now)
+        {
+            emit(sink, StoreRecord::Position(event)).await?;
+        }
+    }
+
+    for finding in &report.findings {
+        if let Finding::UnknownAtBroker { order } = finding {
+            tracing::error!(
+                client_order_id = %order.client_order_id,
+                "open order at the broker that the engine never sent"
+            );
+        }
+    }
+    for problem in &report.problems {
+        tracing::error!(
+            client_order_id = %problem.client_order_id,
+            reason = %problem.reason,
+            "broker snapshot could not be applied"
+        );
+    }
+    if report.unrepresentable_at_broker > 0 {
+        tracing::error!(
+            count = report.unrepresentable_at_broker,
+            "open orders of a kind the engine never sends"
+        );
+    }
+
+    Ok(report)
+}
+
+/// Sends one record to the sink. A sink failure means the store is gone.
+async fn emit<K: RecordSink>(sink: &K, record: StoreRecord) -> Result<(), EngineError> {
+    sink.emit(record)
+        .await
+        .map_err(|err| EngineError::Store(Box::new(err)))
+}
+
+/// The row for the engine's current view of a tracked order, at event time `ts`.
+fn order_row(tracked: &TrackedOrder, ts: UnixNanos) -> OrderEvent {
+    OrderEvent::of(
+        &tracked.intent,
+        tracked.state,
+        tracked.venue_order_id,
+        tracked.cum_filled_qty,
+        ts,
+    )
+}
+
+/// A copy of the tracked order. Errors with `UnknownOrder` when it is not tracked.
+fn tracked_order(tracker: &OrderTracker, id: ClientOrderId) -> Result<TrackedOrder, EngineError> {
+    tracker
+        .get(id)
+        .copied()
+        .ok_or(EngineError::UnknownOrder(id))
 }

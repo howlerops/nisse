@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use nisse_core::{
     AccountSnapshot, Broker, BrokerOrder, BrokerPosition, DecisionId, IntentLog, OpenOrders,
-    OrderIntent, OrderState, SubmitError,
+    OrderIntent, OrderState, RecordSink, StoreRecord, SubmitError,
     nautilus::{
         ClientOrderId, Money, OrderSide, OrderType, Price, Quantity, Symbol, TimeInForce,
         UnixNanos, VenueOrderId,
@@ -289,6 +289,52 @@ impl IntentLog for MemoryIntentLog {
             return Err(FakeError(message.clone()));
         }
         state.intents.push(*intent);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
+struct SinkState {
+    records: Vec<StoreRecord>,
+    fail: Option<String>,
+}
+
+/// An in-memory [`RecordSink`] that keeps every record in the order it was emitted.
+///
+/// While failing (see [`fail_with`](Self::fail_with)) `emit` returns `FakeError` and records
+/// nothing. Clones share the same records.
+#[derive(Clone, Default)]
+pub struct MemorySink {
+    state: Arc<Mutex<SinkState>>,
+}
+
+impl MemorySink {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The records emitted so far, in emit order.
+    #[must_use]
+    pub fn records(&self) -> Vec<StoreRecord> {
+        lock(&self.state).records.clone()
+    }
+
+    /// Makes every later `emit` fail with `FakeError(msg)`, without recording.
+    pub fn fail_with(&self, msg: &str) {
+        lock(&self.state).fail = Some(msg.to_owned());
+    }
+}
+
+impl RecordSink for MemorySink {
+    type Error = FakeError;
+
+    async fn emit(&self, record: StoreRecord) -> Result<(), FakeError> {
+        let mut state = lock(&self.state);
+        if let Some(message) = &state.fail {
+            return Err(FakeError(message.clone()));
+        }
+        state.records.push(record);
         Ok(())
     }
 }
