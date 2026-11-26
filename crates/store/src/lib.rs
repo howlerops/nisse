@@ -10,11 +10,6 @@
 //! - [`StoreWriter`]: everything else, through a bounded queue to a writer task that batches
 //!   rows into transactions, so the engine never waits on the database for them.
 
-#![allow(
-    dead_code,
-    reason = "Phase 2 in progress: stubs call nothing yet. LEAD: remove before the PR."
-)]
-
 mod db;
 mod error;
 mod store;

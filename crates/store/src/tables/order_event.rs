@@ -28,6 +28,10 @@ const ALL: [OrderState; 10] = [
 ];
 
 /// Position of `state` in [`ALL`]. Exhaustive on purpose: a new variant fails to compile here.
+#[allow(
+    dead_code,
+    reason = "called only by the unit test; its exhaustive match is what breaks the build"
+)]
 const fn index(state: OrderState) -> usize {
     match state {
         OrderState::Intent => 0,

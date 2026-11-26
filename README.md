@@ -6,7 +6,7 @@ A deterministic Rust engine (built on NautilusTrader crates) trades through Alpa
 
 ## Status
 
-**Phase 1 (Alpaca adapter).** The workspace, CI, store schema and the Alpaca adapter exist, tested against a local mock server. The adapter's paper round-trip tests are run by the owner (see [`docs/runbooks/paper-tests.md`](docs/runbooks/paper-tests.md)). There is no strategy yet. See [PLAN.md](PLAN.md) for the build plan and the GitHub issues for per-phase work.
+**Phase 2 (decision store).** The workspace, CI, store schema, Alpaca adapter, decision store and replay job exist. The adapter is tested against a local mock server and the store against a real Postgres; the adapter's paper round-trip tests are run by the owner (see [`docs/runbooks/paper-tests.md`](docs/runbooks/paper-tests.md)). There is no strategy and no running engine process yet. See [PLAN.md](PLAN.md) for the build plan and the GitHub issues for per-phase work.
 
 ## Layout
 
@@ -28,6 +28,10 @@ The Rust toolchain is pinned in `rust-toolchain.toml`; `rustup` installs it on f
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+
+# Store tests need a Postgres server. In a dev container with Postgres 16 installed:
+eval "$(scripts/dev-postgres.sh)"   # starts it if needed, exports DATABASE_URL and TEST_DATABASE_URL
+cargo test --workspace --all-features
 
 # Apply the schema to a scratch database and run the schema tests (needs psql and CREATEDB):
 DATABASE_URL=postgres://localhost/postgres scripts/test-migrations.sh

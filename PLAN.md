@@ -58,7 +58,7 @@ Two loops that meet only at a human-approved merge.
 
 ## Trade store and evals
 
-Store every decision, not just every fill. Rank strategy versions, not individual trades (single-trade P&L is mostly luck). All tables are append-only with `event_ts` and `ingest_ts`; corrections are new rows. A trigger on every table rejects UPDATE, DELETE and TRUNCATE; a table owner or superuser can still disable it, so from Phase 2 the engine connects as a role with INSERT and SELECT only. The schema is in `migrations/`, applied by `scripts/migrate.sh`.
+Store every decision, not just every fill. Rank strategy versions, not individual trades (single-trade P&L is mostly luck). All tables are append-only with `event_ts` and `ingest_ts`; corrections are new rows. A trigger on every table rejects UPDATE, DELETE and TRUNCATE. A table owner or superuser could still disable it, so the engine connects as `nisse_writer`, a role that can only INSERT and SELECT, cannot set `id` or `ingest_ts`, and does not own the tables. The schema is in `migrations/`, applied by `scripts/migrate.sh`.
 
 ### Tables
 
@@ -77,7 +77,7 @@ Store every decision, not just every fill. Rank strategy versions, not individua
 
 Every table also has `id` and `ingest_ts`. `order_event.client_order_id` is written with the intent row before submission, when `broker_order_id` is still unknown; fills refer to their order by `client_order_id`. Column types and constraints are in [`docs/phases/phase-0.md`](docs/phases/phase-0.md).
 
-**Nightly replay test:** rerunning a decision from its features, config hash and seed on the recorded git SHA must reproduce the same action.
+**Nightly replay test:** rerunning a decision from its features, config hash and seed on the recorded git SHA must reproduce the same action. A strategy's decision is a pure function of its features (which include the current position), its parameters and the seed; `scripts/replay.sh` replays every decision made by the build at HEAD and writes a `replay_match` score per decision. Timestamps are stored to the microsecond.
 
 ### Trade-level scores
 
