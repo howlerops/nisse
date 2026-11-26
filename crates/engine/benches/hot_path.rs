@@ -1,10 +1,20 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, reason = "benchmark setup")]
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use nisse_core::Features;
+use nisse_core::{
+    Features, ManualClock, StrategyVersionId,
+    nautilus::{
+        AggregationSource, Bar, BarAggregation, BarSpecification, BarType, InstrumentId, Price,
+        PriceType, Quantity, Symbol, UnixNanos, Venue,
+    },
+};
 use nisse_engine::Strategy;
 use nisse_engine::features::{RollingStats, WindowSpec};
 use nisse_engine::strategies::{TrendParams, TrendVolTarget, feature};
+use nisse_engine::{
+    CostModel, MemoryStore, OrderBookState, OrderGateway, SimBroker, SyncOptions, Trader,
+    TraderConfig,
+};
 use rust_decimal::Decimal;
 use std::hint::black_box;
 
@@ -70,5 +80,91 @@ fn trend_decide(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, rolling_push, trend_decide);
+/// Symbols in the benchmarked universe.
+const UNIVERSE: usize = 8;
+
+/// One bar per symbol and session of the table, all with positive, varying closes.
+fn trader_bar(symbol: Symbol, day: u64, close: Decimal) -> Bar {
+    let instrument_id = InstrumentId::new(symbol, Venue::new("ALPACA"));
+    let spec = BarSpecification::new(1, BarAggregation::Day, PriceType::Last);
+    let bar_type = BarType::new(instrument_id, spec, AggregationSource::External);
+    let price = Price::from_decimal(close).unwrap();
+    let ts = UnixNanos::from(day * 86_400_000_000_000);
+    Bar::new(
+        bar_type,
+        price,
+        price,
+        price,
+        price,
+        Quantity::from("1000"),
+        ts,
+        ts,
+    )
+}
+
+fn trader_on_bar(c: &mut Criterion) {
+    let strategy = TrendVolTarget::new(TrendParams {
+        lookback_days: 252,
+        skip_days: 21,
+        vol_window: 60,
+        target_vol: Decimal::new(9, 2),
+        max_weight: Decimal::new(25, 2),
+        min_trade_notional: Decimal::new(25, 0),
+        sessions_per_year: 252,
+    })
+    .unwrap();
+    let symbols: Vec<Symbol> = (0..UNIVERSE)
+        .map(|i| Symbol::new(format!("S{i:02}")))
+        .collect();
+    let config = TraderConfig {
+        strategy_version_id: StrategyVersionId(1),
+        symbols: symbols.clone(),
+        window: strategy.window_spec(),
+        data_snapshot_id: "bench".to_owned(),
+        seed: 0,
+        sync: SyncOptions {
+            never_arrived_grace_nanos: 0,
+            never_arrived_recheck_nanos: 0,
+        },
+    };
+    let store = MemoryStore::new();
+    let mut trader = Trader::new(
+        strategy,
+        OrderGateway::new(
+            SimBroker::new(
+                Decimal::from(100_000),
+                CostModel::new(Decimal::ZERO, Decimal::ZERO).unwrap(),
+            ),
+            &store,
+        ),
+        &store,
+        &store,
+        ManualClock::new(UnixNanos::from(1_000_u64)),
+        config,
+        OrderBookState::default(),
+    )
+    .unwrap();
+
+    // Bars cycle over symbols and days: entry `i` is symbol `i % UNIVERSE`, on day `i / UNIVERSE`.
+    let bars: Vec<Bar> = (0..CLOSES * UNIVERSE)
+        .map(|i| {
+            let symbol = &symbols[i % UNIVERSE];
+            trader_bar(*symbol, (i / UNIVERSE) as u64, close_at(i))
+        })
+        .collect();
+    for bar in bars.iter().take(WARM_UP * UNIVERSE) {
+        trader.on_bar(bar).unwrap();
+    }
+
+    c.bench_function("trader_on_bar", |b| {
+        let mut idx = WARM_UP * UNIVERSE;
+        b.iter(|| {
+            let bar = &bars[idx];
+            idx = (idx + 1) % bars.len();
+            black_box(trader.on_bar(black_box(bar))).unwrap();
+        });
+    });
+}
+
+criterion_group!(benches, rolling_push, trend_decide, trader_on_bar);
 criterion_main!(benches);
