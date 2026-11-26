@@ -10,7 +10,7 @@ use std::collections::btree_map::Entry;
 use std::fmt::Write;
 
 use nisse_core::{
-    BrokerOrder, Fill, FillDetail, OrderIntent, OrderState,
+    BrokerOrder, Fill, FillDetail, OrderIntent, OrderState, RestoredOrder,
     nautilus::{ClientOrderId, Price, Quantity, TradeId, UnixNanos, VenueOrderId},
 };
 use rust_decimal::{Decimal, RoundingStrategy};
@@ -94,6 +94,22 @@ impl OrderTracker {
                 Ok(())
             }
         }
+    }
+
+    /// Restores every order the store reports as possibly live. See [`Self::restore`].
+    pub fn restore_all(&mut self, orders: &[RestoredOrder]) -> Result<(), EngineError> {
+        for order in orders {
+            self.restore(TrackedOrder {
+                intent: order.intent,
+                venue_order_id: order.venue_order_id,
+                state: order.state,
+                cum_filled_qty: order.cum_filled_qty,
+                avg_fill_px: order.avg_fill_px,
+                last_update_ts: order.last_update_ts,
+                never_arrived_at: None,
+            })?;
+        }
+        Ok(())
     }
 
     /// Applies one message from the broker's order stream. `fill` is the single execution the

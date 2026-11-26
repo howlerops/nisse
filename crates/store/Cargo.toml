@@ -12,5 +12,18 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+chrono = { workspace = true }
 nisse-core = { workspace = true }
+rust_decimal = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-postgres = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+# Scratch-database helpers for integration tests (this crate's and other crates').
+test-support = []
+
+[dev-dependencies]
+nisse-store = { workspace = true, features = ["test-support"] }

@@ -360,16 +360,19 @@ async fn positions_are_overwritten_and_flat_symbols_are_removed() {
                 symbol: symbol("QQQ"),
                 local: dec("3"),
                 broker: dec("0"),
+                broker_avg_px: None,
             },
             Finding::PositionMismatch {
                 symbol: symbol("SPY"),
                 local: dec("5"),
                 broker: dec("7"),
+                broker_avg_px: Some(dec("100")),
             },
             Finding::PositionMismatch {
                 symbol: symbol("TLT"),
                 local: dec("0"),
                 broker: dec("-2"),
+                broker_avg_px: Some(dec("100")),
             },
         ]
     );

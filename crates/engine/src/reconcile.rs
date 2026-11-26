@@ -31,6 +31,9 @@ pub enum Finding {
         symbol: Symbol,
         local: Decimal,
         broker: Decimal,
+        /// The broker's average entry price, when it reports a single position for the
+        /// symbol; `None` when the broker is flat (or lists the symbol more than once).
+        broker_avg_px: Option<Decimal>,
     },
 }
 
@@ -101,8 +104,15 @@ fn push_position_findings(
     out: &mut Vec<Finding>,
 ) {
     let mut broker: BTreeMap<Symbol, Decimal> = BTreeMap::new();
+    // The broker's average price per symbol; `None` once a symbol has appeared twice, because
+    // two lines have no single average worth adopting.
+    let mut avg_px: BTreeMap<Symbol, Option<Decimal>> = BTreeMap::new();
     for position in broker_positions {
         let signed = signed_qty(position);
+        avg_px
+            .entry(position.symbol)
+            .and_modify(|px| *px = None)
+            .or_insert_with(|| Some(position.avg_entry_px.as_decimal()));
         let total = broker.entry(position.symbol).or_insert(Decimal::ZERO);
         // Overflow cannot happen with real quantities. If it did, the sum saturates to the
         // sign's extreme so the symbol still shows up as a mismatch.
@@ -123,6 +133,7 @@ fn push_position_findings(
                 symbol: *symbol,
                 local: *local_qty,
                 broker: broker_qty,
+                broker_avg_px: broker_avg_px(&avg_px, *symbol, broker_qty),
             });
         }
     }
@@ -132,10 +143,23 @@ fn push_position_findings(
                 symbol: *symbol,
                 local: Decimal::ZERO,
                 broker: *broker_qty,
+                broker_avg_px: broker_avg_px(&avg_px, *symbol, *broker_qty),
             });
         }
     }
     out[start..].sort_unstable_by(|a, b| sort_key(a).cmp(sort_key(b)));
+}
+
+/// The broker's average price for a non-flat position reported on a single line.
+fn broker_avg_px(
+    avg_px: &BTreeMap<Symbol, Option<Decimal>>,
+    symbol: Symbol,
+    broker_qty: Decimal,
+) -> Option<Decimal> {
+    if broker_qty.is_zero() {
+        return None;
+    }
+    avg_px.get(&symbol).copied().flatten()
 }
 
 /// Signed broker quantity: long positive, short negative, flat zero.
@@ -380,6 +404,7 @@ mod tests {
                 symbol: Symbol::new("SPY"),
                 local: dec("5"),
                 broker: dec("7"),
+                broker_avg_px: Some(dec("100")),
             }]
         );
     }
@@ -399,6 +424,7 @@ mod tests {
                 symbol: Symbol::new("QQQ"),
                 local: dec("-2"),
                 broker: dec("-5"),
+                broker_avg_px: Some(dec("100")),
             }]
         );
     }
@@ -430,6 +456,7 @@ mod tests {
                 symbol: Symbol::new("IWM"),
                 local: dec("0"),
                 broker: dec("4"),
+                broker_avg_px: Some(dec("100")),
             }]
         );
     }
@@ -444,6 +471,7 @@ mod tests {
                 symbol: Symbol::new("DIA"),
                 local: dec("6"),
                 broker: dec("0"),
+                broker_avg_px: None,
             }]
         );
     }
@@ -525,16 +553,19 @@ mod tests {
                     symbol: Symbol::new("IWM"),
                     local: dec("0"),
                     broker: dec("4"),
+                    broker_avg_px: Some(dec("100")),
                 },
                 Finding::PositionMismatch {
                     symbol: Symbol::new("SPY"),
                     local: dec("5"),
                     broker: dec("0"),
+                    broker_avg_px: None,
                 },
                 Finding::PositionMismatch {
                     symbol: Symbol::new("TLT"),
                     local: dec("1"),
                     broker: dec("-1"),
+                    broker_avg_px: Some(dec("100")),
                 },
             ]
         );
@@ -576,21 +607,25 @@ mod tests {
                 symbol: Symbol::new("IWM"),
                 local: dec("0"),
                 broker: dec("1"),
+                broker_avg_px: Some(dec("100")),
             },
             Finding::PositionMismatch {
                 symbol: Symbol::new("QQQ"),
                 local: dec("3"),
                 broker: dec("-1"),
+                broker_avg_px: Some(dec("100")),
             },
             Finding::PositionMismatch {
                 symbol: Symbol::new("SPY"),
                 local: dec("2"),
                 broker: dec("9"),
+                broker_avg_px: Some(dec("100")),
             },
             Finding::PositionMismatch {
                 symbol: Symbol::new("TLT"),
                 local: dec("1"),
                 broker: dec("0"),
+                broker_avg_px: None,
             },
         ];
 

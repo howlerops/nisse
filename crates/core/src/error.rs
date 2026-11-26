@@ -13,4 +13,7 @@ pub enum CoreError {
     /// Sessions handed to [`crate::MarketCalendar::new`] were empty, unordered or overlapping.
     #[error("invalid calendar: {0}")]
     InvalidCalendar(&'static str),
+    /// A stored features value was not an object of decimal strings.
+    #[error("invalid features: {0}")]
+    InvalidFeatures(String),
 }
