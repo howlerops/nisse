@@ -1,6 +1,7 @@
 {
   "deflated_sharpe_min": 0.95,
   "pbo_max": 0.2,
+  "pbo_min_configs": 10,
   "trial_budget": 100,
   "sharpe_haircut": 0.5,
   "cv_folds": 8,

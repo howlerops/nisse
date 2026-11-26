@@ -7,9 +7,10 @@ use serde_json::{Map, Value};
 
 use crate::EvalError;
 
-const FIELDS: [&str; 13] = [
+const FIELDS: [&str; 14] = [
     "deflated_sharpe_min",
     "pbo_max",
+    "pbo_min_configs",
     "trial_budget",
     "sharpe_haircut",
     "cv_folds",
@@ -30,6 +31,9 @@ const FIELDS: [&str; 13] = [
 pub struct Gates {
     pub deflated_sharpe_min: f64,
     pub pbo_max: f64,
+    /// Fewest configurations over the same data for the overfitting probability to mean
+    /// anything; with fewer the gate is not evaluated.
+    pub pbo_min_configs: u32,
     pub trial_budget: u32,
     /// The share of the backtest Sharpe removed before it may be used for sizing.
     pub sharpe_haircut: f64,
@@ -70,6 +74,7 @@ impl Gates {
         let gates = Self {
             deflated_sharpe_min: number(object, "deflated_sharpe_min")?,
             pbo_max: number(object, "pbo_max")?,
+            pbo_min_configs: integer(object, "pbo_min_configs")?,
             trial_budget: integer(object, "trial_budget")?,
             sharpe_haircut: number(object, "sharpe_haircut")?,
             cv_folds: integer(object, "cv_folds")?,
@@ -104,6 +109,16 @@ impl Gates {
             "pbo_max",
             self.pbo_max > 0.0 && self.pbo_max <= 0.2,
             "must be above 0 and at most 0.2",
+        )?;
+        check(
+            "pbo_min_configs",
+            self.pbo_min_configs >= 5,
+            "must be at least 5",
+        )?;
+        check(
+            "holdout_start",
+            self.holdout_start <= latest_holdout_start(),
+            "must not be later than 2023-01-01 (a later date shrinks the holdout)",
         )?;
         check(
             "trial_budget",
@@ -146,6 +161,13 @@ impl Gates {
             "must be between 200 and 366",
         )
     }
+}
+
+/// The latest date the holdout may start. The holdout is the reserved end of the bar history;
+/// a gates file may reserve more of it (an earlier date), never less.
+#[must_use]
+pub fn latest_holdout_start() -> NaiveDate {
+    NaiveDate::from_ymd_opt(2023, 1, 1).unwrap_or(NaiveDate::MAX)
 }
 
 fn invalid(field: &str, reason: &str) -> EvalError {
@@ -214,6 +236,7 @@ mod tests {
         let gates = Gates::from_json(&default_json()).unwrap();
         assert!((gates.deflated_sharpe_min - 0.95).abs() < f64::EPSILON);
         assert!((gates.pbo_max - 0.2).abs() < f64::EPSILON);
+        assert_eq!(gates.pbo_min_configs, 10);
         assert_eq!(gates.trial_budget, 100);
         assert!((gates.sharpe_haircut - 0.5).abs() < f64::EPSILON);
         assert_eq!(gates.cv_folds, 8);
@@ -247,6 +270,9 @@ mod tests {
             ("deflated_sharpe_min", json!("0.95")),
             ("pbo_max", json!(0.21)),
             ("pbo_max", json!(0.0)),
+            ("pbo_min_configs", json!(4)),
+            ("holdout_start", json!("2023-01-02")),
+            ("holdout_start", json!("2099-01-01")),
             ("trial_budget", json!(101)),
             ("trial_budget", json!(0)),
             ("sharpe_haircut", json!(0.49)),
@@ -277,6 +303,8 @@ mod tests {
         json["trial_budget"] = json!(50);
         json["sharpe_haircut"] = json!(0.75);
         json["holdout_max_looks"] = json!(3);
+        json["holdout_start"] = json!("2020-01-01");
+        json["pbo_min_configs"] = json!(20);
         assert!(Gates::from_json(&json).is_ok());
     }
 

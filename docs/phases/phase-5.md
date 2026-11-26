@@ -15,8 +15,8 @@ and published reference values, and the jobs against synthetic rows.
 |---|---|---|
 | Where the statistics live | `nisse_eval::stats`: pure functions on `&[f64]`, no I/O, no clock, no dependency beyond `std` | They can be checked by hand and reused by every job. Statistics are `f64`; money stays decimal. |
 | Randomness | A seeded xoshiro256** generator in `stats::rng`, seeded through SplitMix64 | The bootstrap must reproduce exactly from a stored seed; no new dependency. |
-| Normal distribution | Φ by Abramowitz and Stegun 26.2.17 (error < 7.5e-8), Φ⁻¹ by Acklam's rational approximation refined with one Halley step | `std` has neither; accuracy is far below what the gates need. |
-| Return series per trial | Every backtest result stores its daily equity returns (`"returns"`, 8 significant digits) | The deflated Sharpe needs each trial's Sharpe; PBO needs each trial's returns over the same sessions. Rows cannot be amended later. |
+| Normal distribution | Φ by Abramowitz and Stegun 26.2.17 (error < 7.5e-8), Φ⁻¹ by Acklam's rational approximation (no refinement step) | `std` has neither; accuracy is far below what the gates need. |
+| Return series per trial | Every backtest result stores its daily equity returns (`"returns"`, rounded to 10 decimal places) | The deflated Sharpe needs each trial's Sharpe; PBO needs each trial's returns over the same sessions. Rows cannot be amended later. |
 | Gate thresholds | `config/eval/gates.json`, validated like the risk limits: the code refuses thresholds looser than PLAN.md | Thresholds are pre-declared and reviewed, not chosen when a result is known. |
 | Holdout | The last part of the bar history, from `holdout_start` in the gates file. An ordinary backtest whose range reaches into it is refused. A holdout run is a trial marked `"holdout": true` and is refused once `holdout_max_looks` such trials exist. | "Queried once per candidate, logged as a trial, retired after about 10 looks." |
 | Decision holdout | New append-only table `decision_holdout` (one row per decision: hidden or visible, assigned by a keyed hash, 25% hidden), a view `agent_decision` that shows only visible decisions, and a role `nisse_agent` that can read only agent views | "A random 20 to 30% of live decisions held out and never shown to agents." The assignment is fixed when the decision is first scored and cannot change. **New table, view and role: owner can veto.** |
@@ -119,11 +119,12 @@ when `tracking_error ≤ tracking_error_max` and `max_gap ≤ tracking_gap_max`.
 |---|---|---|
 | `deflated_sharpe_min` | `0.95` | ≥ 0.95 and < 1 |
 | `pbo_max` | `0.2` | > 0 and ≤ 0.2 |
+| `pbo_min_configs` | `10` | ≥ 5 |
 | `trial_budget` | `100` | 1 to 100 |
 | `sharpe_haircut` | `0.5` | ≥ 0.5 and < 1 (the share of the backtest Sharpe removed) |
 | `cv_folds` | `8` | 2 to 20 |
 | `cv_embargo_sessions` | `21` | ≥ 21 (the strategy holds for up to a month) |
-| `holdout_start` | `"2023-01-01"` | a date |
+| `holdout_start` | `"2023-01-01"` | a date no later than 2023-01-01 (a later date would shrink the holdout) |
 | `holdout_max_looks` | `10` | 1 to 10 |
 | `tracking_error_max` | `0.05` | > 0 and ≤ 0.10 |
 | `tracking_gap_max` | `0.05` | > 0 and ≤ 0.10 |
@@ -136,21 +137,27 @@ when `tracking_error ≤ tracking_error_max` and `max_gap ≤ tracking_gap_max`.
 For the version's newest backtest trial that has a result and is not a holdout run (the
 "candidate trial"; none → the report says so and every statistical gate is `not_evaluated`):
 
+A trial is **usable** for the statistics when its stored result has a complete return series,
+was not a dirty build, records the same `holdout_start` as the report's gates file, and (for an
+ordinary run) its last bar is before that date. Anything else, including results stored before
+these fields existed, is counted as a trial but never used: a run that looked at the holdout
+under another gates file cannot be judged as if it had not.
+
 | Gate | Value | Pass when |
 |---|---|---|
 | `trial_budget` | lifetime trial count | `≤ trial_budget` |
-| `deflated_sharpe` | as above | `≥ deflated_sharpe_min` |
-| `pbo` | as above | `≤ pbo_max` |
-| `holdout` | number of holdout trials (all versions) | `≤ holdout_max_looks`, and the version has at least one holdout trial with a result (else `not_evaluated`) |
+| `deflated_sharpe` | as above, on the candidate | `≥ deflated_sharpe_min`. The trial Sharpes are those of usable trials, one per (strategy version, data snapshot, requested range), the newest. `not_evaluated` when the candidate is not usable, or, with more than one lifetime trial, when fewer than half the lifetime trials have a usable Sharpe or their variance is zero (nothing to deflate with). |
+| `pbo` | as above | `≤ pbo_max`, over at least `pbo_min_configs` configurations (else `not_evaluated`) |
+| `holdout` | annualised Sharpe of the version's newest holdout run over the holdout sessions only | looks `≤ holdout_max_looks` (else `fail`), and that Sharpe `≥ haircut_sharpe` of the candidate, over at least 20 holdout sessions, with the run not ending `flat`. No holdout run, or no usable candidate → `not_evaluated`. |
 | `replay` | decisions of this version whose newest `replay_match` score is 0 | `= 0` (no scored decision → `not_evaluated`) |
-| `risk_breaches` | orders of this version that have an order row beyond the intent while one of their decision's `risk_check` rows failed | `= 0` |
+| `risk_breaches` | orders of this version sent beyond the intent whose decision has a failed `risk_check` row or fewer than the eight rows the gate writes | `= 0` (no sent order → `not_evaluated`) |
 | `tracking` | tracking error and gap | inside the band (`not_evaluated` without live returns) |
 
 The report also carries, as information: the summary of the candidate trial, bootstrap
 intervals for the annualised Sharpe and Sortino and for the expectancy, the Sharpe of each
 purged fold, and `haircut_sharpe = (1 − sharpe_haircut) × annualised
 backtest Sharpe` (floored at 0), which is the figure the limits file's `haircut_sharpe` may
-not exceed. It is printed as JSON and written as `eval_score` rows (`subject_type`
+not exceed; and how the candidate was run (costs, requested range, symbols, dirty build). It is printed as JSON and written as `eval_score` rows (`subject_type`
 `strategy_version`, one per gate value, `eval_version` `gate-v1`). The Sharpe by regime is not in the report yet: stored return series carry no
 session dates to line up with the benchmark (`outcome::regime` itself is built and tested).
 Exit codes: 0 all pass, 1 a gate failed, 3 none failed but some not evaluated, 4 the report
@@ -170,18 +177,22 @@ is skipped).
   close[t+h] / close[t] − 1`, `bench_ret` the same for the benchmark, `mfe = max(high[t+1..=t+h])
   / close[t] − 1`, `mae = min(low[t+1..=t+h]) / close[t] − 1`, where `t` is the last bar at or
   before the decision time. A decision whose symbol or benchmark has no bar at `t` is left for
-  a later run. The decision-quality score (`eval_score` metric `decision_quality_<h>`) is
+  a later run. The base bar must be less than a day older than the decision. The decision-quality score
+  is not signed by action (an exit followed by a rally scores positive), so readers split it
+  by action. The score (`eval_score` metric `decision_quality_<h>`) is
   `(fwd_ret − bench_ret) / (expected_vol · sqrt(h / periods_per_year))`, written only when the
   decision has an `expected_vol > 0`.
-- **Execution**: for each decision with at least one order row beyond the intent:
+- **Execution**: scored once, three days after the decision's last order row or fill (a
+  terminal state can still be overturned by reconciliation inside that window). For each
+  decision with at least one order row beyond the intent:
   `shortfall_bps = side · (average fill price − arrival) / arrival · 10⁴` (side +1 for a buy,
   −1 for a sell; arrival is the decision's `close` feature, the price the decision was made
   at), `fees_bps = fees / (filled quantity · arrival) · 10⁴`, and `missed_fill_ratio =
   1 − filled / ordered` once every order of the decision is in a terminal state. Metrics
   `shortfall_bps`, `fees_bps`, `missed_fill_ratio`.
 - **Exit**: round trips per symbol by first-in-first-out matching of fills. For each closed
-  round trip: `realized_r = P&L / R`, `mfe_r`, `mae_r` (the excursions of the close between
-  entry and exit, times the quantity, over R) and `capture = realized P&L / (MFE in dollars)`
+  round trip: `realized_r = P&L / R`, `mfe_r`, `mae_r` (the excursions of the closes from the
+  first bar at or after the entry up to the exit, times the quantity, over R) and `capture = realized P&L / (MFE in dollars)`
   when the MFE is positive. Stored against the entry decision (metrics `realized_r`, `mfe_r`,
   `mae_r`, `capture`).
 

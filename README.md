@@ -18,7 +18,7 @@ A deterministic Rust engine (built on NautilusTrader crates) trades through Alpa
 | `crates/alpaca-adapter` | Alpaca data and execution adapter |
 | `crates/store` | Append-only Postgres decision store |
 | `crates/bars` | Daily bars in Parquet files, written and read through DuckDB |
-| `crates/eval` | Replay and backtest jobs; nightly evaluation and promotion gates later |
+| `crates/eval` | Replay, backtest and nightly scoring jobs; the statistics and the promotion gate report |
 | `config/limits/` | The reviewed risk limits file |
 | `config/eval/` | The reviewed promotion gate thresholds |
 | `migrations/` | Store schema as plain SQL, with tests in `migrations/tests/` |

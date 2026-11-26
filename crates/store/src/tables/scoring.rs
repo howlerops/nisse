@@ -305,6 +305,25 @@ pub async fn risk_breaches<C: GenericClient>(
     Ok(row.try_get(0)?)
 }
 
+/// Orders of `version`'s decisions that went beyond the intent, counted per
+/// `client_order_id`. Zero means the version has traded nothing, so a count of zero risk
+/// breaches says nothing about it.
+pub async fn sent_orders<C: GenericClient>(
+    client: &C,
+    version: StrategyVersionId,
+) -> Result<i64, StoreError> {
+    let row = client
+        .query_one(
+            "SELECT count(DISTINCT o.client_order_id) \
+             FROM order_event o \
+             JOIN decision d ON d.id = o.decision_id \
+             WHERE d.strategy_version_id = $1 AND o.state <> 'intent'",
+            &[&version.0],
+        )
+        .await?;
+    Ok(row.try_get(0)?)
+}
+
 /// Rebuilds a symbol from its stored text.
 fn parse_symbol(text: &str) -> Result<Symbol, StoreError> {
     Symbol::new_checked(text).map_err(|e| StoreError::Data(format!("bad stored symbol: {e}")))
