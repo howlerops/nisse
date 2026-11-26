@@ -548,16 +548,17 @@ async fn s1_a_sell_is_not_approved_against_shares_only_on_order() {
     assert_eq!(submits(&calls), vec![buy_id]);
     assert!(trader.needs_flatten());
 
-    // The buy fills at the next open. Now the shares are held and the sell is approved.
+    // Going flat also cancelled the waiting buy, so it never fills: at the next session the
+    // account holds nothing, nothing is on order, and there is nothing left to exit.
     feed(&mut trader, &sessions(&[(AAA, &["109"])], 7)[0]).await;
-    assert_eq!(trader.state().positions.get(sym(AAA)).qty, on_order);
+    assert_eq!(trader.state().positions.get(sym(AAA)).qty, Decimal::ZERO);
     let after = trader.rebalance().await.unwrap();
 
     assert_eq!(after.orders_blocked, 0);
-    assert_eq!(after.orders_submitted, 1);
-    let sell_id = after.decisions[0].0;
-    assert_eq!(after.decisions[0].2, Action::Exit);
-    assert_eq!(submits(&calls), vec![buy_id, client_id_of(sell_id)]);
+    assert_eq!(after.orders_submitted, 0);
+    assert_eq!(after.decisions[0].2, Action::Hold);
+    assert_eq!(submits(&calls), vec![buy_id]);
+    assert!(!trader.needs_flatten());
 }
 
 #[tokio::test]
@@ -837,13 +838,11 @@ async fn s6_a_mode_change_is_flushed_and_an_unchanged_observation_is_not() {
         OrderBookState::default(),
     );
 
+    // A new peak is flushed too: a restart must not come back with a lower one.
     trader.observe_equity(d("100000")).await.unwrap();
-    assert!(sink.flushes().is_empty());
+    assert_eq!(sink.flushes().len(), 1);
     trader.observe_equity(d("100000")).await.unwrap();
-    assert!(
-        sink.flushes().is_empty(),
-        "an unchanged peak must not flush"
-    );
+    assert_eq!(sink.flushes().len(), 1, "an unchanged peak must not flush");
 
     assert_eq!(
         trader.observe_equity(d("80000")).await.unwrap(),

@@ -249,7 +249,9 @@ where
                 ts,
             }))
             .await?;
-            // Durably: a restart must not come back in a looser mode.
+        }
+        // Durably: a restart must not come back with a lower peak or in a looser mode.
+        if observation.new_peak.is_some() || observation.mode_change.is_some() {
             self.flush().await?;
         }
         Ok(observation.mode_change)
@@ -258,7 +260,11 @@ where
     /// Sets the kill switch flag without touching the broker. Used when the flag is read from
     /// the store.
     pub const fn set_kill_switch(&mut self, engaged: bool) {
-        self.gate.set_kill_switch(engaged);
+        // Lowering is ignored while a switch engaged in this process stands: only
+        // `release_kill_switch` lowers that one.
+        if engaged || !self.kill_engaged_here {
+            self.gate.set_kill_switch(engaged);
+        }
     }
 
     /// Reads the kill switch from `source` and sets the flag to what it says. A source that
@@ -364,6 +370,24 @@ where
 
     /// Counts a fill of tracked order `id` in the day-trade tracker. An untracked order is
     /// skipped.
+    /// Asks the broker to cancel every unresolved buy order it has acknowledged. A failed
+    /// cancel is logged and the rest go on: the order stays tracked and reconciliation will
+    /// say what became of it.
+    async fn cancel_working_buys(&self) {
+        let buys: Vec<ClientOrderId> = self
+            .state
+            .tracker
+            .unresolved_orders()
+            .filter(|order| order.intent.side == OrderSide::Buy && order.venue_order_id.is_some())
+            .map(|order| order.intent.client_order_id)
+            .collect();
+        for id in buys {
+            if let Err(err) = self.gateway.cancel(&self.state.tracker, id).await {
+                tracing::error!(client_order_id = %id, error = %err, "could not cancel a waiting buy at zero risk scale");
+            }
+        }
+    }
+
     fn record_day_trade_fill(&mut self, id: ClientOrderId, ts: UnixNanos) {
         if let Some(tracked) = self.state.tracker.get(id) {
             self.gate
@@ -398,6 +422,12 @@ where
             self.config.sync,
         )
         .await?;
+        // Fills found while reconciling (missed while disconnected) count toward day trades.
+        // Recorded before any early return below: the pass has applied them, so no later pass
+        // will report them again.
+        for fill in &report.fills {
+            self.record_day_trade_fill(fill.client_order_id, fill.ts);
+        }
         if !report.is_reconciled() {
             return Err(EngineError::NotReconciled(report.problems.len()));
         }
@@ -414,10 +444,6 @@ where
         if foreign > 0 {
             return Err(EngineError::ForeignOrders(foreign));
         }
-        // Fills found while reconciling (missed while disconnected) count toward day trades too.
-        for fill in &report.fills {
-            self.record_day_trade_fill(fill.client_order_id, fill.ts);
-        }
         let (working, working_sells) = self.working_quantities();
         // The newest bar any symbol has. A symbol whose last bar is older than that has a gap
         // in its data: it is decided without its price features, so the strategy skips it
@@ -433,6 +459,11 @@ where
         let equity = account.equity.as_decimal();
         // Before any decision, so the `risk_scale` in the features reflects the new mode.
         self.observe_equity(equity).await?;
+        // At zero scale nothing more may be bought, so buys still waiting are cancelled. They
+        // stay counted as working until the broker confirms, so nothing is sold against them.
+        if self.gate.risk_scale().is_zero() {
+            self.cancel_working_buys().await;
+        }
 
         let now = self.clock.now();
         let facts = RoundFacts {
@@ -532,11 +563,19 @@ where
         running_gross: &mut Option<Decimal>,
         report: &mut RebalanceReport,
     ) -> Result<(), EngineError> {
-        let qty = decision.intended_qty.abs();
         let side = if decision.intended_qty < Decimal::ZERO {
             OrderSide::Sell
         } else {
             OrderSide::Buy
+        };
+        // A sell never asks for more than can be sold now. The decision may count shares
+        // still on order (it sizes from held plus working); the order sells what is held and
+        // the rest follows when it has filled or been cancelled.
+        let wanted = decision.intended_qty.abs();
+        let qty = if side == OrderSide::Sell && inputs.sellable_qty > Decimal::ZERO {
+            wanted.min(inputs.sellable_qty)
+        } else {
+            wanted
         };
         let days = self.gate.day_trades();
         let order = OrderCheck {
@@ -570,7 +609,7 @@ where
         }
         // The checks are on record before the order exists anywhere else.
         self.flush().await?;
-        let may_hold_exposure = self.send(decision_id, decision, report).await?;
+        let may_hold_exposure = self.send(decision_id, decision, side, qty, report).await?;
         if may_hold_exposure && side == OrderSide::Buy {
             *running_gross = running_gross
                 .zip(inputs.reference_px)
@@ -652,16 +691,13 @@ where
         &mut self,
         decision_id: DecisionId,
         decision: &Decision,
+        side: OrderSide,
+        qty: Decimal,
         report: &mut RebalanceReport,
     ) -> Result<bool, EngineError> {
-        let qty = Quantity::from_decimal(decision.intended_qty.abs()).map_err(|_| {
+        let qty = Quantity::from_decimal(qty).map_err(|_| {
             EngineError::InvalidConfig("order quantity not representable".to_owned())
         })?;
-        let side = if decision.intended_qty < Decimal::ZERO {
-            OrderSide::Sell
-        } else {
-            OrderSide::Buy
-        };
         let intent = OrderIntent {
             decision_id,
             client_order_id: ClientOrderId::new(format!("nisse-{}-0", decision_id.0)),
@@ -674,8 +710,13 @@ where
             ts: self.clock.now(),
         };
         match submit_and_record(&self.gateway, &mut self.state, &self.sink, &intent).await {
-            Ok(_) => {
+            Ok(submitted) => {
                 report.orders_submitted += 1;
+                // A fill in the broker's answer never comes again as a new fill on the
+                // stream, so it is counted toward day trades here.
+                if let Some(fill) = submitted.applied.fill {
+                    self.record_day_trade_fill(fill.client_order_id, fill.ts);
+                }
                 Ok(true)
             }
             Err(EngineError::OrderRejected { .. }) => {

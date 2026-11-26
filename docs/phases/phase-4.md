@@ -103,6 +103,9 @@ square root is `rust_decimal`'s decimal square root (no `f64`).
   change, and after an approved order's eight checks, before the order is submitted. A kill
   switch engaged in the process is never lowered by `refresh_kill_switch`; only
   `release_kill_switch` (a person's decision) lowers it.
+- At zero risk scale (flat, or a flattening kill switch) a rebalance first asks the broker to
+  cancel every waiting buy. A sell never asks for more than is sellable now: the decision may
+  count shares still on order, the order sells what is held.
 - Flat means the strategy's target is zero, and exits go through ordinary decisions. A symbol
   the strategy cannot decide for (no current bar, not enough history) or whose buy is still
   unfilled stays held; `Trader::needs_flatten` reports that, and `run_backtest` rebalances

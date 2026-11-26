@@ -43,21 +43,25 @@ pub struct RiskState {
 impl RiskState {
     /// The state after `events` (every `risk_event` row, in id order): the drawdown state
     /// from [`DrawdownState::restore`], and the kill switch from the newest `kill_switch`
-    /// event. An event that cannot be read is `InvalidEvent`: the state is unknown and the
+    /// event. A drawdown event, or a newest kill-switch event, that cannot be read is `InvalidEvent`: the state is unknown and the
     /// caller must not trade.
     pub fn restore(events: &[RiskEvent]) -> Result<Self, RiskError> {
-        let mut kill_switch_engaged = false;
-        for event in events {
-            if event.kind == RiskEventKind::KillSwitch {
-                kill_switch_engaged = event
-                    .detail
-                    .get("engaged")
-                    .and_then(serde_json::Value::as_bool)
-                    .ok_or_else(|| {
-                        RiskError::InvalidEvent("kill_switch: engaged must be a boolean".to_owned())
-                    })?;
-            }
-        }
+        // Only the newest row decides, as in the store's own kill-switch read: the two must
+        // never disagree about the same history.
+        let newest = events
+            .iter()
+            .rev()
+            .find(|event| event.kind == RiskEventKind::KillSwitch);
+        let kill_switch_engaged = match newest {
+            None => false,
+            Some(event) => event
+                .detail
+                .get("engaged")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| {
+                    RiskError::InvalidEvent("kill_switch: engaged must be a boolean".to_owned())
+                })?,
+        };
         Ok(Self {
             drawdown: DrawdownState::restore(events)?,
             kill_switch_engaged,
