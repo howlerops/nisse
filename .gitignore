@@ -1,11 +1,22 @@
-# Go
-/bin/
-*.test
-*.out
-coverage.*
-# Nisse emit output
-/.nisse/
-# OS/editor
-.DS_Store
+# Rust
+/target/
+**/target/
+**/*.rs.bk
+*.pdb
+
+# Secrets and local env
+.env
+.env*
+!.env.example
+
+# Data
+data/
+*.parquet
+*.duckdb
+*.duckdb.wal
+
+# Editors / OS
 .idea/
 .vscode/
+*.swp
+.DS_Store

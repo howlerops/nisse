@@ -1,0 +1,5 @@
+# Paths requiring human review. Paths are planned; some do not exist yet.
+/crates/risk/            @jbeck018
+/crates/alpaca-adapter/  @jbeck018
+/config/limits/          @jbeck018
+/.github/                @jbeck018
