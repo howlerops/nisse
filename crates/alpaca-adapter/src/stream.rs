@@ -37,6 +37,29 @@ const UNAUTHORIZED: &str = "authorization rejected by server";
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+/// Default for [`StreamOptions::idle_timeout`].
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Timing knobs for [`run_order_stream`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamOptions {
+    /// First reconnect delay; doubles up to [`MAX_RECONNECT_DELAY`].
+    pub min_reconnect_delay: Duration,
+    /// After this long without any frame the client sends a ping; after a second silent
+    /// interval the connection is declared dead and replaced. Without this a half-open TCP
+    /// connection would look healthy forever while order updates silently stop.
+    pub idle_timeout: Duration,
+}
+
+impl Default for StreamOptions {
+    fn default() -> Self {
+        Self {
+            min_reconnect_delay: MIN_RECONNECT_DELAY,
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
+        }
+    }
+}
+
 /// What the stream task sends to its consumer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(
@@ -211,15 +234,24 @@ pub async fn run_order_stream(
     config: &AlpacaConfig,
     credentials: &Credentials,
     events: mpsc::Sender<StreamEvent>,
-    min_reconnect_delay: Duration,
+    options: StreamOptions,
 ) -> Result<(), AdapterError> {
+    let min_reconnect_delay = options.min_reconnect_delay;
     let mut delay = min_reconnect_delay;
     loop {
         if events.is_closed() {
             return Ok(());
         }
         let mut connected = false;
-        let attempt = match run_connection(config, credentials, &events, &mut connected).await {
+        let attempt = match run_connection(
+            config,
+            credentials,
+            &events,
+            &mut connected,
+            options.idle_timeout,
+        )
+        .await
+        {
             Ok(never) => match never {},
             Err(attempt) => attempt,
         };
@@ -267,18 +299,21 @@ fn stream_failure(text: &str) -> Attempt {
     Attempt::Failed(AdapterError::Stream(text.to_owned()))
 }
 
-/// Waits for the next text or binary frame. Pings are answered and pongs skipped. A close
+/// Waits for the next text or binary frame, setting `saw_frame` when any frame arrives. Pings are answered and pongs skipped. A close
 /// frame, end of stream or transport error is a failure. Returns `Closed` if the receiver is
 /// dropped while waiting.
 async fn next_data(
     ws: &mut Socket,
     events: &mpsc::Sender<StreamEvent>,
+    saw_frame: &mut bool,
 ) -> Result<Message, Attempt> {
     loop {
         let frame = tokio::select! {
             frame = ws.next() => frame,
             () = events.closed() => return Err(Attempt::Closed),
         };
+        // Any frame, a pong included, proves the connection is alive.
+        *saw_frame = true;
         match frame {
             Some(Ok(message @ (Message::Text(_) | Message::Binary(_)))) => return Ok(message),
             Some(Ok(Message::Ping(payload))) => {
@@ -310,7 +345,7 @@ async fn await_reply(
     expected: StreamMessage,
 ) -> Result<(), Attempt> {
     loop {
-        let message = match timeout(HANDSHAKE_TIMEOUT, next_data(ws, events)).await {
+        let message = match timeout(HANDSHAKE_TIMEOUT, next_data(ws, events, &mut false)).await {
             Ok(message) => message?,
             Err(_) => return Err(stream_failure("handshake timed out")),
         };
@@ -337,6 +372,7 @@ async fn run_connection(
     credentials: &Credentials,
     events: &mpsc::Sender<StreamEvent>,
     connected: &mut bool,
+    idle_timeout: Duration,
 ) -> Result<Infallible, Attempt> {
     let mut ws = tokio::select! {
         result = timeout(HANDSHAKE_TIMEOUT, connect_async(config.stream_url.as_str())) => {
@@ -372,8 +408,28 @@ async fn run_connection(
         .map_err(|_| Attempt::Closed)?;
     *connected = true;
 
+    let mut saw_frame = false;
+    let mut pinged = false;
     loop {
-        let message = next_data(&mut ws, events).await?;
+        let waited = timeout(idle_timeout, next_data(&mut ws, events, &mut saw_frame)).await;
+        let message = match waited {
+            Ok(message) => {
+                pinged = false;
+                saw_frame = false;
+                message?
+            }
+            Err(_) => {
+                if pinged && !saw_frame {
+                    return Err(stream_failure("no traffic: connection presumed dead"));
+                }
+                ws.send(Message::Ping(Default::default()))
+                    .await
+                    .map_err(ws_error)?;
+                pinged = true;
+                saw_frame = false;
+                continue;
+            }
+        };
         match parse_stream_message(payload(&message)) {
             Ok(StreamMessage::Update(update)) => {
                 events
@@ -698,6 +754,38 @@ mod tests {
         }
     }
 
+    /// Test timing: fast reconnects, and an idle timeout long enough not to fire.
+    fn opts(min_reconnect_delay: Duration) -> StreamOptions {
+        StreamOptions {
+            min_reconnect_delay,
+            idle_timeout: Duration::from_secs(30),
+        }
+    }
+
+    #[tokio::test]
+    async fn silent_connection_is_declared_dead_and_replaced() {
+        // The first server completes the handshake and then never reads or writes again, like
+        // a half-open TCP connection: no pong ever comes back.
+        let (url, _reports) =
+            spawn_server(vec![Scripted::Serve(vec![]), Scripted::Serve(vec![])]).await;
+        let config = test_config(&url);
+        let credentials = Credentials::new("test-key-id", "test-secret");
+        let (tx, mut rx) = mpsc::channel(4);
+        let options = StreamOptions {
+            min_reconnect_delay: Duration::from_millis(10),
+            idle_timeout: Duration::from_millis(50),
+        };
+        let _task =
+            tokio::spawn(async move { run_order_stream(&config, &credentials, tx, options).await });
+
+        assert_eq!(next_event(&mut rx).await, StreamEvent::Connected);
+        match next_event(&mut rx).await {
+            StreamEvent::Disconnected { reason } => assert!(reason.contains("no traffic")),
+            other => panic!("expected Disconnected, got {other:?}"),
+        }
+        assert_eq!(next_event(&mut rx).await, StreamEvent::Connected);
+    }
+
     /// Spawns `run_order_stream` against `url` with placeholder credentials.
     fn start(
         url: &str,
@@ -711,7 +799,9 @@ mod tests {
         let credentials = Credentials::new("test-key-id", "test-secret");
         let (tx, rx) = mpsc::channel(capacity);
         let handle =
-            tokio::spawn(async move { run_order_stream(&config, &credentials, tx, delay).await });
+            tokio::spawn(
+                async move { run_order_stream(&config, &credentials, tx, opts(delay)).await },
+            );
         (rx, handle)
     }
 
@@ -798,7 +888,7 @@ mod tests {
         let credentials = Credentials::new("test-key-id", "test-secret");
         let (tx, mut rx) = mpsc::channel(4);
         let handle = tokio::spawn(async move {
-            run_order_stream(&config, &credentials, tx, Duration::from_millis(10)).await
+            run_order_stream(&config, &credentials, tx, opts(Duration::from_millis(10))).await
         });
         for _ in 0..2 {
             match next_event(&mut rx).await {
@@ -822,7 +912,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         let result = timeout(
             Duration::from_secs(5),
-            run_order_stream(&config, &credentials, tx, Duration::from_millis(10)),
+            run_order_stream(&config, &credentials, tx, opts(Duration::from_millis(10))),
         )
         .await
         .expect("must return without reconnecting");

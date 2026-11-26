@@ -115,10 +115,20 @@ Let `delta = order.cum_filled_qty − tracked.cum_filled_qty`, compared as decim
        id with `-` removed, then `-`, then the raw fixed-point value of `cum_new` in lower
        hex (at most 36 characters). If `order.avg_fill_px` is `None` here, return
        `InconsistentBrokerData`.
-3. `delta == 0`: no fill. If the tracked state is terminal, or `order.state.rank()` is lower
-   than the tracked state's rank, change nothing. Otherwise adopt the state, set
-   `venue_order_id` and `last_update_ts`.
+3. `delta == 0`: no fill.
+   - From the **stream** (`apply`): if the tracked state is terminal, or `order.state.rank()`
+     is lower than the tracked state's rank, change nothing (the message is late).
+   - From a **REST snapshot** (`apply_snapshot`: submit response, open-orders entry, lookup by
+     id): always adopt the broker's state. A snapshot is the broker's current word, so it may
+     move the order "backwards": a rejected cancel returns `PendingCancel` to `Accepted`, and
+     an order wrongly marked never-arrived comes back to life.
+   - In both cases adopting sets the state, `venue_order_id` and `last_update_ts`.
 4. `state_change` is `Some((before, after))` only when the state actually changed.
+
+After a restart the tracker is rebuilt with `OrderTracker::restore`, from the last recorded
+`order_event` row of each open order (its `cum_filled_qty` and average price), not with
+`track_intent`. Otherwise the first snapshot would re-emit already-recorded fills under a
+synthetic id that the `fill.broker_fill_id` uniqueness cannot catch. Phase 2 does the loading.
 
 ## Reconciliation rules (`reconcile`)
 
@@ -130,6 +140,29 @@ Let `delta = order.cum_filled_qty − tracked.cum_filled_qty`, compared as decim
   For every symbol on either side whose signed quantities differ → `PositionMismatch`.
 - Order: order findings sorted by client order id (as strings), then position findings
   sorted by symbol.
+
+`sync_with_broker` applies the findings. Rules added after the independent review:
+
+- A "not found" answer for an order is believed only once its intent is older than the
+  caller's grace period, and even then the verdict is reversible: a later snapshot revives it.
+- An order whose snapshot cannot be applied is listed in `SyncReport::problems` and skipped;
+  the rest of the pass, including positions, still runs.
+- `Broker::open_orders` returns `OpenOrders { orders, unrepresentable }`. Open orders of a
+  kind the engine never sends are not tracked, but their count is reported in
+  `SyncReport::unrepresentable_at_broker`: something else is trading the account.
+
+## Market data rules
+
+Alpaca stamps a daily bar with the start of its day. `daily_bars` takes the calendar and an
+`as_of` time, stamps each bar at its session close (when it became knowable) and leaves out a
+bar whose session has not closed by `as_of`. Pagination stops with an error after 1000 pages.
+
+## Order stream rules
+
+`run_order_stream` takes `StreamOptions { min_reconnect_delay, idle_timeout }`. After
+`idle_timeout` without any frame the client pings; after a second silent interval the
+connection is declared dead and replaced. Failures are reported as
+`Disconnected { reason }` (after listening) or `ConnectFailed { reason }` (before).
 
 ## Tasks
 
@@ -278,3 +311,11 @@ that orders are placed far from the market and cancelled.
 - Running the paper tests (needs the owner's credentials): the two "Integration test" boxes
   and the fractional-limit box in #3 stay open until the owner runs T9.
 - Postgres `IntentLog` implementation: Phase 2, with the store writer.
+- Scheduling: nothing in this phase runs `sync_with_broker` on a timer or consumes
+  `StreamEvent`. Phase 2 wires the stream, the timer and the store together; until then the
+  "reconcile on a timer" box in #3 is only half done (the function exists and is tested).
+- Known gaps, accepted for now: while the consumer is slow the stream task cannot answer
+  pings (the idle timeout then reconnects); an order marked never-arrived that later fills
+  completely without ever being seen open is found only through the position mismatch; the
+  paper tests return early without a cancel attempt if a submit outcome is unknown (the
+  runbook covers manual cleanup).

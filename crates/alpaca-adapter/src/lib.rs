@@ -23,5 +23,8 @@ pub use config::{AlpacaConfig, Credentials, ENV_KEY_ID, ENV_SECRET_KEY, Feed};
 pub use data::{AlpacaData, VENUE};
 pub use error::AdapterError;
 pub use http::AlpacaHttp;
-pub use stream::{MAX_RECONNECT_DELAY, MIN_RECONNECT_DELAY, StreamEvent, run_order_stream};
+pub use stream::{
+    DEFAULT_IDLE_TIMEOUT, MAX_RECONNECT_DELAY, MIN_RECONNECT_DELAY, StreamEvent, StreamOptions,
+    run_order_stream,
+};
 pub use trading::AlpacaTrading;

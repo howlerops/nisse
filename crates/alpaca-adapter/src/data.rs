@@ -3,10 +3,12 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate};
+use chrono_tz::America::New_York;
+use nisse_core::MarketCalendar;
 use nisse_core::nautilus::{
     AggregationSource, Bar, BarAggregation, BarSpecification, BarType, InstrumentId, PriceType,
-    QuoteTick, Symbol, Venue,
+    QuoteTick, Symbol, UnixNanos, Venue,
 };
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -16,6 +18,10 @@ use crate::{AdapterError, AlpacaConfig, AlpacaHttp, Feed};
 
 /// Venue code used in every instrument id this adapter produces (`SPY.ALPACA`).
 pub const VENUE: &str = "ALPACA";
+
+/// Upper bound on pages followed in one bars request, so a server that keeps returning a
+/// page token cannot loop forever (1000 pages is ten million bars).
+const MAX_BAR_PAGES: usize = 1000;
 
 /// The largest page the bars endpoint returns.
 const BARS_PAGE_LIMIT: &str = "10000";
@@ -79,13 +85,21 @@ impl AlpacaData {
 impl AlpacaData {
     /// Daily bars for `symbols` from `start` to `end` (inclusive dates), fully adjusted
     /// (`adjustment=all`), following `next_page_token` until exhausted. The result is sorted
-    /// by symbol, then time. Each bar is `{SYMBOL}.ALPACA-1-DAY-LAST-EXTERNAL`; `ts_event` is
-    /// the bar's `t` and `ts_init` equals it (no wall-clock read).
+    /// by symbol, then time. Each bar is `{SYMBOL}.ALPACA-1-DAY-LAST-EXTERNAL`.
+    ///
+    /// Alpaca stamps a daily bar with the *start* of its day (midnight New York), when its
+    /// close is not yet known. To keep look-ahead out of backtests, `ts_event` and `ts_init`
+    /// are set to the close of that day's session in `calendar`, which is when the bar
+    /// became knowable, and a bar whose session closes after `as_of` (today's bar while the
+    /// market is still open) is left out. A bar dated on a day that is not a session in
+    /// `calendar` is an error: the calendar does not cover the request. No wall clock is read.
     pub async fn daily_bars(
         &self,
         symbols: &[&str],
         start: NaiveDate,
         end: NaiveDate,
+        calendar: &MarketCalendar,
+        as_of: UnixNanos,
     ) -> Result<Vec<Bar>, AdapterError> {
         if symbols.is_empty() {
             return Ok(Vec::new());
@@ -99,7 +113,7 @@ impl AlpacaData {
 
         let mut bars = Vec::new();
         let mut page_token: Option<String> = None;
-        loop {
+        for _page in 0..MAX_BAR_PAGES {
             let mut query: Vec<(&str, &str)> = Vec::with_capacity(9);
             query.extend([
                 ("symbols", symbols_param.as_str()),
@@ -122,25 +136,30 @@ impl AlpacaData {
                 for (symbol, raw_bars) in by_symbol {
                     let bar_type = bar_type(symbol, spec)?;
                     for raw in raw_bars {
-                        bars.push(bar_from_raw(bar_type, raw)?);
+                        if let Some(bar) = bar_from_raw(bar_type, raw, calendar, as_of)? {
+                            bars.push(bar);
+                        }
                     }
                 }
             }
 
             match page.next_page_token {
                 Some(token) if !token.is_empty() => page_token = Some(token),
-                _ => break,
+                _ => {
+                    bars.sort_by(|a, b| {
+                        a.instrument_id()
+                            .symbol
+                            .as_str()
+                            .cmp(b.instrument_id().symbol.as_str())
+                            .then(a.ts_event.cmp(&b.ts_event))
+                    });
+                    return Ok(bars);
+                }
             }
         }
-
-        bars.sort_by(|a, b| {
-            a.instrument_id()
-                .symbol
-                .as_str()
-                .cmp(b.instrument_id().symbol.as_str())
-                .then(a.ts_event.cmp(&b.ts_event))
-        });
-        Ok(bars)
+        Err(AdapterError::Decode(format!(
+            "bars did not end after {MAX_BAR_PAGES} pages"
+        )))
     }
 
     /// The latest quote for each symbol, sorted by symbol. A symbol with no quote, or with a
@@ -185,7 +204,27 @@ fn bar_type(symbol: &str, spec: BarSpecification) -> Result<BarType, AdapterErro
     ))
 }
 
-fn bar_from_raw(bar_type: BarType, raw: &RawBar) -> Result<Bar, AdapterError> {
+/// `None` when the bar's session has not closed by `as_of`.
+fn bar_from_raw(
+    bar_type: BarType,
+    raw: &RawBar,
+    calendar: &MarketCalendar,
+    as_of: UnixNanos,
+) -> Result<Option<Bar>, AdapterError> {
+    // Alpaca's `t` for a daily bar is midnight New York on the bar's date.
+    let date = DateTime::parse_from_rfc3339(&raw.t)
+        .map_err(|_| AdapterError::Decode(format!("bad bar time {}", raw.t)))?
+        .with_timezone(&New_York)
+        .date_naive();
+    let session = calendar.session_on(date).ok_or_else(|| {
+        AdapterError::Decode(format!(
+            "bar dated {date}, which is not a session in the calendar"
+        ))
+    })?;
+    if session.close > as_of {
+        return Ok(None);
+    }
+    let ts = session.close;
     let open = decimal_text(&raw.o)?;
     let high = decimal_text(&raw.h)?;
     let low = decimal_text(&raw.l)?;
@@ -195,7 +234,6 @@ fn bar_from_raw(bar_type: BarType, raw: &RawBar) -> Result<Bar, AdapterError> {
         .into_iter()
         .map(fraction_digits)
         .fold(0, usize::max);
-    let ts = parse_ts(&raw.t)?;
     let bar = Bar::new_checked(
         bar_type,
         parse_price(&pad_fraction(open, digits))?,
@@ -207,7 +245,7 @@ fn bar_from_raw(bar_type: BarType, raw: &RawBar) -> Result<Bar, AdapterError> {
         ts,
     )
     .map_err(decode_error)?;
-    Ok(bar)
+    Ok(Some(bar))
 }
 
 /// `None` when the bid or the ask is zero (no quote on that side).
@@ -289,6 +327,32 @@ mod tests {
         AlpacaData::new(http, &config)
     }
 
+    /// Sessions for 3, 4 and 5 January 2022 (09:30 to 16:00 New York = 14:30 to 21:00 UTC).
+    fn calendar() -> MarketCalendar {
+        let session = |day: u32| {
+            let date = NaiveDate::from_ymd_opt(2022, 1, day).unwrap();
+            let at = |h: u32, m: u32| {
+                let nanos = date
+                    .and_hms_opt(h, m, 0)
+                    .unwrap()
+                    .and_utc()
+                    .timestamp_nanos_opt()
+                    .unwrap();
+                UnixNanos::from(u64::try_from(nanos).unwrap())
+            };
+            nisse_core::Session {
+                date,
+                open: at(14, 30),
+                close: at(21, 0),
+            }
+        };
+        MarketCalendar::new(vec![session(3), session(4), session(5)]).unwrap()
+    }
+
+    fn far_future() -> UnixNanos {
+        UnixNanos::from(u64::MAX)
+    }
+
     fn date(text: &str) -> NaiveDate {
         NaiveDate::parse_from_str(text, "%Y-%m-%d").unwrap()
     }
@@ -320,7 +384,13 @@ mod tests {
             .await;
 
         let bars = data(&server)
-            .daily_bars(&["AAPL", "TSLA"], date("2022-01-01"), date("2022-01-31"))
+            .daily_bars(
+                &["AAPL", "TSLA"],
+                date("2022-01-01"),
+                date("2022-01-31"),
+                &calendar(),
+                far_future(),
+            )
             .await
             .unwrap();
 
@@ -332,7 +402,8 @@ mod tests {
         assert_eq!(bar.low.to_string(), "178.21");
         assert_eq!(bar.close.to_string(), "178.21");
         assert_eq!(bar.volume.to_string(), "1118");
-        let ts = parse_ts("2022-01-03T09:00:00Z").unwrap();
+        // Stamped at the session close (21:00 UTC), not at Alpaca's start-of-day `t`.
+        let ts = parse_ts("2022-01-03T21:00:00Z").unwrap();
         assert_eq!(bar.ts_event, ts);
         assert_eq!(bar.ts_init, bar.ts_event);
     }
@@ -360,7 +431,13 @@ mod tests {
             .await;
 
         let bars = data(&server)
-            .daily_bars(&["AAPL"], date("2022-01-01"), date("2022-01-31"))
+            .daily_bars(
+                &["AAPL"],
+                date("2022-01-01"),
+                date("2022-01-31"),
+                &calendar(),
+                far_future(),
+            )
             .await
             .unwrap();
 
@@ -390,7 +467,13 @@ mod tests {
             .await;
 
         let bars = data(&server)
-            .daily_bars(&["AAPL", "TSLA"], date("2022-01-01"), date("2022-01-31"))
+            .daily_bars(
+                &["AAPL", "TSLA"],
+                date("2022-01-01"),
+                date("2022-01-31"),
+                &calendar(),
+                far_future(),
+            )
             .await
             .unwrap();
 
@@ -403,9 +486,9 @@ mod tests {
                 )
             })
             .collect();
-        let aapl_first = parse_ts("2022-01-03T05:00:00Z").unwrap().as_u64();
-        let aapl_second = parse_ts("2022-01-05T05:00:00Z").unwrap().as_u64();
-        let tsla = parse_ts("2022-01-04T05:00:00Z").unwrap().as_u64();
+        let aapl_first = parse_ts("2022-01-03T21:00:00Z").unwrap().as_u64();
+        let aapl_second = parse_ts("2022-01-05T21:00:00Z").unwrap().as_u64();
+        let tsla = parse_ts("2022-01-04T21:00:00Z").unwrap().as_u64();
         assert_eq!(
             keys,
             [
@@ -428,7 +511,13 @@ mod tests {
             .await;
 
         let bars = data(&server)
-            .daily_bars(&["AAPL"], date("2022-01-01"), date("2022-01-31"))
+            .daily_bars(
+                &["AAPL"],
+                date("2022-01-01"),
+                date("2022-01-31"),
+                &calendar(),
+                far_future(),
+            )
             .await
             .unwrap();
 
@@ -436,6 +525,67 @@ mod tests {
         assert_eq!(bars[1].close.to_string(), "178.21");
         assert_eq!(bars[1].open.to_string(), "178.20");
         assert_eq!(bars[1].low.to_string(), "178.20");
+    }
+
+    #[tokio::test]
+    async fn daily_bars_leave_out_a_session_that_has_not_closed_and_reject_non_sessions() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/stocks/bars"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                r#"{"bars":{"AAPL":[{"c":1,"h":1,"l":1,"o":1,"t":"2022-01-03T05:00:00Z","v":1},{"c":2,"h":2,"l":2,"o":2,"t":"2022-01-04T05:00:00Z","v":1}]},"next_page_token":null}"#,
+                "application/json",
+            ))
+            .mount(&server)
+            .await;
+        // One second before the 4 January close: that day's bar is still forming.
+        let as_of = parse_ts("2022-01-04T20:59:59Z").unwrap();
+        let bars = data(&server)
+            .daily_bars(
+                &["AAPL"],
+                date("2022-01-01"),
+                date("2022-01-31"),
+                &calendar(),
+                as_of,
+            )
+            .await
+            .unwrap();
+        assert_eq!(bars.len(), 1);
+        assert_eq!(bars[0].close.to_string(), "1");
+        // At the close it is known.
+        let at_close = parse_ts("2022-01-04T21:00:00Z").unwrap();
+        let bars = data(&server)
+            .daily_bars(
+                &["AAPL"],
+                date("2022-01-01"),
+                date("2022-01-31"),
+                &calendar(),
+                at_close,
+            )
+            .await
+            .unwrap();
+        assert_eq!(bars.len(), 2);
+
+        // A bar dated on a day the calendar does not hold (a Saturday) is refused.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                r#"{"bars":{"AAPL":[{"c":1,"h":1,"l":1,"o":1,"t":"2022-01-08T05:00:00Z","v":1}]},"next_page_token":null}"#,
+                "application/json",
+            ))
+            .mount(&server)
+            .await;
+        let err = data(&server)
+            .daily_bars(
+                &["AAPL"],
+                date("2022-01-01"),
+                date("2022-01-31"),
+                &calendar(),
+                far_future(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AdapterError::Decode(_)));
     }
 
     #[tokio::test]
@@ -448,7 +598,13 @@ mod tests {
             .await;
 
         let bars = data(&server)
-            .daily_bars(&[], date("2022-01-01"), date("2022-01-31"))
+            .daily_bars(
+                &[],
+                date("2022-01-01"),
+                date("2022-01-31"),
+                &calendar(),
+                far_future(),
+            )
             .await
             .unwrap();
         assert!(bars.is_empty());
@@ -468,7 +624,13 @@ mod tests {
             .await;
 
         let bars = data(&server)
-            .daily_bars(&["AAPL", "NOPE"], date("2022-01-01"), date("2022-01-31"))
+            .daily_bars(
+                &["AAPL", "NOPE"],
+                date("2022-01-01"),
+                date("2022-01-31"),
+                &calendar(),
+                far_future(),
+            )
             .await
             .unwrap();
         assert_eq!(bars.len(), 1);
@@ -491,7 +653,13 @@ mod tests {
             .await;
 
         let err = data(&server)
-            .daily_bars(&["AAPL"], date("2022-01-01"), date("2022-01-31"))
+            .daily_bars(
+                &["AAPL"],
+                date("2022-01-01"),
+                date("2022-01-31"),
+                &calendar(),
+                far_future(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, AdapterError::Status { status: 403, .. }));
@@ -509,7 +677,13 @@ mod tests {
             .mount(&server)
             .await;
         let err = data(&server)
-            .daily_bars(&["AAPL"], date("2022-01-01"), date("2022-01-31"))
+            .daily_bars(
+                &["AAPL"],
+                date("2022-01-01"),
+                date("2022-01-31"),
+                &calendar(),
+                far_future(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, AdapterError::Decode(_)));
@@ -524,7 +698,13 @@ mod tests {
             .mount(&server)
             .await;
         let err = data(&server)
-            .daily_bars(&["AAPL"], date("2022-01-01"), date("2022-01-31"))
+            .daily_bars(
+                &["AAPL"],
+                date("2022-01-01"),
+                date("2022-01-31"),
+                &calendar(),
+                far_future(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, AdapterError::Decode(_)));
