@@ -3,14 +3,18 @@
 
 use nisse_core::nautilus::UnixNanos;
 use nisse_core::{
-    Decision, DecisionId, DecisionLog, IntentLog, OrderEvent, OrderIntent, RestoredOrder,
-    StrategyVersion, StrategyVersionId,
+    Decision, DecisionId, DecisionLog, IntentLog, KillSwitchSource, OrderEvent, OrderIntent,
+    RestoredOrder, RiskEvent, StrategyVersion, StrategyVersionId,
 };
 use tokio_postgres::Client;
 
 use crate::{
     StoreError,
-    tables::{decision, order_event, strategy_version},
+    tables::{
+        decision,
+        fill::{self, FillSide},
+        heartbeat, order_event, risk_event, strategy_version,
+    },
 };
 
 /// A connection used for writes the engine waits for. Each call is one small statement.
@@ -46,6 +50,37 @@ impl Store {
         ended_since: Option<UnixNanos>,
     ) -> Result<Vec<RestoredOrder>, StoreError> {
         order_event::load_live(&self.client, ended_since).await
+    }
+
+    /// Every fill since `since` with the symbol and side of its order. See
+    /// [`fill::recent_sides`].
+    pub async fn recent_fill_sides(&self, since: UnixNanos) -> Result<Vec<FillSide>, StoreError> {
+        fill::recent_sides(&self.client, since).await
+    }
+
+    /// Every risk event in id order. See [`risk_event::load_all`].
+    pub async fn load_risk_events(&self) -> Result<Vec<RiskEvent>, StoreError> {
+        risk_event::load_all(&self.client).await
+    }
+
+    /// Records that `source` was alive at `ts`. See [`heartbeat::insert`].
+    pub async fn heartbeat(&self, source: &str, ts: UnixNanos) -> Result<(), StoreError> {
+        heartbeat::insert(&self.client, source, ts).await
+    }
+
+    /// Writes one risk event now, awaited (for the kill switch and other changes that must
+    /// not sit in a queue).
+    pub async fn record_risk_event(&self, event: &RiskEvent) -> Result<(), StoreError> {
+        risk_event::insert_many(&self.client, std::slice::from_ref(event)).await
+    }
+}
+
+impl KillSwitchSource for Store {
+    type Error = StoreError;
+
+    /// See [`risk_event::kill_switch_engaged`]. An error means the caller must fail closed.
+    async fn kill_switch_engaged(&self) -> Result<bool, StoreError> {
+        risk_event::kill_switch_engaged(&self.client).await
     }
 }
 

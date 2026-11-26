@@ -1,0 +1,14 @@
+{
+  "max_risk_per_trade": "0.005",
+  "risk_sigmas": "2",
+  "kelly_fraction": "0.25",
+  "haircut_sharpe": "0.4",
+  "portfolio_vol": "0.09",
+  "drawdown_halve": "0.10",
+  "drawdown_flat": "0.15",
+  "drawdown_resume": "0.05",
+  "max_bar_age_hours": 96,
+  "max_day_trades": 3,
+  "flatten_on_kill": false,
+  "heartbeat_max_age_seconds": 300
+}

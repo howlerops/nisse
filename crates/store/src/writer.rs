@@ -1,7 +1,7 @@
 //! The off-path writer: a bounded queue drained by one task into batched transactions.
 
 use nisse_core::{
-    Fill, MarketSnapshot, OrderEvent, PositionEvent, RecordSink, RiskCheck, StoreRecord,
+    Fill, MarketSnapshot, OrderEvent, PositionEvent, RecordSink, RiskCheck, RiskEvent, StoreRecord,
 };
 use tokio::{
     sync::{mpsc, oneshot},
@@ -10,7 +10,7 @@ use tokio::{
 use tokio_postgres::Client;
 
 use crate::StoreError;
-use crate::tables::{fill, market_snapshot, order_event, position_event, risk_check};
+use crate::tables::{fill, market_snapshot, order_event, position_event, risk_check, risk_event};
 
 /// Queue and batch sizes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +58,7 @@ struct Buffers {
     snapshots: Vec<MarketSnapshot>,
     positions: Vec<PositionEvent>,
     risks: Vec<RiskCheck>,
+    risk_events: Vec<RiskEvent>,
     orders: Vec<(OrderEvent, Option<Fill>)>,
 }
 
@@ -67,6 +68,7 @@ impl Buffers {
             snapshots: Vec::with_capacity(capacity),
             positions: Vec::with_capacity(capacity),
             risks: Vec::with_capacity(capacity),
+            risk_events: Vec::with_capacity(capacity),
             orders: Vec::with_capacity(capacity),
         }
     }
@@ -76,6 +78,7 @@ impl Buffers {
             StoreRecord::Snapshot(row) => self.snapshots.push(row),
             StoreRecord::Position(row) => self.positions.push(row),
             StoreRecord::Risk(row) => self.risks.push(row),
+            StoreRecord::RiskEvent(row) => self.risk_events.push(row),
             StoreRecord::Order { event, fill } => self.orders.push((event, fill)),
         }
     }
@@ -84,6 +87,7 @@ impl Buffers {
         self.snapshots.clear();
         self.positions.clear();
         self.risks.clear();
+        self.risk_events.clear();
         self.orders.clear();
     }
 }
@@ -94,6 +98,7 @@ async fn write(client: &mut Client, buffers: &Buffers) -> Result<(), StoreError>
     market_snapshot::insert_many(&tx, &buffers.snapshots).await?;
     position_event::insert_many(&tx, &buffers.positions).await?;
     risk_check::insert_many(&tx, &buffers.risks).await?;
+    risk_event::insert_many(&tx, &buffers.risk_events).await?;
     for (event, fill_row) in &buffers.orders {
         order_event::insert(&tx, event).await?;
         if let Some(fill_row) = fill_row {
@@ -197,5 +202,9 @@ impl RecordSink for StoreWriter {
             .send(Message::Record(record))
             .await
             .map_err(|_| StoreError::WriterStopped)
+    }
+
+    async fn flush(&self) -> Result<(), StoreError> {
+        Self::flush(self).await
     }
 }

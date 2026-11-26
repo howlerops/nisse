@@ -16,7 +16,7 @@ use serde_json::Value;
 
 use crate::{
     Action, BrokerOrder, DecisionId, Features, Fill, Hash32, OrderIntent, OrderState,
-    StrategyVersionId, SubjectType, TrialKind,
+    RiskEventKind, StrategyVersionId, SubjectType, TrialKind,
 };
 
 /// One immutable strategy configuration at one git SHA (`strategy_version`).
@@ -207,6 +207,14 @@ pub struct EvalScore {
     pub ts: UnixNanos,
 }
 
+/// One change of the risk state (`risk_event`). See [`RiskEventKind`] for each kind's detail.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RiskEvent {
+    pub kind: RiskEventKind,
+    pub detail: Value,
+    pub ts: UnixNanos,
+}
+
 /// A row the engine hands to the store without waiting for it to be written.
 #[derive(Debug, Clone, PartialEq)]
 #[allow(
@@ -217,6 +225,7 @@ pub enum StoreRecord {
     Snapshot(MarketSnapshot),
     Position(PositionEvent),
     Risk(RiskCheck),
+    RiskEvent(RiskEvent),
     /// An order's new state and, when it filled, the fill. The store writes both in one
     /// transaction: a fill row without the order row carrying its cumulative quantity would
     /// make a restart count that fill again.
@@ -244,4 +253,17 @@ pub trait RecordSink: Send + Sync {
     type Error: std::error::Error + Send + Sync + 'static;
 
     fn emit(&self, record: StoreRecord) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Waits until every record emitted so far is durably written. Used where what happens
+    /// next must not outrun the record of why: the risk checks before an order goes out, a
+    /// kill switch, a drawdown mode change.
+    fn flush(&self) -> impl Future<Output = Result<(), Self::Error>> + Send;
+}
+
+/// Where the kill switch is read from. A caller that gets an error must treat the switch as
+/// engaged: the gate fails closed.
+pub trait KillSwitchSource: Send + Sync {
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    fn kill_switch_engaged(&self) -> impl Future<Output = Result<bool, Self::Error>> + Send;
 }

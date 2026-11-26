@@ -71,6 +71,7 @@ fn trend_decide(c: &mut Criterion) {
         (feature::N_ASSETS, Decimal::new(8, 0)),
         (feature::MOMENTUM, Decimal::new(10, 2)),
         (feature::VAR_DAILY, Decimal::new(101_587, 9)),
+        (feature::RISK_SCALE, Decimal::ONE),
     ] {
         features.insert(name.to_owned(), value);
     }
@@ -126,6 +127,12 @@ fn trader_on_bar(c: &mut Criterion) {
             never_arrived_grace_nanos: 0,
             never_arrived_recheck_nanos: 0,
         },
+        limits: nisse_risk::Limits::load(std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../config/limits/limits.json"
+        )))
+        .unwrap(),
+        risk: nisse_risk::RiskState::default(),
     };
     let store = MemoryStore::new();
     let mut trader = Trader::new(

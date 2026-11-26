@@ -4,6 +4,7 @@
 //! Every evaluation run registers a trial in `trial_registry`.
 
 pub mod backtest_job;
+pub mod deadman;
 mod error;
 pub mod replay;
 

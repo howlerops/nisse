@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use nisse_core::{
-    Action, Decision, Fill, MarketCalendar, StrategyVersionId,
+    Action, Decision, Fill, MarketCalendar, RiskEvent, RiskEventKind, StrategyVersionId,
     nautilus::{
         AggregationSource, Bar, BarAggregation, BarSpecification, BarType, InstrumentId, Price,
         PriceType, Quantity, Symbol, UnixNanos, Venue,
@@ -15,6 +15,7 @@ use nisse_engine::{
     BacktestConfig, BacktestRun, CostModel, EngineError, ReplayOutcome, replay, run_backtest,
     strategies::{TrendParams, TrendVolTarget},
 };
+use nisse_risk::DrawdownMode;
 use rust_decimal::{Decimal, RoundingStrategy};
 
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
@@ -105,14 +106,20 @@ fn px(d: Decimal) -> Price {
     Price::from(at_4dp.to_string().as_str())
 }
 
-/// One bar per close. Open is the previous close times 1.002 (the first open is `start_px`),
-/// close is the previous close times `1 + daily_change` plus or minus 0.1% on alternate days.
+/// One bar per close, every session moving by the same `daily_change`.
 fn series(
     symbol: &str,
     closes: &[UnixNanos],
     start_px: Decimal,
     daily_change: Decimal,
 ) -> Vec<Bar> {
+    shaped(symbol, closes, start_px, &vec![daily_change; closes.len()])
+}
+
+/// One bar per close. `changes[i]` moves the close of session `i` (`changes` and `closes` have
+/// the same length). Open is the previous close times 1.002 (the first open is `start_px`),
+/// close is the previous close times `1 + change` plus or minus 0.1% on alternate days.
+fn shaped(symbol: &str, closes: &[UnixNanos], start_px: Decimal, changes: &[Decimal]) -> Vec<Bar> {
     let wobble = dec("0.001");
     let open_gap = dec("1.002");
     let instrument_id = InstrumentId::new(Symbol::new(symbol), Venue::new("ALPACA"));
@@ -121,8 +128,9 @@ fn series(
     let mut previous = start_px;
     closes
         .iter()
+        .zip(changes.iter().copied())
         .enumerate()
-        .map(|(i, &ts)| {
+        .map(|(i, (&ts, daily_change))| {
             let open = if i == 0 {
                 start_px
             } else {
@@ -202,7 +210,17 @@ fn config(costs: CostModel) -> BacktestConfig {
         costs,
         data_snapshot_id: "snap-bt1".to_owned(),
         seed: 7,
+        limits: limits(),
     }
+}
+
+/// The reviewed limits file in the repository.
+fn limits() -> nisse_risk::Limits {
+    nisse_risk::Limits::load(std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../config/limits/limits.json"
+    )))
+    .unwrap()
 }
 
 fn free() -> CostModel {
@@ -514,6 +532,226 @@ async fn a_single_session_gives_one_equity_point_and_no_orders() {
     assert_eq!(run.fees_paid, Decimal::ZERO);
 }
 
+// ---- drawdown step-down (E3) ----------------------------------------------------------------
+
+/// The session whose close is the drawdown step in the scenarios below: 2023-03-01, not a
+/// month end.
+const CRASH: usize = 42;
+/// The February month end (2023-02-28), a session that is also a rebalance.
+const FEB_END: usize = 41;
+/// The March month end (2023-03-31).
+const MARCH_END: usize = 64;
+
+/// One asset, which rises 1% a session through session `jump_at - 1`, moves by `jump` at
+/// session `jump_at`, and moves by `after` a session from then on.
+///
+/// The position is `max_weight` (0.5) of equity: the volatility target is far above the cap
+/// (the wobble alone gives a daily deviation of 0.1%), and the risk gate allows 0.5 of equity at
+/// 2 sigma. A `jump` of -25% therefore takes the equity down by about `0.5 × 25% = 12.5%` from
+/// its peak, which is above `drawdown_halve` (10%) and below `drawdown_flat` (15%). A `jump` of
+/// -35% takes it down by about 17.5%, past `drawdown_flat`.
+fn jump_path(jump_at: usize, jump: Decimal, after: Decimal) -> Vec<Bar> {
+    let closes = closes();
+    let changes: Vec<Decimal> = (0..closes.len())
+        .map(|i| {
+            if i < jump_at {
+                dec("0.01")
+            } else if i == jump_at {
+                jump
+            } else {
+                after
+            }
+        })
+        .collect();
+    shaped("ASSET", &closes, dec("100"), &changes)
+}
+
+/// The drawdown mode events that move to `mode`.
+fn moves_to<'a>(run: &'a BacktestRun, mode: &str) -> Vec<&'a RiskEvent> {
+    run.risk_events
+        .iter()
+        .filter(|e| {
+            e.kind == RiskEventKind::DrawdownMode
+                && e.detail.get("mode").and_then(|v| v.as_str()) == Some(mode)
+        })
+        .collect()
+}
+
+fn decisions_at(run: &BacktestRun, ts: UnixNanos) -> Vec<&Decision> {
+    run.decisions.iter().filter(|d| d.ts == ts).collect()
+}
+
+/// The net shares held after every fill at or before `ts`.
+fn held_after(run: &BacktestRun, ts: UnixNanos) -> Decimal {
+    run.fills
+        .iter()
+        .filter(|f| f.ts <= ts)
+        .map(|f| signed_qty(run, f))
+        .sum()
+}
+
+#[tokio::test]
+async fn a_rising_market_never_steps_down() {
+    let closes = closes();
+    let run = backtest(&market(&closes), &calendar_for(&closes), free()).await;
+
+    assert_eq!(run.final_mode, DrawdownMode::Normal);
+    assert_eq!(run.orders_blocked, 0);
+    assert!(
+        run.fills
+            .iter()
+            .any(|f| decision_for(&run, f).symbol == sym("RISE"))
+    );
+    assert!(!run.risk_events.is_empty());
+    assert!(
+        run.risk_events
+            .iter()
+            .all(|e| e.kind == RiskEventKind::EquityPeak)
+    );
+    for event in &run.risk_events {
+        assert!(event.detail.get("peak").and_then(|v| v.as_str()).is_some());
+    }
+    // The first peak is the starting cash, at the first session.
+    let first = &run.risk_events[0];
+    assert_eq!(first.ts, closes[0]);
+    let peak = first.detail.get("peak").and_then(|v| v.as_str()).unwrap();
+    assert_eq!(dec(peak), Decimal::from(100_000));
+}
+
+#[tokio::test]
+async fn a_ten_percent_drawdown_halves_and_rebalances_that_session() {
+    let closes = closes();
+    let bars = jump_path(CRASH, dec("-0.25"), Decimal::ZERO);
+    let run = backtest(&bars, &calendar_for(&closes), free()).await;
+
+    // The step is on a session that is not a month end, so the rebalance there is the
+    // step-down one.
+    assert_eq!(month_of(closes[CRASH]), month_of(closes[CRASH + 1]));
+    let halved = moves_to(&run, "halved");
+    assert_eq!(halved.len(), 1);
+    assert_eq!(halved[0].ts, closes[CRASH]);
+    assert!(moves_to(&run, "flat").is_empty());
+
+    // The rebalance on the step session: one decision (one symbol), at half scale.
+    let at_step = decisions_at(&run, closes[CRASH]);
+    assert_eq!(at_step.len(), 1);
+    assert_eq!(at_step[0].features.get("risk_scale"), Some(&dec("0.5")));
+    assert!(at_step[0].intended_qty < Decimal::ZERO, "{:?}", at_step[0]);
+
+    // The sale fills at the next open and reduces the position without closing it.
+    let before = held_after(&run, closes[CRASH]);
+    let sells: Vec<&Fill> = run
+        .fills
+        .iter()
+        .filter(|f| f.ts == closes[CRASH + 1])
+        .collect();
+    assert_eq!(sells.len(), 1);
+    assert!(signed_qty(&run, sells[0]) < Decimal::ZERO);
+    let after = held_after(&run, closes[CRASH + 1]);
+    assert!(
+        Decimal::ZERO < after && after < before,
+        "{before} -> {after}"
+    );
+
+    // The price is flat after the step, so the equity stays in the halved band.
+    assert_eq!(run.final_mode, DrawdownMode::Halved);
+}
+
+#[tokio::test]
+async fn a_fifteen_percent_drawdown_goes_flat_and_sells_everything() {
+    let closes = closes();
+    let bars = jump_path(CRASH, dec("-0.35"), dec("0.01"));
+    let run = backtest(&bars, &calendar_for(&closes), free()).await;
+
+    let flat = moves_to(&run, "flat");
+    assert_eq!(flat.len(), 1);
+    assert_eq!(flat[0].ts, closes[CRASH]);
+
+    let at_step = decisions_at(&run, closes[CRASH]);
+    assert_eq!(at_step.len(), 1);
+    assert_eq!(at_step[0].action, Action::Exit);
+    assert_eq!(at_step[0].features.get("risk_scale"), Some(&Decimal::ZERO));
+
+    // The whole position is sold at the next open, and nothing is bought after it.
+    let exit = closes[CRASH + 1];
+    let exit_fills: Vec<&Fill> = run.fills.iter().filter(|f| f.ts == exit).collect();
+    assert_eq!(exit_fills.len(), 1);
+    assert!(signed_qty(&run, exit_fills[0]) < Decimal::ZERO);
+    assert_eq!(held_after(&run, closes[closes.len() - 1]), Decimal::ZERO);
+    assert!(
+        run.fills
+            .iter()
+            .all(|f| f.ts <= exit || signed_qty(&run, f) < Decimal::ZERO)
+    );
+
+    // The March month end comes after the crash, with rising prices, and buys nothing.
+    let month_end = decisions_at(&run, closes[MARCH_END]);
+    assert_eq!(month_end.len(), 1);
+    assert!(
+        month_end[0].intended_qty <= Decimal::ZERO,
+        "{:?}",
+        month_end[0]
+    );
+
+    // With no position, equity is the cash from the exit on: the same figure every session.
+    let after_exit: Vec<Decimal> = run
+        .equity_curve
+        .iter()
+        .filter(|(ts, _)| *ts >= exit)
+        .map(|(_, equity)| *equity)
+        .collect();
+    assert!(after_exit.len() > 1);
+    assert!(after_exit.iter().all(|e| *e == after_exit[0]));
+
+    assert_eq!(run.final_mode, DrawdownMode::Flat);
+}
+
+#[tokio::test]
+async fn a_step_down_on_a_month_end_rebalances_once() {
+    let closes = closes();
+    let bars = jump_path(FEB_END, dec("-0.25"), Decimal::ZERO);
+    let run = backtest(&bars, &calendar_for(&closes), free()).await;
+
+    assert_ne!(month_of(closes[FEB_END]), month_of(closes[FEB_END + 1]));
+    let halved = moves_to(&run, "halved");
+    assert_eq!(halved.len(), 1);
+    assert_eq!(halved[0].ts, closes[FEB_END]);
+    // One symbol, so one decision per rebalance: exactly one at this session.
+    assert_eq!(decisions_at(&run, closes[FEB_END]).len(), 1);
+}
+
+#[tokio::test]
+async fn the_drawdown_runs_are_deterministic() {
+    let closes = closes();
+    let calendar = calendar_for(&closes);
+    let costs = CostModel::new(dec("5"), dec("0.005")).unwrap();
+    for bars in [
+        jump_path(CRASH, dec("-0.25"), Decimal::ZERO),
+        jump_path(CRASH, dec("-0.35"), dec("0.01")),
+    ] {
+        let first = backtest(&bars, &calendar, costs).await;
+        let second = backtest(&bars, &calendar, costs).await;
+        assert!(!first.risk_events.is_empty());
+        assert_eq!(first, second);
+    }
+}
+
+#[tokio::test]
+async fn every_decision_of_the_drawdown_runs_replays_as_a_match() {
+    let closes = closes();
+    let calendar = calendar_for(&closes);
+    for bars in [
+        jump_path(CRASH, dec("-0.25"), Decimal::ZERO),
+        jump_path(CRASH, dec("-0.35"), dec("0.01")),
+    ] {
+        let run = backtest(&bars, &calendar, free()).await;
+        assert!(!run.decisions.is_empty());
+        for decision in &run.decisions {
+            assert_eq!(replay(&strategy(), decision), ReplayOutcome::Match);
+        }
+    }
+}
+
 // ---- errors ---------------------------------------------------------------------------------
 
 #[tokio::test]
@@ -563,4 +801,115 @@ async fn a_bar_outside_the_calendar_is_an_invalid_bar() {
         result,
         Err(EngineError::InvalidBar("bar outside the calendar"))
     ));
+}
+
+// ---- regression: the loop keeps exiting while flat -----------------------------------------
+
+/// AAA and BBB both rise 1% a session and are both entered at the first month end, each at a cap
+/// of 0.45 of equity: a gross of 0.9 × equity, under the 1.11 × equity limit. The cap is below
+/// 0.5 so the two buys leave cash for the next open: at 0.5 each they take all the cash, and the
+/// open of the second is a little above its close, so that buy would wait unfilled.
+///
+/// On the crash session AAA falls 35%. Half of the equity is AAA at the peak, so the equity falls
+/// by about 0.45 × 35% = 15.75% from its peak, past the flat threshold (15%). BBB has no bar that
+/// session, so at that step-down rebalance it has no close to decide from: it is `Skip`, and it
+/// stays held. The next session (not a month end) must rebalance anyway, because the account is
+/// flat with a position. This test fails if `|| trader.needs_flatten()` is removed from the
+/// backtest loop: that session would then have no decisions, BBB would stay held until the next
+/// month end, and the `decision(&next, "BBB")` assertion would fail.
+#[tokio::test]
+async fn a_flat_backtest_keeps_exiting_a_symbol_it_could_not_decide_for() {
+    let closes = closes();
+    let calendar = calendar_for(&closes);
+    let rise: Vec<Decimal> = vec![dec("0.01"); closes.len()];
+    let mut aaa_changes = rise.clone();
+    aaa_changes[CRASH] = dec("-0.35");
+    let aaa = shaped("AAA", &closes, dec("100"), &aaa_changes);
+    let mut bbb = shaped("BBB", &closes, dec("50"), &rise);
+    bbb.retain(|bar| bar.ts_event != closes[CRASH]);
+    let bars = merge(vec![aaa, bbb]);
+
+    let strat = TrendVolTarget::new(TrendParams {
+        max_weight: dec("0.45"),
+        ..params()
+    })
+    .unwrap();
+    let config = BacktestConfig {
+        window: strat.window_spec(),
+        ..config(free())
+    };
+    let run = run_backtest(strat, &bars, &calendar, config).await.unwrap();
+
+    // Both are bought at the first month end, and the gate lets both through.
+    let entered = decisions_at(&run, closes[FIRST_MONTH_END]);
+    assert_eq!(entered.len(), 2);
+    assert!(entered.iter().all(|d| d.action == Action::Enter));
+    assert_eq!(run.orders_blocked, 0);
+
+    // The crash session: the account goes flat; AAA is exited and BBB cannot be decided for.
+    assert_eq!(moves_to(&run, "flat").len(), 1);
+    assert_eq!(moves_to(&run, "flat")[0].ts, closes[CRASH]);
+    let at_crash = decisions_at(&run, closes[CRASH]);
+    assert_eq!(at_crash.len(), 2);
+    let decision = |list: &[&Decision], symbol: &str| -> Action {
+        list.iter()
+            .find(|d| d.symbol == sym(symbol))
+            .unwrap()
+            .action
+    };
+    assert_eq!(decision(&at_crash, "AAA"), Action::Exit);
+    assert_eq!(decision(&at_crash, "BBB"), Action::Skip);
+
+    // The next session is not a month end, and it still rebalances: BBB gets an exit decision.
+    assert_eq!(month_of(closes[CRASH]), month_of(closes[CRASH + 1]));
+    let next = decisions_at(&run, closes[CRASH + 1]);
+    assert_eq!(next.len(), 2);
+    assert_eq!(decision(&next, "BBB"), Action::Exit);
+
+    // Each sale fills at the open of the session after its decision: AAA at CRASH + 1, BBB at
+    // CRASH + 2.
+    let sold_at = |symbol: &str, ts: UnixNanos| -> Vec<&Fill> {
+        run.fills
+            .iter()
+            .filter(|f| f.ts == ts && decision_for(&run, f).symbol == sym(symbol))
+            .collect()
+    };
+    assert_eq!(sold_at("AAA", closes[CRASH + 1]).len(), 1);
+    let bbb_sales = sold_at("BBB", closes[CRASH + 2]);
+    assert_eq!(bbb_sales.len(), 1);
+    assert!(signed_qty(&run, bbb_sales[0]) < Decimal::ZERO);
+
+    // At the end nothing is held, and the account stays flat.
+    let held_at_end = |symbol: &str| -> Decimal {
+        run.fills
+            .iter()
+            .filter(|f| decision_for(&run, f).symbol == sym(symbol))
+            .map(|f| signed_qty(&run, f))
+            .sum()
+    };
+    assert_eq!(held_at_end("AAA"), Decimal::ZERO);
+    assert_eq!(held_at_end("BBB"), Decimal::ZERO);
+    assert_eq!(run.final_mode, DrawdownMode::Flat);
+
+    // Once everything is sold, decisions happen only at month ends again.
+    let sold_out = closes[CRASH + 2];
+    let month_ends: BTreeSet<u64> = closes
+        .iter()
+        .filter(|ts| **ts > sold_out)
+        .filter(|ts| {
+            calendar
+                .session_at(UnixNanos::from(ts.as_u64() - 1))
+                .and_then(|session| calendar.is_last_session_of_month(session.date))
+                == Some(true)
+        })
+        .map(|ts| ts.as_u64())
+        .collect();
+    let decided: BTreeSet<u64> = run
+        .decisions
+        .iter()
+        .filter(|decision| decision.ts > sold_out)
+        .map(|decision| decision.ts.as_u64())
+        .collect();
+    assert!(!month_ends.is_empty());
+    assert_eq!(decided, month_ends);
 }

@@ -22,6 +22,9 @@ pub enum EvalError {
     /// The engine failed while building or running a strategy.
     #[error(transparent)]
     Engine(#[from] nisse_engine::EngineError),
+    /// The risk limits file could not be read or is not acceptable.
+    #[error(transparent)]
+    Risk(#[from] nisse_risk::RiskError),
     /// Reading the bar files failed.
     #[error(transparent)]
     Bars(#[from] nisse_bars::BarsError),

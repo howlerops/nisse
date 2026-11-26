@@ -346,6 +346,13 @@ impl RecordSink for MemorySink {
         state.records.push(record);
         Ok(())
     }
+
+    async fn flush(&self) -> Result<(), FakeError> {
+        match &lock(&self.state).fail {
+            Some(message) => Err(FakeError(message.clone())),
+            None => Ok(()),
+        }
+    }
 }
 
 /// A limit (when `limit_px` is `Some`) or market day order for SPY, buy side, decision 1,

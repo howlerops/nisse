@@ -6,10 +6,12 @@
 pub mod decision;
 pub mod eval_score;
 pub mod fill;
+pub mod heartbeat;
 pub mod market_snapshot;
 pub mod order_event;
 pub mod position_event;
 pub mod risk_check;
+pub mod risk_event;
 pub mod strategy_version;
 pub mod trial_registry;
 pub mod trial_result;

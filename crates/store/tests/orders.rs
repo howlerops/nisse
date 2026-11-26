@@ -6,9 +6,10 @@ use nisse_core::nautilus::{
     VenueOrderId,
 };
 use nisse_core::{DecisionId, Fill, OrderEvent, OrderIntent, OrderState, RestoredOrder};
-use nisse_store::StoreError;
-use nisse_store::tables::{fill, order_event};
+use nisse_store::tables::fill::{self, FillSide};
+use nisse_store::tables::order_event;
 use nisse_store::testing::ScratchDb;
+use nisse_store::{Store, StoreError};
 use rust_decimal::Decimal;
 use tokio_postgres::Client;
 
@@ -682,5 +683,188 @@ async fn a_second_intent_for_one_client_order_id_is_refused() {
         .unwrap();
     let again = order_event::insert(&client, &OrderEvent::intent(&intent)).await;
     assert!(matches!(again, Err(StoreError::Db(_))));
+    db.drop_db().await.unwrap();
+}
+
+/// The expected `FillSide` for a test fill at `us` microseconds.
+fn side_of(symbol: &str, side: OrderSide, us: u64) -> FillSide {
+    FillSide {
+        symbol: Symbol::new_checked(symbol).unwrap(),
+        side,
+        ts: micros(us),
+    }
+}
+
+#[tokio::test]
+async fn recent_sides_returns_each_fill_with_its_order_symbol_and_side_in_id_order() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let decision = decision_id(&client).await;
+
+    // Order 1 is a buy of AAA; order 2 is a sell of BBB. Both have later rows too.
+    let buy = OrderIntent {
+        symbol: Symbol::new_checked("AAA").unwrap(),
+        side: OrderSide::Buy,
+        ..limit_intent(decision, "order-1", BASE)
+    };
+    let sell = OrderIntent {
+        symbol: Symbol::new_checked("BBB").unwrap(),
+        side: OrderSide::Sell,
+        ..limit_intent(decision, "order-2", BASE)
+    };
+    put(&client, &OrderEvent::intent(&buy)).await;
+    put(&client, &OrderEvent::intent(&sell)).await;
+    put(
+        &client,
+        &row(
+            &buy,
+            OrderState::PartiallyFilled,
+            Some("V-1"),
+            "2",
+            BASE + 1,
+        ),
+    )
+    .await;
+    put(
+        &client,
+        &row(&sell, OrderState::Filled, Some("V-2"), "1", BASE + 2),
+    )
+    .await;
+
+    // Fills at t1 < t2 < t3, two of them for order 1.
+    fill::insert(&client, &fill_of("order-1", "T-1", "10", "1", BASE + 1))
+        .await
+        .unwrap();
+    fill::insert(&client, &fill_of("order-2", "T-2", "20", "1", BASE + 2))
+        .await
+        .unwrap();
+    fill::insert(&client, &fill_of("order-1", "T-3", "11", "1", BASE + 3))
+        .await
+        .unwrap();
+
+    let sides = fill::recent_sides(&client, micros(BASE)).await.unwrap();
+    assert_eq!(
+        sides,
+        vec![
+            side_of("AAA", OrderSide::Buy, BASE + 1),
+            side_of("BBB", OrderSide::Sell, BASE + 2),
+            side_of("AAA", OrderSide::Buy, BASE + 3),
+        ]
+    );
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn recent_sides_since_is_inclusive_and_excludes_earlier_fills() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let decision = decision_id(&client).await;
+    let intent = limit_intent(decision, "order-1", BASE);
+    put(&client, &OrderEvent::intent(&intent)).await;
+    for (n, us) in [(1, BASE + 1), (2, BASE + 2), (3, BASE + 3)] {
+        fill::insert(
+            &client,
+            &fill_of("order-1", &format!("T-{n}"), "10", "1", us),
+        )
+        .await
+        .unwrap();
+    }
+
+    let from_t2 = fill::recent_sides(&client, micros(BASE + 2)).await.unwrap();
+    assert_eq!(
+        from_t2,
+        vec![
+            side_of("SPY", OrderSide::Buy, BASE + 2),
+            side_of("SPY", OrderSide::Buy, BASE + 3),
+        ]
+    );
+
+    let after_t3 = fill::recent_sides(&client, micros(BASE + 4)).await.unwrap();
+    assert!(after_t3.is_empty());
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn recent_sides_with_no_fills_is_empty() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let decision = decision_id(&client).await;
+    let intent = limit_intent(decision, "order-1", BASE);
+    put(&client, &OrderEvent::intent(&intent)).await;
+
+    assert!(
+        fill::recent_sides(&client, micros(BASE))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn recent_sides_refuses_a_fill_whose_order_has_no_event_row() {
+    // There is no foreign key from fill to order_event, so the fill row can exist alone.
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    fill::insert(&client, &fill_of("ghost-1", "T-1", "10", "1", BASE + 1))
+        .await
+        .unwrap();
+
+    let err = fill::recent_sides(&client, micros(BASE)).await.unwrap_err();
+    assert!(matches!(err, StoreError::Data(_)), "got {err:?}");
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn recent_sides_takes_symbol_and_side_from_the_first_row_of_the_order() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let decision = decision_id(&client).await;
+    let intent = OrderIntent {
+        symbol: Symbol::new_checked("AAA").unwrap(),
+        side: OrderSide::Buy,
+        ..limit_intent(decision, "order-1", BASE)
+    };
+    put(&client, &OrderEvent::intent(&intent)).await;
+    // A later row for the same order that names another symbol and side must not win.
+    let later = OrderIntent {
+        symbol: Symbol::new_checked("ZZZ").unwrap(),
+        side: OrderSide::Sell,
+        ..limit_intent(decision, "order-1", BASE)
+    };
+    put(
+        &client,
+        &row(&later, OrderState::Accepted, Some("V-1"), "0", BASE + 1),
+    )
+    .await;
+    fill::insert(&client, &fill_of("order-1", "T-1", "10", "1", BASE + 2))
+        .await
+        .unwrap();
+
+    let sides = fill::recent_sides(&client, micros(BASE)).await.unwrap();
+    assert_eq!(sides, vec![side_of("AAA", OrderSide::Buy, BASE + 2)]);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn store_recent_fill_sides_agrees_with_the_table_function() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let decision = decision_id(&client).await;
+    let intent = OrderIntent {
+        symbol: Symbol::new_checked("AAA").unwrap(),
+        side: OrderSide::Sell,
+        ..limit_intent(decision, "order-1", BASE)
+    };
+    put(&client, &OrderEvent::intent(&intent)).await;
+    fill::insert(&client, &fill_of("order-1", "T-1", "10", "1", BASE + 1))
+        .await
+        .unwrap();
+
+    let store = Store::new(db.client().await.unwrap());
+    let via_store = store.recent_fill_sides(micros(BASE)).await.unwrap();
+    let direct = fill::recent_sides(&client, micros(BASE)).await.unwrap();
+    assert_eq!(via_store, direct);
+    assert_eq!(via_store, vec![side_of("AAA", OrderSide::Sell, BASE + 1)]);
     db.drop_db().await.unwrap();
 }
