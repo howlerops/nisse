@@ -34,6 +34,8 @@ pub mod feature {
     pub const EQUITY: &str = "equity";
     /// Number of assets in the universe (each gets an equal share of the risk budget).
     pub const N_ASSETS: &str = "n_assets";
+    /// The risk gate's exposure factor: 1 normally, 0.5 after a 10% drawdown, 0 when flat or while the kill switch flattens. The strategy multiplies its target weight by it.
+    pub const RISK_SCALE: &str = "risk_scale";
 }
 
 /// Reason codes. Stable strings: they are stored in `decision.reason_code` and compared on
@@ -155,13 +157,15 @@ impl TrendVolTarget {
     }
 
     /// Rule 3, long branch: the shares that give this asset its share of the volatility
-    /// target. `Err` carries the reason code of the skip.
+    /// target, scaled by the risk gate's `risk_scale`. `Err` carries the reason code of the
+    /// skip.
     fn target_shares(
         &self,
         asset_vol: f64,
         n_assets: Decimal,
         equity: Decimal,
         close: Decimal,
+        risk_scale: Decimal,
     ) -> Result<Decimal, &'static str> {
         let (Some(target_vol), Some(max_weight), Some(n)) = (
             self.params.target_vol.to_f64(),
@@ -174,6 +178,8 @@ impl TrendVolTarget {
         let weight = Decimal::from_f64(weight_f)
             .ok_or(ZERO_VOL)?
             .round_dp_with_strategy(8, RoundingStrategy::MidpointNearestEven);
+        // Applied after the per-asset cap, in the same `Decimal` as the weight.
+        let weight = weight.checked_mul(risk_scale).ok_or(BAD_INPUT)?;
         let shares = weight
             .checked_mul(equity)
             .and_then(|x| x.checked_div(close))
@@ -190,12 +196,13 @@ impl Strategy for TrendVolTarget {
     /// See `docs/phases/phase-3.md`, "Trend strategy rules".
     fn decide(&self, features: &Features, _seed: u64) -> Verdict {
         // Required features: all present, or `missing_feature`.
-        let (Some(close), Some(_), Some(position), Some(equity), Some(n_assets)) = (
+        let (Some(close), Some(_), Some(position), Some(equity), Some(n_assets), Some(risk_scale)) = (
             get(features, feature::CLOSE),
             get(features, feature::HISTORY_DAYS),
             get(features, feature::POSITION_QTY),
             get(features, feature::EQUITY),
             get(features, feature::N_ASSETS),
+            get(features, feature::RISK_SCALE),
         ) else {
             return skip(MISSING_FEATURE, None);
         };
@@ -205,6 +212,8 @@ impl Strategy for TrendVolTarget {
             || equity <= Decimal::ZERO
             || n_assets < Decimal::ONE
             || !n_assets.fract().is_zero()
+            || risk_scale < Decimal::ZERO
+            || risk_scale > Decimal::ONE
         {
             return skip(BAD_INPUT, None);
         }
@@ -236,7 +245,7 @@ impl Strategy for TrendVolTarget {
                 };
                 return skip(reason, None);
             };
-            match self.target_shares(vol, n_assets, equity, close) {
+            match self.target_shares(vol, n_assets, equity, close, risk_scale) {
                 Ok(shares) => (shares, TREND_UP),
                 Err(reason) => return skip(reason, asset_vol),
             }
@@ -382,6 +391,7 @@ mod tests {
             (feature::N_ASSETS, "8"),
             (feature::MOMENTUM, "0.10"),
             (feature::VAR_DAILY, "0.0001015873015873015873015873"),
+            (feature::RISK_SCALE, "1"),
         ]
     }
 
@@ -454,6 +464,7 @@ mod tests {
             feature::POSITION_QTY,
             feature::EQUITY,
             feature::N_ASSETS,
+            feature::RISK_SCALE,
         ];
         for name in names {
             let v = strategy().decide(&with_features(&[(name, None)]), 0);
@@ -640,6 +651,106 @@ mod tests {
     }
 
     #[test]
+    fn risk_scale_outside_zero_to_one_is_bad_input() {
+        for value in ["-0.1", "1.1"] {
+            let v = strategy().decide(&with_features(&[(feature::RISK_SCALE, Some(value))]), 0);
+            assert_eq!(v.action, Action::Skip, "{value}");
+            assert_eq!(v.reason_code, BAD_INPUT, "{value}");
+            assert_eq!(v.expected_vol, None, "{value}");
+        }
+    }
+
+    #[test]
+    fn risk_scale_of_zero_half_and_one_is_accepted() {
+        // Zero and one give a hold and an entry from flat; 0.5 gives an entry of half size.
+        for (value, action) in [
+            ("0", Action::Hold),
+            ("0.5", Action::Enter),
+            ("1", Action::Enter),
+        ] {
+            let v = strategy().decide(&with_features(&[(feature::RISK_SCALE, Some(value))]), 0);
+            assert_eq!(v.action, action, "{value}");
+            assert_ne!(v.reason_code, BAD_INPUT, "{value}");
+            assert_ne!(v.reason_code, MISSING_FEATURE, "{value}");
+        }
+    }
+
+    #[test]
+    fn half_risk_scale_halves_the_uncapped_entry() {
+        // Uncapped: weight 0.0703125 at scale 1 gives 0.0703125 * 100000 / 100 = 70.3125 shares.
+        // At scale 0.5 the weight is 0.03515625, giving 35.15625 shares, exactly half.
+        let full = strategy().decide(&features(&base()), 0);
+        let half = strategy().decide(&with_features(&[(feature::RISK_SCALE, Some("0.5"))]), 0);
+        assert_eq!(full.intended_qty, d("70.3125"));
+        assert_eq!(half.intended_qty, d("35.15625"));
+        assert_eq!(half.intended_qty * d("2"), full.intended_qty);
+        assert_eq!(half.action, Action::Enter);
+        assert_eq!(half.reason_code, TREND_UP);
+    }
+
+    #[test]
+    fn half_risk_scale_halves_the_capped_entry() {
+        // Capped: two assets at 2% volatility give 2.25 uncapped, so the weight is 0.25.
+        // At scale 1: 0.25 * 100000 / 100 = 250 shares. At scale 0.5: weight 0.125 gives 125.
+        let var = (d("0.02") * d("0.02") / d("252")).to_string();
+        let changes = [
+            (feature::VAR_DAILY, Some(var.as_str())),
+            (feature::N_ASSETS, Some("2")),
+        ];
+        let full = strategy().decide(&with_features(&changes), 0);
+        let half = strategy().decide(
+            &with_features(&[
+                (feature::VAR_DAILY, Some(var.as_str())),
+                (feature::N_ASSETS, Some("2")),
+                (feature::RISK_SCALE, Some("0.5")),
+            ]),
+            0,
+        );
+        assert_eq!(full.intended_qty, d("250"));
+        assert_eq!(half.intended_qty, d("125"));
+        assert_eq!(half.intended_qty * d("2"), full.intended_qty);
+    }
+
+    #[test]
+    fn zero_risk_scale_from_flat_does_not_enter() {
+        // Target is 0 shares, delta is 0: the within-band hold, as for a flat zero target.
+        let f = with_features(&[(feature::RISK_SCALE, Some("0"))]);
+        let v = strategy().decide(&f, 0);
+        assert_eq!(v.action, Action::Hold);
+        assert_eq!(v.intended_qty, Decimal::ZERO);
+        assert_eq!(v.reason_code, WITHIN_BAND);
+        assert!((v.expected_vol.unwrap() - 0.16).abs() < 1e-9);
+    }
+
+    #[test]
+    fn zero_risk_scale_with_a_position_exits_all_of_it() {
+        // Target 0 with positive momentum: delta is -100, exited through the existing path.
+        // The reason code is `trend_up`, as for any reduction while the momentum is positive.
+        let f = with_features(&[
+            (feature::RISK_SCALE, Some("0")),
+            (feature::POSITION_QTY, Some("100")),
+        ]);
+        let v = strategy().decide(&f, 0);
+        assert_eq!(v.action, Action::Exit);
+        assert_eq!(v.intended_qty, d("-100"));
+        assert_eq!(v.reason_code, TREND_UP);
+    }
+
+    #[test]
+    fn half_risk_scale_sells_half_of_the_full_target() {
+        // Holding the scale-1 target 70.3125; at scale 0.5 the target is 35.15625.
+        // Delta is -35.15625, notional 3515.625, well above the minimum.
+        let f = with_features(&[
+            (feature::RISK_SCALE, Some("0.5")),
+            (feature::POSITION_QTY, Some("70.3125")),
+        ]);
+        let v = strategy().decide(&f, 0);
+        assert_eq!(v.action, Action::Exit);
+        assert_eq!(v.intended_qty, d("-35.15625"));
+        assert_eq!(v.reason_code, TREND_UP);
+    }
+
+    #[test]
     fn decide_is_deterministic_and_ignores_the_seed() {
         let s = strategy();
         let f = features(&base());
@@ -781,6 +892,17 @@ mod tests {
         let skip = decide(&s, context(with_features(&[(feature::CLOSE, None)])));
         assert_eq!(skip.action, Action::Skip);
         assert_eq!(replay(&s, &skip), ReplayOutcome::Match);
+    }
+
+    #[test]
+    fn replay_matches_a_decision_scaled_by_risk_scale() {
+        let s = strategy();
+        let scaled = decide(
+            &s,
+            context(with_features(&[(feature::RISK_SCALE, Some("0.5"))])),
+        );
+        assert_eq!(scaled.action, Action::Enter);
+        assert_eq!(replay(&s, &scaled), ReplayOutcome::Match);
     }
 
     #[test]
