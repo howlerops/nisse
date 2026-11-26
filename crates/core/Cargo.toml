@@ -16,5 +16,7 @@ chrono = { workspace = true }
 nautilus-core = { workspace = true }
 nautilus-model = { workspace = true }
 rust_decimal = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
 strum = { workspace = true }
 thiserror = { workspace = true }

@@ -48,6 +48,12 @@ pub enum EngineError {
         original: ClientOrderId,
         replacement: ClientOrderId,
     },
+    /// The decision could not be stored, so it must not be acted on.
+    #[error("decision was not recorded: {0}")]
+    DecisionNotRecorded(#[source] BoxError),
+    /// The store's record queue is gone; the engine must stop trading.
+    #[error("store is unavailable: {0}")]
+    Store(#[source] BoxError),
     /// A broker read failed during reconciliation.
     #[error("broker request failed: {0}")]
     Broker(#[source] BoxError),

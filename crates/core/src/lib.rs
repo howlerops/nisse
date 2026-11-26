@@ -6,14 +6,19 @@
 //! quantities are always the Nautilus fixed-point types, never `f64`.
 
 mod calendar;
+mod canonical;
 mod clock;
 mod error;
 mod hash;
 mod ids;
 mod order;
+mod record;
 mod types;
 
 pub use calendar::{FULL_SESSION_NANOS, MarketCalendar, Session};
+pub use canonical::{
+    Features, canonical_json, config_hash, feature_hash, features_from_json, features_to_json,
+};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use error::CoreError;
 pub use hash::Hash32;
@@ -21,6 +26,10 @@ pub use ids::{DecisionId, StrategyVersionId};
 pub use order::{
     AccountSnapshot, Broker, BrokerOrder, BrokerPosition, Fill, FillDetail, IntentLog, OpenOrders,
     OrderIntent, OrderState, OrderUpdate, ReplaceRequest, SubmitError,
+};
+pub use record::{
+    Decision, DecisionLog, EvalScore, MarketSnapshot, OrderEvent, PositionEvent, RecordSink,
+    RestoredOrder, RiskCheck, StoreRecord, StrategyVersion, Trial,
 };
 pub use types::{Action, SubjectType, TrialKind};
 

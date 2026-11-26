@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use nisse_core::{
     AccountSnapshot, Broker, BrokerOrder, BrokerPosition, DecisionId, IntentLog, OpenOrders,
-    OrderIntent, OrderState, SubmitError,
+    OrderIntent, OrderState, RecordSink, StoreRecord, SubmitError,
     nautilus::{
         ClientOrderId, Money, OrderSide, OrderType, Price, Quantity, Symbol, TimeInForce,
         UnixNanos, VenueOrderId,
@@ -84,6 +84,7 @@ struct BrokerState {
     positions: Vec<BrokerPosition>,
     orders_by_client_id: BTreeMap<String, BrokerOrder>,
     fail_reads: Option<String>,
+    fail_lookups: Option<String>,
     unrepresentable: u32,
 }
 
@@ -132,6 +133,11 @@ impl FakeBroker {
     /// Replaces the positions returned by `positions`.
     pub fn set_positions(&self, positions: Vec<BrokerPosition>) {
         lock(&self.state).positions = positions;
+    }
+
+    /// Makes only `order_by_client_id` fail, leaving the other reads working.
+    pub fn fail_lookups(&self, msg: &str) {
+        lock(&self.state).fail_lookups = Some(msg.to_owned());
     }
 
     /// Sets how many open orders `open_orders` reports as not representable.
@@ -200,6 +206,9 @@ impl Broker for FakeBroker {
         push(&self.log, Call::OrderByClientId(client_order_id));
         if let Some(err) = self.read_failure() {
             return Err(err);
+        }
+        if let Some(msg) = lock(&self.state).fail_lookups.clone() {
+            return Err(FakeError(msg));
         }
         Ok(lock(&self.state)
             .orders_by_client_id
@@ -289,6 +298,52 @@ impl IntentLog for MemoryIntentLog {
             return Err(FakeError(message.clone()));
         }
         state.intents.push(*intent);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
+struct SinkState {
+    records: Vec<StoreRecord>,
+    fail: Option<String>,
+}
+
+/// An in-memory [`RecordSink`] that keeps every record in the order it was emitted.
+///
+/// While failing (see [`fail_with`](Self::fail_with)) `emit` returns `FakeError` and records
+/// nothing. Clones share the same records.
+#[derive(Clone, Default)]
+pub struct MemorySink {
+    state: Arc<Mutex<SinkState>>,
+}
+
+impl MemorySink {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The records emitted so far, in emit order.
+    #[must_use]
+    pub fn records(&self) -> Vec<StoreRecord> {
+        lock(&self.state).records.clone()
+    }
+
+    /// Makes every later `emit` fail with `FakeError(msg)`, without recording.
+    pub fn fail_with(&self, msg: &str) {
+        lock(&self.state).fail = Some(msg.to_owned());
+    }
+}
+
+impl RecordSink for MemorySink {
+    type Error = FakeError;
+
+    async fn emit(&self, record: StoreRecord) -> Result<(), FakeError> {
+        let mut state = lock(&self.state);
+        if let Some(message) = &state.fail {
+            return Err(FakeError(message.clone()));
+        }
+        state.records.push(record);
         Ok(())
     }
 }
