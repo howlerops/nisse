@@ -3,6 +3,7 @@
 //!
 //! Every evaluation run registers a trial in `trial_registry`.
 
+pub mod backtest_job;
 mod error;
 pub mod replay;
 
