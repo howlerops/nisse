@@ -93,7 +93,7 @@ Spawn the `fable-reviewer` subagent with only the diff range and the phase issue
 
 - Branch: `phase-N-<slug>`; one PR per phase; the description fills in the phase issue's checklist and links `Refs #<issue>`.
 - Commits: imperative subject of 72 characters or fewer, referencing the issue.
-- Never merge it yourself. PRs touching `/crates/risk/`, `/crates/alpaca-adapter/`, `/config/limits/` or `/.github/` need the CODEOWNER, and the person merges every PR.
+- Merge it yourself only after the `fable-reviewer` pass, with its confirmed findings fixed and CI green on the head commit (see CLAUDE.md, "Sensitive paths"). Call out every change under `/crates/risk/`, `/crates/alpaca-adapter/`, `/config/limits/` or `/.github/` in the PR description. If the person has said they want to merge a PR themselves, leave it open.
 - Tick the completed boxes in the phase issue and update `PLAN.md` if a decision changed.
 
 ## Budget and stopping

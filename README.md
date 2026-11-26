@@ -43,4 +43,4 @@ This is a personal project and not financial advice. Nothing here is a recommend
 
 ## Licence
 
-MIT, see [LICENSE](LICENSE). NautilusTrader is LGPL-3.0; how that interacts with this repo is an open question in PLAN.md.
+MIT, see [LICENSE](LICENSE). The NautilusTrader crates this project depends on are a separate LGPL-3.0-only library and keep their own licence.

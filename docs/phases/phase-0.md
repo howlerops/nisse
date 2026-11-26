@@ -120,5 +120,5 @@ Rounds: {T1, T5, T6} in parallel, then T2, then {T3, T4} in parallel. No two tas
 
 ## Not done by this phase's PR
 
-- Branch protection and required CODEOWNERS review on `main` are repository settings; the
-  owner turns them on.
+- Branch protection and required CODEOWNERS review on `main`: dropped by the owner on
+  2026-11-26 (reviewers are the owner and Claude).
