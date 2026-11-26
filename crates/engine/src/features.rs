@@ -24,7 +24,11 @@ impl WindowSpec {
     pub const fn capacity(&self) -> usize {
         let momentum = self.lookback_days + 1;
         let variance = self.vol_window + 1;
-        if momentum > variance { momentum } else { variance }
+        if momentum > variance {
+            momentum
+        } else {
+            variance
+        }
     }
 }
 

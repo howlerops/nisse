@@ -61,7 +61,9 @@ impl DecisionLog for MemoryStore {
     async fn record_decision(&self, decision: &Decision) -> Result<DecisionId, MemoryStoreError> {
         let mut inner = self.lock();
         inner.decisions.push(decision.clone());
-        Ok(DecisionId(i64::try_from(inner.decisions.len()).unwrap_or(i64::MAX)))
+        Ok(DecisionId(
+            i64::try_from(inner.decisions.len()).unwrap_or(i64::MAX),
+        ))
     }
 }
 
@@ -136,8 +138,14 @@ mod tests {
             reason_code: "within_band".to_owned(),
             ts: UnixNanos::from(1),
         };
-        assert_eq!((&store).record_decision(&decision).await.unwrap(), DecisionId(1));
-        assert_eq!(store.record_decision(&decision).await.unwrap(), DecisionId(2));
+        assert_eq!(
+            (&store).record_decision(&decision).await.unwrap(),
+            DecisionId(1)
+        );
+        assert_eq!(
+            store.record_decision(&decision).await.unwrap(),
+            DecisionId(2)
+        );
         let event = PositionEvent {
             symbol: Symbol::new("SPY"),
             qty_after: 1.into(),
