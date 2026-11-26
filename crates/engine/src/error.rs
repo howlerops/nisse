@@ -48,6 +48,22 @@ pub enum EngineError {
         original: ClientOrderId,
         replacement: ClientOrderId,
     },
+    /// A configuration value is missing, mistyped or out of range.
+    #[error("invalid configuration: {0}")]
+    InvalidConfig(String),
+    /// `strategy_version.params` names a strategy this build does not have.
+    #[error("unknown strategy: {0}")]
+    UnknownStrategy(String),
+    /// A bar that cannot be used (a non-positive price, an unknown session).
+    #[error("invalid bar: {0}")]
+    InvalidBar(&'static str),
+    /// Reconciliation left an order in an unknown state, so the engine must not decide.
+    #[error("not reconciled with the broker: {0} order(s) could not be resolved")]
+    NotReconciled(usize),
+    /// The broker has open orders the engine did not send. Something else is trading the
+    /// account, so the engine's view of its positions cannot be trusted for sizing.
+    #[error("{0} open order(s) at the broker were not sent by the engine")]
+    ForeignOrders(usize),
     /// The decision could not be stored, so it must not be acted on.
     #[error("decision was not recorded: {0}")]
     DecisionNotRecorded(#[source] BoxError),

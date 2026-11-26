@@ -12,3 +12,4 @@ pub mod position_event;
 pub mod risk_check;
 pub mod strategy_version;
 pub mod trial_registry;
+pub mod trial_result;

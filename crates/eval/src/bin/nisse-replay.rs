@@ -4,18 +4,17 @@
 //! `scripts/replay.sh`.
 
 use nisse_core::{Clock, DecisionId, SystemClock};
-use nisse_engine::{GIT_SHA, Strategy};
+use nisse_engine::{EngineError, GIT_SHA, Strategy};
 use nisse_eval::{EvalError, replay::replay_decisions};
 use serde_json::Value;
 
-/// Builds a strategy from its stored parameters. No strategies are registered yet: Phase 3
-/// adds the real ones here, matched on the `"strategy"` field.
+/// Builds a strategy from its stored parameters with the engine's own registry.
 fn registry(params: &Value) -> Result<Box<dyn Strategy>, EvalError> {
-    let name = params
-        .get("strategy")
-        .and_then(Value::as_str)
-        .unwrap_or("<missing>");
-    Err(EvalError::UnknownStrategy(name.to_owned()))
+    match nisse_engine::strategies::build(params) {
+        Ok(built) => Ok(built.strategy),
+        Err(EngineError::UnknownStrategy(name)) => Err(EvalError::UnknownStrategy(name)),
+        Err(other) => Err(EvalError::Engine(other)),
+    }
 }
 
 #[tokio::main]

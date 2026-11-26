@@ -71,7 +71,7 @@ For each returned branch, run `git diff main...<branch>` and check it against th
 - [ ] Ring buffers and indicators are preallocated, and rolling stats are updated incrementally rather than recomputed over a window.
 - [ ] DB writes stay off the hot path: bounded channel → writer task → batched multi-row insert or COPY. The only synchronous write is the small, prepared write-ahead intent insert before an order is sent.
 - [ ] Bars are read via DuckDB over Parquet with projection and predicate pushdown, never by loading whole files into memory.
-- [ ] Each hot-path function has a `criterion` bench. Compare with `cargo bench -- --baseline main`; a regression over 5% needs a written justification in the PR.
+- [ ] Each hot-path function has a `criterion` bench. Compare with `cargo bench -p nisse-engine --bench hot_path -- --baseline main` (save one on `main` first with `--save-baseline main`); a regression over 5% needs a written justification in the PR.
 - [ ] `tokio` channels are bounded, and back-pressure behaviour is tested.
 
 Then merge the branch into your phase branch and run the full gate:
@@ -80,7 +80,7 @@ Then merge the branch into your phase branch and run the full gate:
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cargo bench --workspace -- --baseline main   # once benches exist
+cargo bench -p nisse-engine --bench hot_path -- --baseline main
 ```
 
 Don't move on while anything is red.

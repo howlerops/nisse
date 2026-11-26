@@ -22,7 +22,9 @@ jobs:
   rust:
     name: fmt, clippy, test
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # The first uncached run compiles DuckDB from source twice (check and test profiles), about
+    # ten minutes each on a hosted runner; later runs restore it from the cache.
+    timeout-minutes: 75
     # The store's integration tests create scratch databases on this server.
     services:
       postgres:

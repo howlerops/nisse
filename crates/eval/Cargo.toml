@@ -12,7 +12,10 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+chrono = { workspace = true }
+rust_decimal = { workspace = true }
 anyhow = { workspace = true }
+nisse-bars = { workspace = true }
 nisse-core = { workspace = true }
 nisse-engine = { workspace = true }
 nisse-store = { workspace = true }
