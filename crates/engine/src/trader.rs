@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 
 use nisse_core::{
     Action, Broker, Clock, Decision, DecisionId, DecisionLog, Features, IntentLog,
-    KillSwitchSource, OrderIntent, OrderUpdate, RecordSink, RiskCheck, RiskEvent, RiskEventKind,
-    StoreRecord, StrategyVersionId,
+    KillSwitchSource, OrderIntent, OrderState, OrderUpdate, RecordSink, RiskCheck, RiskEvent,
+    RiskEventKind, StoreRecord, StrategyVersionId,
     nautilus::{
         Bar, ClientOrderId, OrderSide, OrderType, Quantity, Symbol, TimeInForce, UnixNanos,
     },
@@ -368,17 +368,19 @@ where
         cancelled
     }
 
-    /// Counts a fill of tracked order `id` in the day-trade tracker. An untracked order is
-    /// skipped.
-    /// Asks the broker to cancel every unresolved buy order it has acknowledged. A failed
-    /// cancel is logged and the rest go on: the order stays tracked and reconciliation will
-    /// say what became of it.
+    /// Asks the broker to cancel every unresolved buy order it has acknowledged, except one
+    /// whose cancel is already pending. A failed cancel is logged and the rest go on: the
+    /// order stays tracked and reconciliation will say what became of it.
     async fn cancel_working_buys(&self) {
         let buys: Vec<ClientOrderId> = self
             .state
             .tracker
             .unresolved_orders()
-            .filter(|order| order.intent.side == OrderSide::Buy && order.venue_order_id.is_some())
+            .filter(|order| {
+                order.intent.side == OrderSide::Buy
+                    && order.venue_order_id.is_some()
+                    && order.state != OrderState::PendingCancel
+            })
             .map(|order| order.intent.client_order_id)
             .collect();
         for id in buys {
@@ -388,6 +390,8 @@ where
         }
     }
 
+    /// Counts a fill of tracked order `id` in the day-trade tracker. An untracked order is
+    /// skipped.
     fn record_day_trade_fill(&mut self, id: ClientOrderId, ts: UnixNanos) {
         if let Some(tracked) = self.state.tracker.get(id) {
             self.gate

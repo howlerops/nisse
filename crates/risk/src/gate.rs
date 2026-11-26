@@ -1204,6 +1204,45 @@ mod tests {
     }
 
     #[test]
+    fn only_the_newest_kill_switch_row_decides() {
+        use serde_json::json;
+        let bad = || event(RiskEventKind::KillSwitch, json!({"engaged": "yes"}));
+        let on = || event(RiskEventKind::KillSwitch, json!({"engaged": true}));
+        let off = || event(RiskEventKind::KillSwitch, json!({"engaged": false}));
+        // An older unreadable row under a newer readable one: the newer one decides.
+        assert!(
+            !RiskState::restore(&[bad(), off()])
+                .unwrap()
+                .kill_switch_engaged
+        );
+        assert!(
+            RiskState::restore(&[bad(), on()])
+                .unwrap()
+                .kill_switch_engaged
+        );
+        // The newest, not the oldest: on then off is off, off then on is on.
+        assert!(
+            !RiskState::restore(&[on(), off()])
+                .unwrap()
+                .kill_switch_engaged
+        );
+        assert!(
+            RiskState::restore(&[off(), on()])
+                .unwrap()
+                .kill_switch_engaged
+        );
+        // A newest row that cannot be read is an error whatever came before.
+        assert!(matches!(
+            RiskState::restore(&[on(), bad()]),
+            Err(RiskError::InvalidEvent(_))
+        ));
+        assert!(matches!(
+            RiskState::restore(&[off(), bad()]),
+            Err(RiskError::InvalidEvent(_))
+        ));
+    }
+
+    #[test]
     fn risk_state_restore_refuses_an_unreadable_event() {
         use serde_json::json;
         for detail in [json!({}), json!({"engaged": "yes"})] {

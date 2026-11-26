@@ -95,8 +95,10 @@ square root is `rust_decimal`'s decimal square root (no `f64`).
   and not sent. Data age is `clock.now() − newest bar time` (unknown when there is no bar).
   Gross exposure is `Σ |held + working| × last close` over the universe; a symbol with a
   position and no close makes it unknown, which fails `kelly_exposure` for buys.
-- `Trader::on_order_update` records fills in the day-trade tracker (only a fill that moved the
-  order's filled quantity; a redelivered message is not a new fill). After a restart the caller
+- Fills reach the day-trade tracker from three places, each once: `Trader::on_order_update`
+  (only a fill that moved the order's filled quantity; a redelivered message is not a new
+  fill), a fill in the broker's answer to a submit, and fills found by reconciliation
+  (counted even when the pass then ends in an error). After a restart the caller
   feeds the last seven days of fills back with `Trader::record_past_fill`
   (`Store::recent_fill_sides`).
 - Durability: `RecordSink::flush` is awaited after a kill-switch event, after a drawdown mode
@@ -105,7 +107,10 @@ square root is `rust_decimal`'s decimal square root (no `f64`).
   `release_kill_switch` (a person's decision) lowers it.
 - At zero risk scale (flat, or a flattening kill switch) a rebalance first asks the broker to
   cancel every waiting buy. A sell never asks for more than is sellable now: the decision may
-  count shares still on order, the order sells what is held.
+  count shares still on order, the order sells what is held, so an order's quantity can be smaller than its decision's
+  `intended_qty` (the `no_short` row records the quantity sold). Waiting buys are NOT
+  cancelled on a step to `halved`: the next rebalance resizes from held plus working. A
+  failed cancel is logged and reconciliation reports what became of the order.
 - Flat means the strategy's target is zero, and exits go through ordinary decisions. A symbol
   the strategy cannot decide for (no current bar, not enough history) or whose buy is still
   unfilled stays held; `Trader::needs_flatten` reports that, and `run_backtest` rebalances
