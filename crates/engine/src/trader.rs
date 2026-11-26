@@ -4,13 +4,14 @@
 use std::collections::BTreeMap;
 
 use nisse_core::{
-    Action, Broker, Clock, Decision, DecisionId, DecisionLog, Features, IntentLog, OrderIntent,
-    OrderUpdate, RecordSink, StrategyVersionId,
+    Action, Broker, Clock, Decision, DecisionId, DecisionLog, Features, IntentLog,
+    KillSwitchSource, OrderIntent, OrderUpdate, RecordSink, RiskCheck, RiskEvent, RiskEventKind,
+    StoreRecord, StrategyVersionId,
     nautilus::{
         Bar, ClientOrderId, OrderSide, OrderType, Quantity, Symbol, TimeInForce, UnixNanos,
     },
 };
-use nisse_risk::{Limits, RiskGate, RiskState};
+use nisse_risk::{DrawdownMode, Limits, OrderCheck, RiskGate, RiskState};
 use rust_decimal::Decimal;
 
 use crate::{
@@ -50,6 +51,44 @@ pub struct RebalanceReport {
     /// Orders the broker refused or whose outcome is unknown. The decisions stand; the
     /// orders are in the tracker and the store.
     pub orders_failed: u32,
+    /// Orders the risk gate refused. Their decisions stand, with the checks that blocked them.
+    pub orders_blocked: u32,
+}
+
+/// What the risk gate needs about one symbol's order, from its decision and its window.
+#[derive(Debug, Clone, Copy)]
+struct GateInputs {
+    /// Shares held plus shares on order: the position the decision was made from.
+    position_qty: Decimal,
+    /// The symbol's last close, when it has any bar.
+    reference_px: Option<Decimal>,
+    /// The symbol's daily variance, when its window has enough returns.
+    var_daily: Option<Decimal>,
+}
+
+/// The figures every order of one rebalance shares.
+#[derive(Debug, Clone, Copy)]
+struct RoundFacts {
+    now: UnixNanos,
+    equity: Decimal,
+    trading_blocked: bool,
+    /// Nanoseconds since the newest bar in the universe; `None` when there is no bar.
+    data_age_nanos: Option<u64>,
+}
+
+/// Σ |position| × last close over the decided symbols, or `None` when a symbol with a
+/// position has no close, or the sum overflows.
+fn gross_exposure(decided: &[(DecisionId, Decision, GateInputs)]) -> Option<Decimal> {
+    let mut gross = Decimal::ZERO;
+    for (_, _, inputs) in decided {
+        let exposure = inputs.position_qty.abs();
+        if exposure.is_zero() {
+            continue;
+        }
+        let px = inputs.reference_px?;
+        gross = gross.checked_add(exposure.checked_mul(px)?)?;
+    }
+    Some(gross)
 }
 
 /// One symbol's rolling statistics and the time of the last bar that went into them.
@@ -157,11 +196,112 @@ where
     }
 
     /// Applies one broker order update (live: from the order stream; backtest: from the
-    /// simulated broker) and records what it changed.
+    /// simulated broker) and records what it changed. A fill also counts toward the day-trade
+    /// limit.
     pub async fn on_order_update(&mut self, update: &OrderUpdate) -> Result<(), EngineError> {
-        record_stream_update(&mut self.state, &self.sink, update)
+        record_stream_update(&mut self.state, &self.sink, update).await?;
+        if update.fill.is_some() {
+            self.record_day_trade_fill(update.order.client_order_id, update.ts);
+        }
+        Ok(())
+    }
+
+    /// Feeds the drawdown state with the account's equity. Emits an `equity_peak` event for a
+    /// new high-water mark and a `drawdown_mode` event for a mode change, and returns the mode
+    /// change when there was one.
+    pub async fn observe_equity(
+        &mut self,
+        equity: Decimal,
+    ) -> Result<Option<(DrawdownMode, DrawdownMode)>, EngineError> {
+        let limits = self.gate.limits().clone();
+        let observation = self.gate.drawdown_mut().observe(equity, &limits);
+        let ts = self.clock.now();
+        if let Some(peak) = observation.new_peak {
+            self.emit(StoreRecord::RiskEvent(RiskEvent {
+                kind: RiskEventKind::EquityPeak,
+                detail: serde_json::json!({ "peak": peak.to_string() }),
+                ts,
+            }))
+            .await?;
+        }
+        if let Some((_, to)) = observation.mode_change {
+            self.emit(StoreRecord::RiskEvent(RiskEvent {
+                kind: RiskEventKind::DrawdownMode,
+                detail: serde_json::json!({
+                    "mode": to.as_str(),
+                    "equity": equity.to_string(),
+                    "reset": false,
+                }),
+                ts,
+            }))
+            .await?;
+        }
+        Ok(observation.mode_change)
+    }
+
+    /// Sets the kill switch flag without touching the broker. Used when the flag is read from
+    /// the store.
+    pub const fn set_kill_switch(&mut self, engaged: bool) {
+        self.gate.set_kill_switch(engaged);
+    }
+
+    /// Reads the kill switch from `source` and sets the flag to what it says. A source that
+    /// cannot be read engages the switch. Returns the flag now in force. Does not cancel
+    /// orders; see [`Self::engage_kill_switch`].
+    pub async fn refresh_kill_switch<Src: KillSwitchSource>(&mut self, source: &Src) -> bool {
+        let engaged = match source.kill_switch_engaged().await {
+            Ok(engaged) => engaged,
+            Err(err) => {
+                tracing::error!(error = %err, "kill switch unreadable; engaging it");
+                true
+            }
+        };
+        self.gate.set_kill_switch(engaged);
+        engaged
+    }
+
+    /// Engages the kill switch: sets the flag, records the event, and cancels every open
+    /// order. The flag is set whatever happens after that. If recording fails, the cancel is
+    /// still sent and the store error is returned; if the cancel fails, it is returned as
+    /// `Broker`.
+    pub async fn engage_kill_switch(&mut self, by: &str) -> Result<(), EngineError> {
+        self.gate.set_kill_switch(true);
+        let recorded = self
+            .emit(StoreRecord::RiskEvent(RiskEvent {
+                kind: RiskEventKind::KillSwitch,
+                detail: serde_json::json!({ "engaged": true, "by": by }),
+                ts: self.clock.now(),
+            }))
+            .await;
+        let cancelled = self
+            .gateway
+            .broker()
+            .cancel_all()
             .await
-            .map(|_| ())
+            .map_err(|err| EngineError::Broker(Box::new(err)));
+        if let Err(err) = &cancelled {
+            tracing::error!(error = %err, "kill switch engaged but open orders were not cancelled");
+        }
+        recorded?;
+        cancelled
+    }
+
+    /// Counts a fill of tracked order `id` in the day-trade tracker. An untracked order is
+    /// skipped.
+    fn record_day_trade_fill(&mut self, id: ClientOrderId, ts: UnixNanos) {
+        if let Some(tracked) = self.state.tracker.get(id) {
+            self.gate
+                .day_trades_mut()
+                .record_fill(tracked.intent.symbol, tracked.intent.side, ts);
+        }
+    }
+
+    /// Sends one record to the sink. A sink failure means the store is gone.
+    async fn emit(&self, record: StoreRecord) -> Result<(), EngineError> {
+        self.sink
+            .emit(record)
+            .await
+            .map_err(|err| EngineError::Store(Box::new(err)))
     }
 
     /// Decides for every symbol and sends the resulting orders. Steps are in
@@ -191,24 +331,37 @@ where
         if foreign > 0 {
             return Err(EngineError::ForeignOrders(foreign));
         }
+        // Fills found while reconciling (missed while disconnected) count toward day trades too.
+        for fill in &report.fills {
+            self.record_day_trade_fill(fill.client_order_id, fill.ts);
+        }
         let working = self.working_quantities();
         // The newest bar any symbol has. A symbol whose last bar is older than that has a gap
         // in its data: it is decided without its price features, so the strategy skips it
         // instead of sizing an order from a stale close.
         let newest_bar_ts = self.windows.values().filter_map(|w| w.last_bar_ts).max();
 
-        let equity = self
+        let account = self
             .gateway
             .broker()
             .account()
             .await
-            .map_err(|e| EngineError::Broker(Box::new(e)))?
-            .equity
-            .as_decimal();
+            .map_err(|e| EngineError::Broker(Box::new(e)))?;
+        let equity = account.equity.as_decimal();
+        // Before any decision, so the `risk_scale` in the features reflects the new mode.
+        self.observe_equity(equity).await?;
+
+        let now = self.clock.now();
+        let facts = RoundFacts {
+            now,
+            equity,
+            trading_blocked: account.trading_blocked,
+            data_age_nanos: newest_bar_ts.map(|ts| now.as_u64().saturating_sub(ts.as_u64())),
+        };
 
         // Phase A: decide for every symbol before any order is sent, all from one equity.
         let universe = self.config.symbols.len();
-        let mut decided: Vec<(DecisionId, Decision)> = Vec::with_capacity(universe);
+        let mut decided: Vec<(DecisionId, Decision, GateInputs)> = Vec::with_capacity(universe);
         let mut out = RebalanceReport {
             decisions: Vec::with_capacity(universe),
             ..RebalanceReport::default()
@@ -216,6 +369,8 @@ where
         for &symbol in &self.config.symbols {
             let working_qty = working.get(&symbol).copied().unwrap_or(Decimal::ZERO);
             let features = self.features_for(symbol, equity, working_qty, newest_bar_ts);
+            let position_qty = self.state.positions.get(symbol).qty + working_qty;
+            let inputs = self.gate_inputs(symbol, position_qty);
             let context = DecisionContext {
                 strategy_version_id: self.config.strategy_version_id,
                 symbol,
@@ -228,21 +383,95 @@ where
             let (id, decision) =
                 decide_and_record(&self.strategy, &self.decisions, context).await?;
             out.decisions.push((id, symbol, decision.action));
-            decided.push((id, decision));
+            decided.push((id, decision, inputs));
         }
 
-        // Phase B: sells first, then buys, each in universe order.
-        for (id, decision) in &decided {
+        // Phase B: sells first, then buys, each in universe order. Each order is checked by the
+        // risk gate before it is sent. `running_gross` starts from the held book and grows with
+        // every buy that may have gone out, so buys in one rebalance cannot together exceed the
+        // exposure cap.
+        let mut running_gross = gross_exposure(&decided);
+        for (id, decision, inputs) in &decided {
             if decision.intended_qty < Decimal::ZERO {
-                self.send(*id, decision, &mut out).await?;
+                self.send_checked(*id, decision, inputs, &facts, &mut running_gross, &mut out)
+                    .await?;
             }
         }
-        for (id, decision) in &decided {
+        for (id, decision, inputs) in &decided {
             if decision.intended_qty > Decimal::ZERO {
-                self.send(*id, decision, &mut out).await?;
+                self.send_checked(*id, decision, inputs, &facts, &mut running_gross, &mut out)
+                    .await?;
             }
         }
         Ok(out)
+    }
+
+    /// The risk gate's inputs for one symbol: its position and its window's last close and
+    /// daily variance (both absent when the window has no bar).
+    fn gate_inputs(&self, symbol: Symbol, position_qty: Decimal) -> GateInputs {
+        let stats = self.windows.get(&symbol).and_then(|w| w.stats.stats());
+        GateInputs {
+            position_qty,
+            reference_px: stats.map(|s| s.close),
+            var_daily: stats.and_then(|s| s.var_daily),
+        }
+    }
+
+    /// Checks one non-zero decision with the risk gate, records every check, and sends the
+    /// order only if the gate approves it. A buy that may have left a position adds its
+    /// notional to `running_gross`.
+    async fn send_checked(
+        &mut self,
+        decision_id: DecisionId,
+        decision: &Decision,
+        inputs: &GateInputs,
+        facts: &RoundFacts,
+        running_gross: &mut Option<Decimal>,
+        report: &mut RebalanceReport,
+    ) -> Result<(), EngineError> {
+        let qty = decision.intended_qty.abs();
+        let side = if decision.intended_qty < Decimal::ZERO {
+            OrderSide::Sell
+        } else {
+            OrderSide::Buy
+        };
+        let days = self.gate.day_trades();
+        let order = OrderCheck {
+            side,
+            qty,
+            reference_px: inputs.reference_px,
+            var_daily: inputs.var_daily,
+            position_qty: inputs.position_qty,
+            equity: facts.equity,
+            gross_exposure: *running_gross,
+            data_age_nanos: facts.data_age_nanos,
+            account_blocked: facts.trading_blocked,
+            would_day_trade: days.would_day_trade(decision.symbol, side, facts.now),
+            day_trades_in_window: days.count_in_window(facts.now),
+        };
+        let verdict = self.gate.check(&order);
+        for result in &verdict.checks {
+            self.emit(StoreRecord::Risk(RiskCheck {
+                decision_id,
+                rule: result.rule.to_owned(),
+                limit_value: result.limit_value,
+                actual_value: result.actual_value,
+                passed: result.passed,
+                ts: facts.now,
+            }))
+            .await?;
+        }
+        if !verdict.approved() {
+            report.orders_blocked += 1;
+            return Ok(());
+        }
+        let may_hold_exposure = self.send(decision_id, decision, report).await?;
+        if may_hold_exposure && side == OrderSide::Buy {
+            *running_gross = running_gross
+                .zip(inputs.reference_px)
+                .and_then(|(gross, px)| gross.checked_add(qty.checked_mul(px)?));
+        }
+        Ok(())
     }
 
     /// Signed shares still to fill in the engine's own unresolved orders, per symbol: an
@@ -304,13 +533,14 @@ where
     }
 
     /// Sends the order for one non-zero decision and counts the outcome in `report`. A broker
-    /// refusal or an unknown outcome is counted and does not stop the rebalance.
+    /// refusal or an unknown outcome is counted and does not stop the rebalance. Returns
+    /// whether the order may have left a position: it was accepted, or its outcome is unknown.
     async fn send(
         &mut self,
         decision_id: DecisionId,
         decision: &Decision,
         report: &mut RebalanceReport,
-    ) -> Result<(), EngineError> {
+    ) -> Result<bool, EngineError> {
         let qty = Quantity::from_decimal(decision.intended_qty.abs()).map_err(|_| {
             EngineError::InvalidConfig("order quantity not representable".to_owned())
         })?;
@@ -331,13 +561,20 @@ where
             ts: self.clock.now(),
         };
         match submit_and_record(&self.gateway, &mut self.state, &self.sink, &intent).await {
-            Ok(_) => report.orders_submitted += 1,
-            Err(EngineError::OrderRejected { .. } | EngineError::OrderOutcomeUnknown { .. }) => {
-                report.orders_failed += 1;
+            Ok(_) => {
+                report.orders_submitted += 1;
+                Ok(true)
             }
-            Err(err) => return Err(err),
+            Err(EngineError::OrderRejected { .. }) => {
+                report.orders_failed += 1;
+                Ok(false)
+            }
+            Err(EngineError::OrderOutcomeUnknown { .. }) => {
+                report.orders_failed += 1;
+                Ok(true)
+            }
+            Err(err) => Err(err),
         }
-        Ok(())
     }
 
     /// The risk gate, read-only.
