@@ -1,0 +1,5 @@
+# nautilus-* 0.68.0 declares rust-version 1.99.1. Bump together with the Nautilus pin.
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

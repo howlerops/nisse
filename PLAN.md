@@ -16,7 +16,7 @@ Realistic good outcome: net Sharpe 0.3 to 0.6 with long stretches behind SPY. At
 | Area | Decision |
 |---|---|
 | Broker | Alpaca for paper and live (real order API, free paper environment on the same API, fractional shares, $0 stock commissions). |
-| Engine | NautilusTrader Rust crates, version-pinned (same engine for backtest and live). Rust API still changes between releases; licence is LGPL-3.0. |
+| Engine | NautilusTrader Rust crates, pinned at exactly `0.68.0` (released 2026-11-10; needs Rust 1.99.1, pinned in `rust-toolchain.toml`). Same engine for backtest and live. Rust API still changes between releases; licence is LGPL-3.0-only. |
 | Language | Rust only for the core. |
 | Adapter | Write our own Alpaca adapter (Alpaca is not an official Nautilus adapter; community ones are alpha). |
 | Agents | Claude Code cloud scheduled tasks on the subscription, no API token for now; hourly at most; output is PRs. |
@@ -51,9 +51,14 @@ Two loops that meet only at a human-approved merge.
 - No workflow engine: cron plus a Postgres state machine with idempotent steps.
 - No LLM call anywhere in the order path.
 
+### UI notes (Phase 8)
+
+- Take inspiration from [herdr-app](https://github.com/herdrdev/herdr-app), an app built with Native Shell, in particular its ability to open an agent that edits the app in real time, per user.
+- If nisse gets such an in-app agent, the existing boundaries still hold: it edits UI code only, never the engine, risk gate, adapter or limits; it never sees broker credentials; and it cannot place orders or change what the kill switch does. Anything it changes outside a user's own UI session still lands as a PR that a human merges.
+
 ## Trade store and evals
 
-Store every decision, not just every fill. Rank strategy versions, not individual trades (single-trade P&L is mostly luck). All tables are append-only with `event_ts` and `ingest_ts`; corrections are new rows.
+Store every decision, not just every fill. Rank strategy versions, not individual trades (single-trade P&L is mostly luck). All tables are append-only with `event_ts` and `ingest_ts`; corrections are new rows. A trigger on every table rejects UPDATE, DELETE and TRUNCATE; a table owner or superuser can still disable it, so from Phase 2 the engine connects as a role with INSERT and SELECT only. The schema is in `migrations/`, applied by `scripts/migrate.sh`.
 
 ### Tables
 
@@ -61,14 +66,16 @@ Store every decision, not just every fill. Rank strategy versions, not individua
 |---|---|
 | `strategy_version` | id, git_sha, config_hash, params, parent_id |
 | `trial_registry` | strategy_version_id, kind [backtest \| shadow \| live], data_range, result |
-| `decision` | ts, strategy_version_id, symbol, action [enter \| exit \| hold \| skip], intended_qty, expected_edge_bps, expected_vol, features, feature_hash, data_snapshot_id, rng_seed, reason_code |
-| `market_snapshot` | ts, symbol, bid, ask, mid, spread_bps, adv, vol, regime_tag |
-| `order_event` | decision_id, broker_order_id, ts, state, type, limit_px, qty |
-| `fill` | order_id, ts, px, qty, fee |
-| `position_event` | ts, symbol, qty_after, avg_cost |
+| `decision` | event_ts, strategy_version_id, symbol, action [enter \| exit \| hold \| skip], intended_qty, expected_edge_bps, expected_vol, features, feature_hash, data_snapshot_id, rng_seed, reason_code |
+| `market_snapshot` | event_ts, symbol, bid, ask, mid, spread_bps, adv, vol, regime_tag |
+| `order_event` | decision_id, client_order_id, broker_order_id, event_ts, state, type, limit_px, qty |
+| `fill` | client_order_id, broker_fill_id (unique), event_ts, px, qty, fee |
+| `position_event` | event_ts, symbol, qty_after, avg_cost |
 | `outcome_window` | decision_id, horizon, fwd_ret, bench_ret, mfe, mae |
 | `eval_score` | subject_id, subject_type, metric, value, eval_version |
-| `risk_check` | decision_id, rule, limit, actual, passed |
+| `risk_check` | decision_id, rule, limit_value, actual_value, passed |
+
+Every table also has `id` and `ingest_ts`. `order_event.client_order_id` is written with the intent row before submission, when `broker_order_id` is still unknown; fills refer to their order by `client_order_id`. Column types and constraints are in [`docs/phases/phase-0.md`](docs/phases/phase-0.md).
 
 **Nightly replay test:** rerunning a decision from its features, config hash and seed on the recorded git SHA must reproduce the same action.
 
@@ -192,7 +199,7 @@ Intraday is out of scope unless a gated strategy needs it. The day-trade limit s
 
 - [ ] Market data: free IEX feed or the $99/month SIP plan; decide before backtesting.
 - [ ] Whether Alpaca fractional orders can be limit orders (Alpaca docs disagree); test in paper.
-- [ ] Pin a NautilusTrader version; confirm LGPL-3.0 suits how this repo is published.
+- [ ] ~~Pin a NautilusTrader version~~ (pinned at `0.68.0` in Phase 0); confirm LGPL-3.0 suits how this repo is published. Note the crates moved from `LGPL-3.0-or-later` to `LGPL-3.0-only`.
 - [ ] Confirm Native Shell can read Postgres through a Rust module before building screens.
 - [ ] Whether Anthropic's Commercial Terms or Usage Policy carry a securities clause like the Consumer Terms; read before moving agents to an API key.
 - [ ] Taxable account or IRA.

@@ -20,3 +20,6 @@ data/
 .vscode/
 *.swp
 .DS_Store
+
+# Claude Code worker worktrees
+.claude/worktrees/
