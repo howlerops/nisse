@@ -1370,6 +1370,7 @@ dependencies = [
  "nisse-store",
  "rust_decimal",
  "serde_json",
+ "strum",
  "thiserror",
  "tokio",
  "tokio-postgres",

@@ -1,7 +1,7 @@
 //! `strategy_version`: one immutable strategy configuration at one git SHA.
 
 use chrono::{DateTime, Utc};
-use nisse_core::{Hash32, StrategyVersion, StrategyVersionId};
+use nisse_core::{Hash32, StrategyVersion, StrategyVersionId, config_hash};
 use tokio_postgres::{GenericClient, Row};
 
 use crate::{
@@ -10,12 +10,20 @@ use crate::{
 };
 
 /// Returns the id of the row for `(git_sha, config_hash)`, inserting it if it does not exist.
+/// Errors with `Data` when `config_hash` is not `nisse_core::config_hash(params)`.
 /// Safe to call concurrently and repeatedly: the unique constraint decides, and an existing
 /// row is never changed (its `params`, `parent_id` and `event_ts` stay as first written).
 pub async fn ensure<C: GenericClient>(
     client: &C,
     version: &StrategyVersion,
 ) -> Result<StrategyVersionId, StoreError> {
+    // A version whose hash does not describe its parameters could never be rebuilt for
+    // replay, so it is refused here rather than discovered at replay time.
+    if config_hash(&version.params) != version.config_hash {
+        return Err(StoreError::Data(
+            "strategy version config_hash is not the hash of its params".to_owned(),
+        ));
+    }
     let config_hash: &[u8] = version.config_hash.as_bytes();
     let parent_id = version.parent_id.map(|id| id.0);
     let event_ts = to_ts(version.ts)?;

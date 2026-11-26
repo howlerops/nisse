@@ -3,54 +3,21 @@
 
 use chrono::{DateTime, Utc};
 use nisse_core::nautilus::{
-    ClientOrderId, OrderSide, OrderType, Symbol, TimeInForce, VenueOrderId,
+    ClientOrderId, OrderSide, OrderType, Symbol, TimeInForce, UnixNanos, VenueOrderId,
 };
 use nisse_core::{DecisionId, OrderEvent, OrderIntent, OrderState, RestoredOrder};
 use rust_decimal::{Decimal, RoundingStrategy};
+use strum::VariantArray;
 use tokio_postgres::GenericClient;
 
 use crate::StoreError;
 use crate::db::{from_ts, parse_enum, to_price, to_quantity, to_ts};
 
-/// Every `OrderState`. `index` below must match every variant, so adding a state breaks the
-/// build until this list and the `CHECK` constraint in `migrations/` are updated.
-const ALL: [OrderState; 10] = [
-    OrderState::Intent,
-    OrderState::Submitted,
-    OrderState::Accepted,
-    OrderState::PartiallyFilled,
-    OrderState::PendingCancel,
-    OrderState::Filled,
-    OrderState::Canceled,
-    OrderState::Replaced,
-    OrderState::Rejected,
-    OrderState::Expired,
-];
-
-/// Position of `state` in [`ALL`]. Exhaustive on purpose: a new variant fails to compile here.
-#[allow(
-    dead_code,
-    reason = "called only by the unit test; its exhaustive match is what breaks the build"
-)]
-const fn index(state: OrderState) -> usize {
-    match state {
-        OrderState::Intent => 0,
-        OrderState::Submitted => 1,
-        OrderState::Accepted => 2,
-        OrderState::PartiallyFilled => 3,
-        OrderState::PendingCancel => 4,
-        OrderState::Filled => 5,
-        OrderState::Canceled => 6,
-        OrderState::Replaced => 7,
-        OrderState::Rejected => 8,
-        OrderState::Expired => 9,
-    }
-}
-
-/// The stored strings of every terminal state, built from [`ALL`] so they cannot drift from
-/// `OrderState::is_terminal`.
+/// The stored strings of every terminal state, from the enum itself so they cannot drift
+/// from `OrderState::is_terminal`.
 fn terminal_states() -> Vec<&'static str> {
-    ALL.iter()
+    OrderState::VARIANTS
+        .iter()
         .filter(|state| state.is_terminal())
         .map(|state| <&'static str>::from(*state))
         .collect()
@@ -85,23 +52,38 @@ pub async fn insert<C: GenericClient>(client: &C, event: &OrderEvent) -> Result<
     Ok(())
 }
 
-/// Every order whose latest row is not in a terminal state, in client order id order. An
-/// order whose latest state is terminal is not returned.
-///
-/// One statement. The latest row is the highest `event_ts`, then the highest `id`; the intent
-/// is the order's `state = 'intent'` row; the average fill price is the quantity-weighted mean
-/// of its `fill` rows.
+/// Every order whose latest row is not in a terminal state, in client order id order.
+/// Equivalent to [`load_live`] with no recent-terminal window.
 pub async fn load_open<C: GenericClient>(client: &C) -> Result<Vec<RestoredOrder>, StoreError> {
+    load_live(client, None).await
+}
+
+/// The orders a restarting engine must track, in client order id order: every order whose
+/// latest row is not terminal, plus, when `ended_since` is given, every order whose latest
+/// row is terminal but was stored at or after that time. The second group matters because a
+/// terminal order can still fill (a fill racing a cancel), and because a "never arrived"
+/// verdict is provisional: without them a late fill would arrive for an order the engine no
+/// longer knows.
+///
+/// One statement. "Latest" is the row inserted last (highest `id`), not the highest
+/// `event_ts`: event times come from two clocks (the engine's for intents, the broker's for
+/// its updates), and a small skew must not make an intent look newer than the fill after it.
+/// `ended_since` is compared with `ingest_ts`, which only the database sets.
+pub async fn load_live<C: GenericClient>(
+    client: &C,
+    ended_since: Option<UnixNanos>,
+) -> Result<Vec<RestoredOrder>, StoreError> {
+    let ended_since = ended_since.map(to_ts).transpose()?;
     let terminal = terminal_states();
     let rows = client
         .query(
             "WITH latest AS ( \
                  SELECT DISTINCT ON (client_order_id) client_order_id, broker_order_id, state, \
-                        cum_filled_qty, event_ts \
-                 FROM order_event ORDER BY client_order_id, event_ts DESC, id DESC \
+                        cum_filled_qty, event_ts, ingest_ts \
+                 FROM order_event ORDER BY client_order_id, id DESC \
              ), intent AS ( \
                  SELECT DISTINCT ON (client_order_id) * \
-                 FROM order_event WHERE state = 'intent' ORDER BY client_order_id, event_ts, id \
+                 FROM order_event WHERE state = 'intent' ORDER BY client_order_id, id \
              ), fills AS ( \
                  SELECT client_order_id, sum(px * qty) / sum(qty) AS avg_px \
                  FROM fill GROUP BY client_order_id \
@@ -114,9 +96,9 @@ pub async fn load_open<C: GenericClient>(client: &C) -> Result<Vec<RestoredOrder
              FROM latest l \
              JOIN intent i USING (client_order_id) \
              LEFT JOIN fills f USING (client_order_id) \
-             WHERE NOT (l.state = ANY($1)) \
+             WHERE NOT (l.state = ANY($1)) OR COALESCE(l.ingest_ts >= $2, false) \
              ORDER BY l.client_order_id",
-            &[&terminal],
+            &[&terminal, &ended_since],
         )
         .await?;
 
@@ -185,17 +167,6 @@ fn parse_id<T, E: std::fmt::Display>(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn all_lists_every_state_once_in_index_order() {
-        for (position, state) in ALL.iter().enumerate() {
-            assert_eq!(index(*state), position, "ALL is out of order at {state}");
-        }
-        let mut names: Vec<&str> = ALL.iter().map(|s| <&str>::from(*s)).collect();
-        names.sort_unstable();
-        names.dedup();
-        assert_eq!(names.len(), ALL.len(), "ALL holds a duplicate state");
-    }
 
     #[test]
     fn terminal_states_are_the_terminal_variants() {

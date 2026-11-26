@@ -122,6 +122,11 @@ pub async fn replay_decisions(
                     scores.push(score(stored.id, true, now));
                 }
                 outcome => {
+                    tracing::error!(
+                        decision_id = stored.id.0,
+                        ?outcome,
+                        "decision did not replay"
+                    );
                     report.failures.push(ReplayFailure {
                         decision_id: stored.id,
                         outcome,

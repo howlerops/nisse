@@ -67,7 +67,7 @@ async fn decision_then_intent_then_restart_load() {
     store.record_intent(&intent).await.unwrap();
 
     // A restart with nothing but the store finds the order, still only an intent.
-    let open = store.load_open_orders().await.unwrap();
+    let open = store.load_live_orders(None).await.unwrap();
     assert_eq!(open.len(), 1);
     assert_eq!(open[0].intent, intent);
     assert_eq!(open[0].state, OrderState::Intent);

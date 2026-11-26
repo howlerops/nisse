@@ -35,10 +35,13 @@ fn hash(byte: u8) -> Hash32 {
 
 /// A version at git SHA `git` (a single hex digit repeated) with config hash byte `byte`.
 fn version(git: char, byte: u8, lookback: i64) -> StrategyVersion {
+    // `byte` only makes the parameters, and so the hash, differ between versions: the store
+    // refuses a version whose hash is not the hash of its parameters.
+    let params = json!({"strategy": "threshold", "lookback": lookback, "variant": byte});
     StrategyVersion {
         git_sha: git.to_string().repeat(40),
-        config_hash: hash(byte),
-        params: json!({"strategy": "threshold", "lookback": lookback}),
+        config_hash: nisse_core::config_hash(&params),
+        params,
         parent_id: None,
         ts: UnixNanos::from(T0),
     }
@@ -95,10 +98,18 @@ async fn ensure_twice_returns_same_id_and_keeps_first_row() {
     let first = version('a', 1, 252);
     let id = strategy_version::ensure(&client, &first).await.unwrap();
 
+    // Same parameters (so the same hash) registered again later: the first row is kept.
     let mut second = first.clone();
-    second.params = json!({"strategy": "threshold", "lookback": 20});
     second.ts = UnixNanos::from(T0 + ONE_SECOND);
     let again = strategy_version::ensure(&client, &second).await.unwrap();
+
+    // A version whose hash does not describe its parameters is refused outright.
+    let mut mismatched = first.clone();
+    mismatched.params = json!({"strategy": "threshold", "lookback": 20});
+    assert!(matches!(
+        strategy_version::ensure(&client, &mismatched).await,
+        Err(StoreError::Data(_))
+    ));
 
     assert_eq!(again, id);
     let stored = strategy_version::get(&client, id).await.unwrap();

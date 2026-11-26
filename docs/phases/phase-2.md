@@ -75,6 +75,7 @@ back-pressure tested, batched multi-row inserts, and SQL only in `crates/store/s
 | F | Deps, core records and traits, store connection/test support/stubs, engine and eval stubs, CI database | (foundation) | lead |
 | C1 | Canonical JSON and hashes | `crates/core/src/canonical.rs` | 1 |
 | M1 | Roles migration | `migrations/0007_roles.sql`, `migrations/tests/0008_roles.sql` | 1 |
+| L | Review fixes: `submit_and_record`, `load_live`, migration 0008, hash check | (lead) | after review |
 | S1 | `strategy_version`, `trial_registry`, `decision` | those three table modules, `crates/store/tests/decisions.rs` | 1 |
 | S2 | `order_event`, `fill` | those two table modules, `crates/store/tests/orders.rs` | 1 |
 | S3a | `market_snapshot`, `position_event` | those two table modules, `crates/store/tests/snapshots.rs` | 1 |
@@ -208,7 +209,41 @@ needs a build of that SHA (building other SHAs automatically is Phase 6 deployme
 then runs `cargo run -p nisse-eval --bin nisse-replay` for HEAD; exits non-zero if the
 binary does.
 
+## Rules added after the independent review
+
+- **A failed lookup does not end a reconciliation pass.** It is a `SyncProblem` for that
+  order; fills already applied in the pass are still reported and recorded.
+- **Gateway outcomes are recorded.** `submit_and_record` writes the row for what the broker
+  answered: an order that comes back already filled gets its fill and position recorded
+  (the later stream message carries no new quantity), and a rejection gets a `rejected` row.
+- **Restart loading uses insertion order.** `order_event::load_live` takes an order's latest
+  row by `id`, not `event_ts`: event times come from two clocks. Rows written by
+  reconciliation carry the order's own last-update time, not the engine clock.
+- **Recently ended orders are restored too.** `load_live(client, Some(since))` also returns
+  orders whose latest row is terminal but was stored since `since`, so a fill racing a
+  cancel, or an order under a provisional never-arrived verdict, is still known after a
+  restart. A restored `rejected` order with no broker id is treated as provisional.
+- **One intent row per client order id** (migration 0008, a partial unique index).
+- **`strategy_version::ensure` refuses a version whose `config_hash` is not the hash of its
+  `params`.**
+- **`scripts/replay.sh` exits 3 when another build's decisions were skipped.** "Replay
+  passed" must not mean "nothing was replayed".
+- **`nisse_engine::build_is_replayable()`** is false for a dirty tree or an unknown commit; a
+  trading process must refuse to start then (enforced when the engine binary exists).
+
 ## Not done by this phase's PR
+
+- Scheduling: nothing runs the replay job nightly yet (cron on the engine host is Phase 6).
+- The replay job starts from the first decision every run and writes a new score row for
+  each, so `eval_score` grows by the decision count per run. Acceptable at this volume; a
+  stored cursor can come with Phase 5.
+- One undecodable decision row stops the replay job (loudly) rather than being scored 0.
+- `nisse-replay` installs no `tracing` subscriber; its alert is the printed report and the
+  exit status until Phase 6 routes logs.
+- Open orders and positions are read at two instants, so a fill landing between them can be
+  counted on top of an adopted position until the next pass corrects it. A decision made in
+  that window would see a wrong position feature; the engine loop (Phase 3/4) must reconcile
+  before it decides.
 
 - A running engine process: the pieces are wired into a binary in Phase 3 (strategy and
   backtest) and Phase 4 (risk gate). This phase delivers the store, the recording paths and

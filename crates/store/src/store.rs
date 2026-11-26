@@ -1,6 +1,7 @@
 //! The awaited writes: decisions and the write-ahead intent. Everything else goes through
 //! [`crate::StoreWriter`].
 
+use nisse_core::nautilus::UnixNanos;
 use nisse_core::{
     Decision, DecisionId, DecisionLog, IntentLog, OrderEvent, OrderIntent, RestoredOrder,
     StrategyVersion, StrategyVersionId,
@@ -38,9 +39,13 @@ impl Store {
         strategy_version::ensure(&self.client, version).await
     }
 
-    /// See [`order_event::load_open`].
-    pub async fn load_open_orders(&self) -> Result<Vec<RestoredOrder>, StoreError> {
-        order_event::load_open(&self.client).await
+    /// The orders a restarting engine must track. See [`order_event::load_live`]; pass the
+    /// start of the never-arrived recheck window as `ended_since`.
+    pub async fn load_live_orders(
+        &self,
+        ended_since: Option<UnixNanos>,
+    ) -> Result<Vec<RestoredOrder>, StoreError> {
+        order_event::load_live(&self.client, ended_since).await
     }
 }
 

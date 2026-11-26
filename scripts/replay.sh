@@ -3,11 +3,13 @@
 # decisions that this checkout cannot replay.
 #
 # The binary replays only decisions whose strategy version carries its own git SHA. For every
-# other SHA in `strategy_version` this script prints a notice and skips it. Building those
-# commits and running the replay from each checkout is deployment work for a later phase
-# (Phase 6), so a skipped SHA is reported but does not fail the run.
+# other SHA in `strategy_version` this script prints a notice and cannot replay it: building
+# those commits and running the replay from each checkout is deployment work for a later phase
+# (Phase 6). Until then a skipped SHA fails the run, because "replay passed" must never mean
+# "nothing was replayed".
 #
-# Exits with the replay binary's status when it is non-zero, else 0.
+# Exit status: the replay binary's when it is non-zero; 3 when the binary was clean but some
+# build's decisions could not be replayed from this checkout; else 0.
 #
 # Usage: DATABASE_URL=postgres://user@host/db scripts/replay.sh
 set -euo pipefail
@@ -34,6 +36,7 @@ if (( status != 0 )); then
   exit "$status"
 fi
 if (( skipped )); then
-  echo "replay: finished for $head; other builds were skipped (see above)" >&2
+  echo "replay: clean for $head, but other builds' decisions were not replayed (see above)" >&2
+  exit 3
 fi
 exit 0

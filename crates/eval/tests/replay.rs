@@ -110,21 +110,24 @@ async fn ensure(client: &Client, git_sha: &str, params: Value) -> StrategyVersio
     strategy_version::ensure(client, &version).await.unwrap()
 }
 
-/// Ensures a version whose stored `config_hash` is `hash`, whatever `params` say.
+/// Inserts a version row whose stored `config_hash` is `hash`, whatever `params` say. The
+/// store API refuses such a version, so this writes the row directly, as a corrupted or
+/// hand-edited row would be.
 async fn ensure_with_hash(
     client: &Client,
     git_sha: &str,
     params: Value,
     hash: Hash32,
 ) -> StrategyVersionId {
-    let version = StrategyVersion {
-        git_sha: git_sha.to_owned(),
-        config_hash: hash,
-        params,
-        parent_id: None,
-        ts: UnixNanos::from(T0),
-    };
-    strategy_version::ensure(client, &version).await.unwrap()
+    let row = client
+        .query_one(
+            "INSERT INTO strategy_version (git_sha, config_hash, params, event_ts) \
+             VALUES ($1, $2, $3, '2026-01-02T00:00:00Z') RETURNING id",
+            &[&git_sha, &hash.as_bytes().as_slice(), &params],
+        )
+        .await
+        .unwrap();
+    StrategyVersionId(row.get(0))
 }
 
 /// A decision context for `version`; `signal` is written as the `"signal"` feature.

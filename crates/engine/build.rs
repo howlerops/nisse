@@ -2,7 +2,9 @@
 //! replay can say exactly which code decided.
 //!
 //! `NISSE_GIT_SHA` in the environment wins (for builds without a `.git` directory, such as a
-//! container image). Otherwise `git rev-parse HEAD` is used. If neither works the SHA is 40
+//! container image, which is then trusted to be built from exactly that commit). Otherwise
+//! `git rev-parse HEAD` is used, and the build is marked dirty when the tree has uncommitted
+//! changes to tracked files. If neither works the SHA is 40
 //! zeros, which the store accepts but which matches no real commit: decisions made by such a
 //! build cannot be replayed, so production builds must set the variable or build from a
 //! checkout.
@@ -29,4 +31,19 @@ fn main() {
         .find(|s| is_sha(s))
         .map_or_else(|| "0".repeat(40), |s| s.to_ascii_lowercase());
     println!("cargo:rustc-env=NISSE_GIT_SHA={sha}");
+
+    // A build from a tree with uncommitted changes does not match its commit, so decisions it
+    // makes could not be replayed from that commit. `git status --porcelain` prints nothing
+    // for a clean tree. Unknown (no git) counts as dirty.
+    let clean = Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .is_some_and(|out| out.stdout.is_empty());
+    let forced_clean = std::env::var("NISSE_GIT_SHA").is_ok();
+    println!(
+        "cargo:rustc-env=NISSE_GIT_DIRTY={}",
+        if clean || forced_clean { "0" } else { "1" }
+    );
 }

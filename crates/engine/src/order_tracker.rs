@@ -106,7 +106,12 @@ impl OrderTracker {
                 cum_filled_qty: order.cum_filled_qty,
                 avg_fill_px: order.avg_fill_px,
                 last_update_ts: order.last_update_ts,
-                never_arrived_at: None,
+                // A rejected order the broker never acknowledged may be a never-arrived
+                // verdict that was still provisional when the engine stopped. Treating every
+                // such order as provisional costs a few lookups and loses nothing.
+                never_arrived_at: (order.state == OrderState::Rejected
+                    && order.venue_order_id.is_none())
+                .then_some(order.last_update_ts),
             })?;
         }
         Ok(())

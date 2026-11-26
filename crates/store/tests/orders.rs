@@ -393,14 +393,15 @@ async fn results_are_in_client_order_id_order() {
 }
 
 #[tokio::test]
-async fn latest_is_highest_event_ts_then_highest_id() {
+async fn latest_is_the_row_inserted_last_whatever_its_event_time() {
     let db = ScratchDb::create().await;
     let client = db.client().await.unwrap();
     let decision = decision_id(&client).await;
 
     let intent = limit_intent(decision, "order-1", BASE);
     put(&client, &OrderEvent::intent(&intent)).await;
-    // Inserted in this order: the later-timestamp rows come first, so the id tie-break decides.
+    // The last row inserted carries an earlier event time than the ones before it. It is
+    // still the latest: insertion order decides, not event time.
     put(
         &client,
         &row(&intent, OrderState::Submitted, None, "0", BASE + 5),
@@ -429,10 +430,10 @@ async fn latest_is_highest_event_ts_then_highest_id() {
         vec![restored(
             intent,
             Some("V-1"),
-            OrderState::Accepted,
+            OrderState::PendingCancel,
             "0",
             None,
-            BASE + 5,
+            BASE + 4,
         )]
     );
     db.drop_db().await.unwrap();
@@ -589,5 +590,97 @@ async fn fifty_orders_with_three_rows_each_load_in_one_call() {
     assert_eq!(open[0].intent.client_order_id.to_string(), "order-00");
     assert_eq!(open[49].intent.client_order_id.to_string(), "order-49");
     assert!(open.iter().all(|order| order.state == OrderState::Accepted));
+    db.drop_db().await.unwrap();
+}
+
+// Regression tests for the Phase 2 independent review.
+
+#[tokio::test]
+async fn latest_row_is_the_one_inserted_last_even_when_clocks_disagree() {
+    // The engine clock runs ahead of the broker's: the intent is stamped later than the fill
+    // that followed it. The fill row was still inserted last, so it is the latest.
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let decision = decision_id(&client).await;
+    let intent = limit_intent(decision, "skew-1", BASE + 1_000_000);
+    order_event::insert(&client, &OrderEvent::intent(&intent))
+        .await
+        .unwrap();
+    let filled = OrderEvent::of(
+        &intent,
+        OrderState::Filled,
+        Some(VenueOrderId::new("brk-1")),
+        intent.qty,
+        micros(BASE + 900_000),
+    );
+    order_event::insert(&client, &filled).await.unwrap();
+
+    assert!(
+        order_event::load_open(&client).await.unwrap().is_empty(),
+        "the order is filled, not an open intent"
+    );
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn load_live_also_returns_orders_that_ended_recently() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let decision = decision_id(&client).await;
+    let open = limit_intent(decision, "live-open", BASE);
+    let ended = limit_intent(decision, "live-rejected", BASE + 1);
+    for intent in [&open, &ended] {
+        order_event::insert(&client, &OrderEvent::intent(intent))
+            .await
+            .unwrap();
+    }
+    // A never-arrived verdict: rejected, with no broker order id.
+    let rejected = OrderEvent::of(
+        &ended,
+        OrderState::Rejected,
+        None,
+        Quantity::from("0"),
+        micros(BASE + 5),
+    );
+    order_event::insert(&client, &rejected).await.unwrap();
+
+    // Without a window only the open order is loaded.
+    let only_open = order_event::load_live(&client, None).await.unwrap();
+    assert_eq!(only_open.len(), 1);
+    assert_eq!(only_open[0].intent.client_order_id, open.client_order_id);
+
+    // With a window that started before the rows were stored, the ended order comes too.
+    let long_ago = UnixNanos::from(1_000_000_000_000_000_000);
+    let both = order_event::load_live(&client, Some(long_ago))
+        .await
+        .unwrap();
+    assert_eq!(both.len(), 2);
+    let restored = both
+        .iter()
+        .find(|o| o.intent.client_order_id == ended.client_order_id)
+        .unwrap();
+    assert_eq!(restored.state, OrderState::Rejected);
+    assert_eq!(restored.venue_order_id, None);
+
+    // With a window that starts in the future, it does not.
+    let far_future = UnixNanos::from(4_000_000_000_000_000_000);
+    let none_recent = order_event::load_live(&client, Some(far_future))
+        .await
+        .unwrap();
+    assert_eq!(none_recent.len(), 1);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_second_intent_for_one_client_order_id_is_refused() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let decision = decision_id(&client).await;
+    let intent = limit_intent(decision, "dup-1", BASE);
+    order_event::insert(&client, &OrderEvent::intent(&intent))
+        .await
+        .unwrap();
+    let again = order_event::insert(&client, &OrderEvent::intent(&intent)).await;
+    assert!(matches!(again, Err(StoreError::Db(_))));
     db.drop_db().await.unwrap();
 }
