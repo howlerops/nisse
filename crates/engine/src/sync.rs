@@ -4,12 +4,12 @@
 use std::collections::BTreeMap;
 
 use nisse_core::{
-    Broker, Fill,
+    Broker, BrokerOrder, Fill,
     nautilus::{Symbol, UnixNanos},
 };
 use rust_decimal::Decimal;
 
-use crate::{EngineError, Finding, OrderTracker};
+use crate::{EngineError, Finding, OrderTracker, reconcile};
 
 /// What one reconciliation pass changed or found.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -33,12 +33,68 @@ pub struct SyncReport {
 ///
 /// `now` is the caller's clock reading, used as the event time for never-arrived orders. Any
 /// broker error aborts the pass with `Broker(..)`; the tracker keeps whatever was applied.
-#[allow(unused_variables, reason = "stub: Phase 1 task T10")]
 pub async fn sync_with_broker<B: Broker>(
     broker: &B,
     tracker: &mut OrderTracker,
     local_positions: &mut BTreeMap<Symbol, Decimal>,
     now: UnixNanos,
 ) -> Result<SyncReport, EngineError> {
-    todo!("Phase 1 task T10")
+    let open_orders = broker.open_orders().await.map_err(broker_error)?;
+    let positions = broker.positions().await.map_err(broker_error)?;
+
+    let findings = reconcile(tracker, local_positions, &open_orders, &positions);
+    let mut fills = Vec::new();
+
+    for &finding in &findings {
+        match finding {
+            Finding::OrderDrift { order } => apply_snapshot(tracker, &order, &mut fills)?,
+            Finding::NotOpenAtBroker { client_order_id } => {
+                match broker
+                    .order_by_client_id(client_order_id)
+                    .await
+                    .map_err(broker_error)?
+                {
+                    // A non-terminal answer (the open-orders list was stale) is applied like
+                    // any snapshot: it either changes nothing or reports a fill.
+                    Some(order) => apply_snapshot(tracker, &order, &mut fills)?,
+                    None => {
+                        tracker.mark_never_arrived(client_order_id, now)?;
+                    }
+                }
+            }
+            Finding::PositionMismatch {
+                symbol,
+                broker: broker_qty,
+                ..
+            } => {
+                if broker_qty.is_zero() {
+                    local_positions.remove(&symbol);
+                } else {
+                    local_positions.insert(symbol, broker_qty);
+                }
+            }
+            Finding::UnknownAtBroker { .. } => {}
+        }
+    }
+
+    Ok(SyncReport { findings, fills })
+}
+
+/// Applies one broker snapshot without a stream execution and keeps any fill it produced.
+fn apply_snapshot(
+    tracker: &mut OrderTracker,
+    order: &BrokerOrder,
+    fills: &mut Vec<Fill>,
+) -> Result<(), EngineError> {
+    if let Some(fill) = tracker.apply(order, None, order.ts)?.fill {
+        fills.push(fill);
+    }
+    Ok(())
+}
+
+fn broker_error<E>(err: E) -> EngineError
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    EngineError::Broker(Box::new(err))
 }
