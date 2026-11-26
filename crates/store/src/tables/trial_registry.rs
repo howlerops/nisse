@@ -38,3 +38,15 @@ pub async fn lifetime_count<C: GenericClient>(client: &C) -> Result<i64, StoreEr
         .await?;
     Ok(row.try_get(0)?)
 }
+
+/// The number of holdout looks: trials registered with `"holdout": true` in their result,
+/// whether or not their run finished. Counts every strategy version.
+pub async fn holdout_count<C: GenericClient>(client: &C) -> Result<i64, StoreError> {
+    let row = client
+        .query_one(
+            r#"SELECT COUNT(*) FROM trial_registry WHERE result @> '{"holdout": true}'::jsonb"#,
+            &[],
+        )
+        .await?;
+    Ok(row.try_get(0)?)
+}

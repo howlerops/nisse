@@ -176,3 +176,51 @@ async fn non_object_json_results_round_trip() {
 
     db.drop_db().await.unwrap();
 }
+
+#[tokio::test]
+async fn holdout_count_is_zero_on_an_empty_table() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+
+    assert_eq!(trial_registry::holdout_count(&client).await.unwrap(), 0);
+
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn holdout_count_counts_only_trials_marked_holdout_true() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let params = json!({"strategy": "trend_vol_target", "lookback": 252});
+    let version = StrategyVersion {
+        git_sha: "a".repeat(40),
+        config_hash: nisse_core::config_hash(&params),
+        params,
+        parent_id: None,
+        ts: UnixNanos::from(T0),
+    };
+    let sv: StrategyVersionId = strategy_version::ensure(&client, &version).await.unwrap();
+    let results = [
+        None,
+        Some(json!({"holdout": false})),
+        Some(json!({"other": 1})),
+        Some(json!({"holdout": true})),
+        Some(json!({"holdout": true, "x": 1})),
+    ];
+    for result in results {
+        let trial = Trial {
+            strategy_version_id: sv,
+            kind: TrialKind::Backtest,
+            data_start: UnixNanos::from(T0),
+            data_end: UnixNanos::from(T0 + 365 * 86_400 * ONE_SECOND),
+            result,
+            ts: UnixNanos::from(T0 + ONE_SECOND),
+        };
+        trial_registry::insert(&client, &trial).await.unwrap();
+    }
+
+    assert_eq!(trial_registry::holdout_count(&client).await.unwrap(), 2);
+    assert_eq!(trial_registry::lifetime_count(&client).await.unwrap(), 5);
+
+    db.drop_db().await.unwrap();
+}

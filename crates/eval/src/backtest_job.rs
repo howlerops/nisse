@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate, Utc};
 use nisse_bars::BarReader;
 use nisse_core::{
     MarketCalendar, StrategyVersion, StrategyVersionId, Trial, TrialKind, bars_snapshot_id,
@@ -24,14 +24,15 @@ use nisse_store::{
     Store,
     tables::{trial_registry, trial_result},
 };
-use rust_decimal::Decimal;
-use serde_json::{Map, Value, json};
+use rust_decimal::{Decimal, prelude::ToPrimitive};
+use serde_json::{Map, Number, Value, json};
 
-use crate::EvalError;
+use crate::{EvalError, gates::Gates};
 
 /// Top-level fields a job file may hold. Anything else is an error.
-const JOB_FIELDS: [&str; 9] = [
+const JOB_FIELDS: [&str; 10] = [
     "limits_path",
+    "gates_path",
     "strategy",
     "symbols",
     "start",
@@ -56,13 +57,15 @@ pub struct BacktestJob {
     pub bars_dir: PathBuf,
     /// The risk limits file the run is gated by.
     pub limits_path: PathBuf,
+    /// The promotion gates file: it holds the holdout boundary and the look limit.
+    pub gates_path: PathBuf,
     pub seed: u64,
 }
 
 impl BacktestJob {
     /// Parses the config file's JSON:
     /// {"strategy": {..params incl. "strategy"..}, "symbols": ["SPY", ..], "start": "2015-01-01", "end": "2024-12-31",
-    ///  "starting_cash": "100000", "costs": {"slippage_bps": "2", "fee_per_share": "0.0001"}, "bars_dir": "data/bars", "limits_path": "config/limits/limits.json", "seed": 0}
+    ///  "starting_cash": "100000", "costs": {"slippage_bps": "2", "fee_per_share": "0.0001"}, "bars_dir": "data/bars", "limits_path": "config/limits/limits.json", "gates_path": "config/eval/gates.json", "seed": 0}
     /// Decimals are JSON strings (never floats; a JSON number for a decimal field is an error). `start` is 00:00:00 UTC of its date and `end` is 23:59:59.999999999 UTC of its date. `seed` is optional (default 0). Unknown top-level fields are an error. Errors are `EvalError::InvalidJob(String)` naming the field.
     pub fn from_json(value: &Value) -> Result<Self, EvalError> {
         let object = value
@@ -102,6 +105,11 @@ impl BacktestJob {
                 .as_str()
                 .ok_or_else(|| invalid("limits_path", "must be a string"))?,
         );
+        let gates_path = PathBuf::from(
+            field(object, "gates_path")?
+                .as_str()
+                .ok_or_else(|| invalid("gates_path", "must be a string"))?,
+        );
         let seed = match object.get("seed") {
             None => 0,
             Some(seed) => seed
@@ -118,9 +126,21 @@ impl BacktestJob {
             costs,
             bars_dir,
             limits_path,
+            gates_path,
             seed,
         })
     }
+}
+
+/// How a run is classified. `holdout` marks it as a counted look at the holdout period.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunOptions {
+    /// The build can be replayed (no uncommitted changes).
+    pub replayable: bool,
+    /// Run even if the build is not replayable; the result says so.
+    pub allow_dirty: bool,
+    /// A deliberate, counted look at the holdout period. Ordinary runs must stay before it.
+    pub holdout: bool,
 }
 
 /// What a finished job reports.
@@ -134,25 +154,29 @@ pub struct JobOutcome {
 /// Runs `job` and stores its result. Steps, in order:
 ///
 /// 1. Refuse a build that cannot be replayed unless `allow_dirty` (nothing is read or written).
-/// 2. Build the strategy from its parameters.
+/// 2. Build the strategy from its parameters; load the risk limits and the gates.
 /// 3. Read the bars in range. No bars at all, or none for one of the requested symbols, is an
 ///    error; nothing has been written yet.
-/// 4. Ensure the strategy version.
-/// 5. Register the trial, before the run.
-/// 6. Run the backtest. On failure the trial stays registered with no result.
-/// 7. Store the result.
+/// 4. The holdout rule. An ordinary run whose last bar is on or after the holdout boundary is
+///    `HoldoutTouched`. A holdout run must reach the boundary and must have looks left under
+///    `holdout_max_looks`, else `InvalidJob` or `HoldoutRetired`. Nothing is written in these.
+/// 5. Ensure the strategy version.
+/// 6. Register the trial, before the run. A holdout run is marked in its registered result, so
+///    the look counts even if the run then fails.
+/// 7. Run the backtest. On failure the trial stays registered with no result.
+/// 8. Store the result.
 pub async fn run_backtest_job(
     store: &Store,
     job: &BacktestJob,
-    replayable: bool,
-    allow_dirty: bool,
+    options: RunOptions,
     now: UnixNanos,
 ) -> Result<JobOutcome, EvalError> {
-    if !replayable && !allow_dirty {
+    if !options.replayable && !options.allow_dirty {
         return Err(EvalError::DirtyBuild);
     }
     let built = strategies::build(&job.strategy_params).map_err(strategy_error)?;
     let limits = Limits::load(&job.limits_path)?;
+    let gates = Gates::load(&job.gates_path)?;
     // Taken before `limits` moves into the run's config.
     let limits_hash = limits.hash().to_string();
     let limits_json = limits.to_json();
@@ -192,6 +216,27 @@ pub async fn run_backtest_job(
             "the bars for {short} stop before the last session in range"
         )));
     }
+    let boundary = day_nanos(gates.holdout_start, false, "holdout_start")?;
+    let last_session = last.ts_event;
+    if options.holdout {
+        if last_session.as_u64() < boundary.as_u64() {
+            return Err(EvalError::InvalidJob(
+                "a holdout run must reach into the holdout period".to_owned(),
+            ));
+        }
+        let looks = trial_registry::holdout_count(store.client()).await?;
+        let max = gates.holdout_max_looks;
+        if looks >= i64::from(max) {
+            return Err(EvalError::HoldoutRetired { looks, max });
+        }
+    } else if last_session.as_u64() >= boundary.as_u64() {
+        return Err(EvalError::HoldoutTouched(format!(
+            "the holdout starts {}, but the bars run to {}",
+            gates.holdout_start,
+            date_text(last_session)
+        )));
+    }
+
     let data_start = first.ts_event;
     let data_end = last
         .ts_event
@@ -223,7 +268,7 @@ pub async fn run_backtest_job(
         kind: TrialKind::Backtest,
         data_start,
         data_end,
-        result: None,
+        result: options.holdout.then(|| json!({"holdout": true})),
         ts: now,
     };
     let trial_id = trial_registry::insert(store.client(), &trial).await?;
@@ -245,10 +290,15 @@ pub async fn run_backtest_job(
         .map_or(job.starting_cash, |point| point.1);
     let summary = metrics::summarize(&run.equity_curve, built.sessions_per_year)
         .map_or(Value::Null, |summary| summary.to_json());
+    let (returns, returns_complete) = returns_json(&run.equity_curve);
     let result = json!({
         "summary": summary,
+        "returns": returns,
+        "returns_complete": returns_complete,
+        "holdout": options.holdout,
+        "holdout_start": gates.holdout_start.to_string(),
         "git_sha": GIT_SHA,
-        "dirty_build": !replayable,
+        "dirty_build": !options.replayable,
         "data_snapshot_id": data_snapshot_id,
         "bars_file": bars_file,
         "symbols": job.symbols,
@@ -283,6 +333,44 @@ pub async fn run_backtest_job(
         strategy_version_id,
         result,
     })
+}
+
+/// The daily returns `equity_t / equity_{t-1} - 1`, one per session after the first, as JSON
+/// numbers rounded to 10 decimal places. The ratio is computed in `Decimal`; only the final
+/// conversion is `f64`. A return with a zero or negative equity on either side, or one that is
+/// not finite, is `null`, and the flag is `false`.
+fn returns_json(curve: &[(UnixNanos, Decimal)]) -> (Value, bool) {
+    const SCALE: f64 = 1e10;
+    let mut complete = true;
+    let mut returns = Vec::with_capacity(curve.len().saturating_sub(1));
+    for pair in curve.windows(2) {
+        let (before, after) = (pair[0].1, pair[1].1);
+        let ratio = if before > Decimal::ZERO && after > Decimal::ZERO {
+            after
+                .checked_div(before)
+                .and_then(|ratio| ratio.checked_sub(Decimal::ONE))
+                .and_then(|ret| ret.to_f64())
+        } else {
+            None
+        };
+        let number = ratio
+            .map(|ret| (ret * SCALE).round() / SCALE)
+            .and_then(Number::from_f64);
+        complete &= number.is_some();
+        returns.push(number.map_or(Value::Null, Value::Number));
+    }
+    (Value::Array(returns), complete)
+}
+
+/// The UTC date of a bar's timestamp, as `YYYY-MM-DD`.
+fn date_text(ts: UnixNanos) -> String {
+    i64::try_from(ts.as_u64())
+        .ok()
+        .map_or_else(String::new, |nanos| {
+            DateTime::<Utc>::from_timestamp_nanos(nanos)
+                .date_naive()
+                .to_string()
+        })
 }
 
 /// An unknown strategy name keeps its own error; anything else about the parameters is a bad job.
@@ -346,6 +434,11 @@ fn day_bound(value: &Value, name: &str, end: bool) -> Result<UnixNanos, EvalErro
         .ok_or_else(|| invalid(name, "must be a date as a string, YYYY-MM-DD"))?;
     let date = NaiveDate::parse_from_str(text, "%Y-%m-%d")
         .map_err(|_| invalid(name, "must be a date as YYYY-MM-DD"))?;
+    day_nanos(date, end, name)
+}
+
+/// The instant a date's day starts (`end == false`) or ends (`end == true`), UTC.
+fn day_nanos(date: NaiveDate, end: bool, name: &str) -> Result<UnixNanos, EvalError> {
     let at = if end {
         date.and_hms_nano_opt(23, 59, 59, 999_999_999)
     } else {
@@ -355,4 +448,81 @@ fn day_bound(value: &Value, name: &str, end: bool) -> Result<UnixNanos, EvalErro
         .and_then(|nanos| u64::try_from(nanos).ok())
         .map(UnixNanos::from)
         .ok_or_else(|| invalid(name, "is outside the representable range"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dec(s: &str) -> Decimal {
+        s.parse().unwrap()
+    }
+
+    /// A curve of equity values, one per session, at consecutive timestamps.
+    fn curve(values: &[&str]) -> Vec<(UnixNanos, Decimal)> {
+        values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (UnixNanos::from(i as u64), dec(v)))
+            .collect()
+    }
+
+    #[test]
+    fn returns_are_simple_daily_ratios() {
+        assert_eq!(
+            returns_json(&curve(&["100", "110", "99"])),
+            (json!([0.1, -0.1]), true)
+        );
+    }
+
+    #[test]
+    fn a_zero_equity_makes_its_return_and_the_next_null() {
+        assert_eq!(
+            returns_json(&curve(&["100", "0", "50", "100"])),
+            (json!([null, null, 1.0]), false)
+        );
+    }
+
+    #[test]
+    fn a_negative_equity_makes_its_returns_null() {
+        assert_eq!(
+            returns_json(&curve(&["100", "-5", "10"])),
+            (json!([null, null]), false)
+        );
+    }
+
+    #[test]
+    fn one_session_has_no_returns_and_is_complete() {
+        assert_eq!(returns_json(&curve(&["100"])), (json!([]), true));
+    }
+
+    #[test]
+    fn an_empty_curve_has_no_returns_and_is_complete() {
+        assert_eq!(returns_json(&[]), (json!([]), true));
+    }
+
+    #[test]
+    fn returns_are_rounded_to_ten_decimal_places() {
+        assert_eq!(
+            returns_json(&curve(&["100", "100.000000000001"])),
+            (json!([0.0]), true)
+        );
+    }
+
+    #[test]
+    fn a_flat_account_has_exact_zero_returns() {
+        assert_eq!(
+            returns_json(&curve(&["100000", "100000", "100000"])),
+            (json!([0.0, 0.0]), true)
+        );
+    }
+
+    #[test]
+    fn a_day_bound_is_the_start_or_the_end_of_its_day() {
+        let date = NaiveDate::from_ymd_opt(2023, 1, 1).unwrap();
+        let start = day_nanos(date, false, "start").unwrap().as_u64();
+        let end = day_nanos(date, true, "end").unwrap().as_u64();
+        assert_eq!(start, 1_672_531_200 * 1_000_000_000);
+        assert_eq!(end, start + 86_400 * 1_000_000_000 - 1);
+    }
 }
