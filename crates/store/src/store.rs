@@ -10,7 +10,11 @@ use tokio_postgres::Client;
 
 use crate::{
     StoreError,
-    tables::{decision, heartbeat, order_event, risk_event, strategy_version},
+    tables::{
+        decision,
+        fill::{self, FillSide},
+        heartbeat, order_event, risk_event, strategy_version,
+    },
 };
 
 /// A connection used for writes the engine waits for. Each call is one small statement.
@@ -46,6 +50,12 @@ impl Store {
         ended_since: Option<UnixNanos>,
     ) -> Result<Vec<RestoredOrder>, StoreError> {
         order_event::load_live(&self.client, ended_since).await
+    }
+
+    /// Every fill since `since` with the symbol and side of its order. See
+    /// [`fill::recent_sides`].
+    pub async fn recent_fill_sides(&self, since: UnixNanos) -> Result<Vec<FillSide>, StoreError> {
+        fill::recent_sides(&self.client, since).await
     }
 
     /// Every risk event in id order. See [`risk_event::load_all`].
