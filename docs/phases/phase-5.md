@@ -148,10 +148,13 @@ For the version's newest backtest trial that has a result and is not a holdout r
 
 The report also carries, as information: the summary of the candidate trial, bootstrap
 intervals for the annualised Sharpe and Sortino and for the expectancy, the Sharpe of each
-purged fold, the Sharpe by regime, and `haircut_sharpe = (1 − sharpe_haircut) × annualised
+purged fold, and `haircut_sharpe = (1 − sharpe_haircut) × annualised
 backtest Sharpe` (floored at 0), which is the figure the limits file's `haircut_sharpe` may
 not exceed. It is printed as JSON and written as `eval_score` rows (`subject_type`
-`strategy_version`, one per gate value, `eval_version` `gate-v1`).
+`strategy_version`, one per gate value, `eval_version` `gate-v1`). The Sharpe by regime is not in the report yet: stored return series carry no
+session dates to line up with the benchmark (`outcome::regime` itself is built and tested).
+Exit codes: 0 all pass, 1 a gate failed, 3 none failed but some not evaluated, 4 the report
+could not be produced.
 
 ## Trade-level scores (nightly job `nisse-score`)
 
