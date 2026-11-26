@@ -3,10 +3,10 @@
 use std::collections::BTreeSet;
 
 use nisse_core::{
-    Broker, Decision, Fill, ManualClock, MarketCalendar, StoreRecord, StrategyVersionId,
+    Broker, Decision, Fill, ManualClock, MarketCalendar, RiskEvent, StoreRecord, StrategyVersionId,
     nautilus::{Bar, Symbol, UnixNanos},
 };
-use nisse_risk::{Limits, RiskState};
+use nisse_risk::{DrawdownMode, Limits, RiskState};
 use rust_decimal::Decimal;
 
 use crate::{
@@ -37,6 +37,12 @@ pub struct BacktestRun {
     /// Every fill, in the order it happened.
     pub fills: Vec<Fill>,
     pub fees_paid: Decimal,
+    /// Every risk event (peaks and mode changes), in the order it was stored.
+    pub risk_events: Vec<RiskEvent>,
+    /// Orders the gate refused, summed over every rebalance (saturating).
+    pub orders_blocked: u32,
+    /// The drawdown mode after the last session.
+    pub final_mode: DrawdownMode,
 }
 
 /// Runs `strategy` over `bars` (sorted by time, then symbol) with month-end rebalancing.
@@ -90,6 +96,7 @@ pub async fn run_backtest<S: Strategy>(
     )?;
 
     let session_count = bars.chunk_by(same_session).count();
+    let mut orders_blocked: u32 = 0;
     let mut equity_curve: Vec<EquityPoint> = Vec::with_capacity(session_count);
     for session in bars.chunk_by(same_session) {
         let Some(session_ts) = session.first().map(|bar| bar.ts_event) else {
@@ -111,6 +118,7 @@ pub async fn run_backtest<S: Strategy>(
             .equity
             .as_decimal();
         equity_curve.push((session_ts, equity));
+        let step = trader.observe_equity(equity).await?;
 
         // A bar's ts is the session close; the session that contains it is the one that
         // closed it, which is the one whose last instant is just before that close.
@@ -121,25 +129,39 @@ pub async fn run_backtest<S: Strategy>(
         let Some(closed_session) = inside else {
             return Err(EngineError::InvalidBar("bar outside the calendar"));
         };
-        if calendar.is_last_session_of_month(closed_session.date) == Some(true) {
-            trader.rebalance().await?;
+        let month_end = calendar.is_last_session_of_month(closed_session.date) == Some(true);
+        // A step down (to a smaller exposure scale) resizes at once, not at the next month end.
+        // A step up waits for the month end.
+        let stepped_down = step.is_some_and(|(from, to)| to.scale() < from.scale());
+        if month_end || stepped_down {
+            let report = trader.rebalance().await?;
+            orders_blocked = orders_blocked.saturating_add(report.orders_blocked);
         }
     }
 
-    let fills: Vec<Fill> = store
-        .records()
-        .into_iter()
-        .filter_map(|record| match record {
-            StoreRecord::Order { fill, .. } => fill,
-            _ => None,
-        })
-        .collect();
+    let mut fills: Vec<Fill> = Vec::new();
+    let mut risk_events: Vec<RiskEvent> = Vec::new();
+    for record in store.records() {
+        match record {
+            StoreRecord::Order {
+                fill: Some(fill), ..
+            } => fills.push(fill),
+            StoreRecord::RiskEvent(event) => risk_events.push(event),
+            StoreRecord::Snapshot(_)
+            | StoreRecord::Position(_)
+            | StoreRecord::Risk(_)
+            | StoreRecord::Order { fill: None, .. } => {}
+        }
+    }
 
     Ok(BacktestRun {
         equity_curve,
         decisions: store.decisions(),
         fills,
         fees_paid: trader.broker().fees_paid(),
+        risk_events,
+        orders_blocked,
+        final_mode: trader.risk().state().drawdown.mode,
     })
 }
 
