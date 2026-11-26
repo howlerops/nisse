@@ -15,7 +15,7 @@ use crate::db::{from_ts, parse_enum, to_price, to_quantity, to_ts};
 
 /// The stored strings of every terminal state, from the enum itself so they cannot drift
 /// from `OrderState::is_terminal`.
-fn terminal_states() -> Vec<&'static str> {
+pub(crate) fn terminal_states() -> Vec<&'static str> {
     OrderState::VARIANTS
         .iter()
         .filter(|state| state.is_terminal())

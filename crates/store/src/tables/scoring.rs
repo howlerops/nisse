@@ -5,10 +5,9 @@ use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
 use nisse_core::nautilus::{OrderSide, Symbol, UnixNanos};
-use nisse_core::{DecisionId, OrderState, StrategyVersionId};
+use nisse_core::{DecisionId, StrategyVersionId};
 use rust_decimal::Decimal;
 use serde_json::Value;
-use strum::VariantArray;
 use tokio_postgres::GenericClient;
 
 use crate::StoreError;
@@ -53,17 +52,6 @@ pub struct TrialWithResult {
     pub result: Value,
     /// The trial's own timestamp (`trial_registry.event_ts`), not the result's.
     pub ts: UnixNanos,
-}
-
-/// The stored strings of every terminal state. Mirrors the private helper in `order_event`
-/// (which this module must not edit); both come from `OrderState::is_terminal`, so they
-/// cannot drift.
-fn terminal_states() -> Vec<&'static str> {
-    OrderState::VARIANTS
-        .iter()
-        .filter(|state| state.is_terminal())
-        .map(|state| <&'static str>::from(*state))
-        .collect()
 }
 
 /// Every fill, in `fill.id` order, with its order's decision, symbol and side (from the
@@ -119,7 +107,7 @@ pub async fn fills<C: GenericClient>(client: &C) -> Result<Vec<DecisionFill>, St
 pub async fn decision_orders<C: GenericClient>(
     client: &C,
 ) -> Result<Vec<DecisionOrders>, StoreError> {
-    let terminal = terminal_states();
+    let terminal = super::order_event::terminal_states();
     let rows = client
         .query(
             "WITH first_rows AS ( \
@@ -325,12 +313,4 @@ fn parse_symbol(text: &str) -> Result<Symbol, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn terminal_states_are_the_terminal_variants() {
-        assert_eq!(
-            terminal_states(),
-            vec!["filled", "canceled", "replaced", "rejected", "expired"]
-        );
-    }
 }
