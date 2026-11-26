@@ -1,9 +1,9 @@
 -- Assertion helpers for migrations/tests/*.sql. Loaded by scripts/test-migrations.sh before
 -- each test file, inside the transaction that the runner rolls back.
 
-
 -- TRUNCATE ... CASCADE in assert_append_only announces each cascade; keep test output quiet.
 SET LOCAL client_min_messages = warning;
+
 -- Fails the test unless `cond` is true (NULL counts as false).
 CREATE FUNCTION pg_temp.assert_true(cond boolean, msg text) RETURNS void
 LANGUAGE plpgsql AS $$
