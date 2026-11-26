@@ -22,16 +22,21 @@ pub(crate) fn parse_ts(text: &str) -> Result<UnixNanos, AdapterError> {
     Ok(UnixNanos::from(nanos))
 }
 
+/// Whether `text` is a plain decimal: an optional `-`, digits, at most one `.`. No exponent,
+/// no NaN, no empty string. Nautilus' own parsers accept `1e5`, which Alpaca never sends and
+/// which this adapter refuses rather than interpret.
+fn is_plain_decimal(text: &str) -> bool {
+    let digits = text.strip_prefix('-').unwrap_or(text);
+    digits.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        && digits.bytes().filter(|b| *b == b'.').count() <= 1
+        && digits.bytes().any(|b| b.is_ascii_digit())
+}
+
 /// The decimal text of a JSON string or number, without quotes. Rejects anything that is not
 /// a plain decimal (`null`, exponents, NaN), so callers can hand it to a fixed-point parser.
 pub(crate) fn decimal_text(raw: &RawValue) -> Result<&str, AdapterError> {
     let text = raw.get().trim_matches('"');
-    let digits = text.strip_prefix('-').unwrap_or(text);
-    let plain = !digits.is_empty()
-        && digits.bytes().all(|b| b.is_ascii_digit() || b == b'.')
-        && digits.bytes().filter(|b| *b == b'.').count() <= 1
-        && digits.bytes().any(|b| b.is_ascii_digit());
-    if plain {
+    if is_plain_decimal(text) {
         Ok(text)
     } else {
         Err(AdapterError::Decode(format!(
@@ -41,13 +46,19 @@ pub(crate) fn decimal_text(raw: &RawValue) -> Result<&str, AdapterError> {
     }
 }
 
-/// Parses decimal text to a [`Price`], keeping the precision it was written with.
+/// Parses plain decimal text to a [`Price`], keeping the precision it was written with.
 pub(crate) fn parse_price(text: &str) -> Result<Price, AdapterError> {
+    if !is_plain_decimal(text) {
+        return Err(AdapterError::Decode(format!("bad price {text}")));
+    }
     Price::from_str(text).map_err(|e| AdapterError::Decode(format!("bad price {text}: {e}")))
 }
 
-/// Parses decimal text to a [`Quantity`] (non-negative), keeping its precision.
+/// Parses plain decimal text to a [`Quantity`] (non-negative), keeping its precision.
 pub(crate) fn parse_qty(text: &str) -> Result<Quantity, AdapterError> {
+    if !is_plain_decimal(text) {
+        return Err(AdapterError::Decode(format!("bad quantity {text}")));
+    }
     Quantity::from_str(text).map_err(|e| AdapterError::Decode(format!("bad quantity {text}: {e}")))
 }
 
@@ -102,5 +113,9 @@ mod tests {
         assert_eq!(qty.to_string(), "1790.86");
         assert!(parse_qty("-1").is_err());
         assert!(parse_price("abc").is_err());
+        for exponent in ["1e5", "1E-2", ""] {
+            assert!(parse_price(exponent).is_err(), "{exponent}");
+            assert!(parse_qty(exponent).is_err(), "{exponent}");
+        }
     }
 }
