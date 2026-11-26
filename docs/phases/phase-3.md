@@ -83,11 +83,13 @@ Long-only by construction: the target is never negative. If `position_qty` is ne
 ## Rebalance steps (`Trader::rebalance`)
 
 1. `reconcile_and_record`; if `!report.is_reconciled()` → `Err(NotReconciled(n))`. Nothing is
-   decided on an unknown order state.
+   decided on an unknown order state. If the broker has open orders the engine did not send
+   (`UnknownAtBroker` findings, `unrepresentable_at_broker`) → `Err(ForeignOrders(n))`.
 2. `equity` = `broker.account().equity` as a decimal.
 3. For each symbol in universe order: build the features from its rolling window
    (`close`, `history_days`, `momentum` and `var_daily` when present), the position book
-   (`position_qty`), `equity` and `n_assets`; a symbol with no bar yet gets a decision too
+   plus the unfilled remainder of the engine's own unresolved orders for the symbol
+   (`position_qty`; so a rebalance repeated before the fills orders nothing twice), `equity` and `n_assets`; a symbol with no bar yet gets a decision too
    (`Skip`, from the missing `close`). `decide_and_record` with seed `config.seed + n`.
 4. If the decision's `intended_qty` is non-zero: build an `OrderIntent` (market, `Day`, side
    from the sign, quantity `|intended_qty|`, client order id `nisse-<decision id>-0`, time

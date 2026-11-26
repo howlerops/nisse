@@ -22,7 +22,7 @@ use nisse_engine::{
     SimError, Strategy, SyncOptions, Trader, TraderConfig,
 };
 use rust_decimal::Decimal;
-use support::{Call, FakeBroker, FakeError, calls, intent, new_call_log};
+use support::{Call, FakeBroker, FakeError, accepted_from, calls, intent, new_call_log};
 
 const AAA: &str = "AAA";
 const BBB: &str = "BBB";
@@ -612,5 +612,105 @@ async fn unresolved_order_blocks_the_rebalance() {
     let result = trader.rebalance().await;
 
     assert!(matches!(result, Err(EngineError::NotReconciled(1))));
+    assert!(store.decisions().is_empty());
+}
+
+#[tokio::test]
+async fn a_repeated_rebalance_before_the_fills_orders_nothing_twice() {
+    let store = MemoryStore::new();
+    let (mut trader, first) = enter_both(&store).await;
+    assert_eq!(first.orders_submitted, 2);
+    let intents_before = store.intents().len();
+
+    // No session in between: both orders are still queued for the next open.
+    let second = trader.rebalance().await.unwrap();
+
+    assert!(
+        second
+            .decisions
+            .iter()
+            .all(|(_, _, action)| *action == Action::Hold),
+        "got {:?}",
+        second.decisions
+    );
+    assert_eq!(second.orders_submitted, 0);
+    assert_eq!(store.intents().len(), intents_before);
+    // The stored position feature is what was held plus what was on order.
+    let first_qty = store.decisions()[0].intended_qty;
+    let repeated = &store.decisions()[2];
+    assert_eq!(
+        repeated.features.get("position_qty").copied(),
+        Some(first_qty)
+    );
+}
+
+#[tokio::test]
+async fn a_bar_that_is_not_newer_is_rejected_and_changes_nothing() {
+    let store = MemoryStore::new();
+    let mut trader = engine(&store, &[AAA, BBB]);
+    let all = sessions(&[(AAA, &RISING_A), (BBB, &RISING_B)], 0);
+    for session in &all {
+        feed(&mut trader, session).await;
+    }
+    let last = all.last().unwrap();
+    let earlier = &all[all.len() - 2];
+
+    // The same bar again, and an older one: both refused.
+    for stale in [&last[0], &earlier[0]] {
+        assert!(matches!(
+            trader.on_bar(stale),
+            Err(EngineError::InvalidBar(_))
+        ));
+    }
+
+    // The decisions are the ones a trader that never saw the stale bars makes.
+    let report = trader.rebalance().await.unwrap();
+    let clean_store = MemoryStore::new();
+    let (_, clean_report) = enter_both(&clean_store).await;
+    assert_eq!(report, clean_report);
+    assert_eq!(store.decisions(), clean_store.decisions());
+}
+
+#[tokio::test]
+async fn orders_the_engine_did_not_send_block_the_rebalance() {
+    // An open order at the broker that the tracker does not know.
+    let store = MemoryStore::new();
+    let broker = FakeBroker::new(new_call_log());
+    let stranger = intent("someone-else-1", "5", None);
+    broker.set_open_orders(vec![accepted_from(&stranger)]);
+    let mut trader = Trader::new(
+        strategy(),
+        OrderGateway::new(broker.clone(), &store),
+        &store,
+        &store,
+        clock(),
+        config(vec![sym(AAA), sym(BBB)]),
+        OrderBookState::default(),
+    )
+    .unwrap();
+    assert!(matches!(
+        trader.rebalance().await,
+        Err(EngineError::ForeignOrders(1))
+    ));
+    assert!(store.decisions().is_empty());
+
+    // Open orders of a kind the engine never sends.
+    let store = MemoryStore::new();
+    let broker = FakeBroker::new(new_call_log());
+    broker.set_unrepresentable(2);
+    let mut trader = Trader::new(
+        strategy(),
+        OrderGateway::new(broker.clone(), &store),
+        &store,
+        &store,
+        clock(),
+        config(vec![sym(AAA), sym(BBB)]),
+        OrderBookState::default(),
+    )
+    .unwrap();
+    assert!(matches!(
+        trader.rebalance().await,
+        Err(EngineError::ForeignOrders(2))
+    ));
     assert!(store.decisions().is_empty());
 }

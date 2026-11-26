@@ -28,7 +28,7 @@ pub mod feature {
     pub const MOMENTUM: &str = "momentum";
     /// Variance of daily returns over the volatility window.
     pub const VAR_DAILY: &str = "var_daily";
-    /// Signed shares held now.
+    /// Signed shares held now, plus the shares still to fill in the engine's own open orders.
     pub const POSITION_QTY: &str = "position_qty";
     /// Account equity in dollars.
     pub const EQUITY: &str = "equity";

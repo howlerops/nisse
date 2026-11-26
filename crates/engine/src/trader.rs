@@ -6,12 +6,14 @@ use std::collections::BTreeMap;
 use nisse_core::{
     Action, Broker, Clock, Decision, DecisionId, DecisionLog, Features, IntentLog, OrderIntent,
     OrderUpdate, RecordSink, StrategyVersionId,
-    nautilus::{Bar, ClientOrderId, OrderSide, OrderType, Quantity, Symbol, TimeInForce},
+    nautilus::{
+        Bar, ClientOrderId, OrderSide, OrderType, Quantity, Symbol, TimeInForce, UnixNanos,
+    },
 };
 use rust_decimal::Decimal;
 
 use crate::{
-    DecisionContext, EngineError, OrderBookState, OrderGateway, Strategy, SyncOptions,
+    DecisionContext, EngineError, Finding, OrderBookState, OrderGateway, Strategy, SyncOptions,
     decide_and_record,
     features::{RollingStats, WindowSpec},
     reconcile_and_record, record_stream_update,
@@ -45,6 +47,13 @@ pub struct RebalanceReport {
     pub orders_failed: u32,
 }
 
+/// One symbol's rolling statistics and the time of the last bar that went into them.
+#[derive(Debug)]
+struct SymbolWindow {
+    stats: RollingStats,
+    last_bar_ts: Option<UnixNanos>,
+}
+
 /// The trading loop for one strategy.
 #[derive(Debug)]
 pub struct Trader<S, B, L, D, K, C> {
@@ -56,7 +65,7 @@ pub struct Trader<S, B, L, D, K, C> {
     config: TraderConfig,
     state: OrderBookState,
     /// One preallocated window per symbol in the universe.
-    windows: BTreeMap<Symbol, RollingStats>,
+    windows: BTreeMap<Symbol, SymbolWindow>,
     decisions_made: u64,
 }
 
@@ -96,7 +105,13 @@ where
         }
         let mut windows = BTreeMap::new();
         for &symbol in &config.symbols {
-            windows.insert(symbol, RollingStats::new(config.window)?);
+            windows.insert(
+                symbol,
+                SymbolWindow {
+                    stats: RollingStats::new(config.window)?,
+                    last_bar_ts: None,
+                },
+            );
         }
         Ok(Self {
             strategy,
@@ -113,12 +128,23 @@ where
 
     /// Feeds one daily bar. This is the per-bar path: one map lookup and one O(1) window
     /// update, no allocation. A bar for a symbol outside the universe is ignored.
+    ///
+    /// A bar that is not newer than the symbol's last one is `InvalidBar` and changes
+    /// nothing: a daily bar delivered twice (a reconnect, a re-fetch after a restart) would
+    /// otherwise add a zero return and shift the lookback. The caller drops such a bar.
     pub fn on_bar(&mut self, bar: &Bar) -> Result<(), EngineError> {
         let symbol = bar.bar_type.instrument_id().symbol;
-        match self.windows.get_mut(&symbol) {
-            Some(window) => window.push(bar.close.as_decimal()),
-            None => Ok(()),
+        let Some(window) = self.windows.get_mut(&symbol) else {
+            return Ok(());
+        };
+        if window.last_bar_ts.is_some_and(|last| bar.ts_event <= last) {
+            return Err(EngineError::InvalidBar(
+                "bar is not newer than the symbol's last bar",
+            ));
         }
+        window.stats.push(bar.close.as_decimal())?;
+        window.last_bar_ts = Some(bar.ts_event);
+        Ok(())
     }
 
     /// Applies one broker order update (live: from the order stream; backtest: from the
@@ -143,6 +169,20 @@ where
         if !report.is_reconciled() {
             return Err(EngineError::NotReconciled(report.problems.len()));
         }
+        // Orders the engine did not send change the position under the decisions: something
+        // else is trading the account. Nothing is decided until that is cleared up.
+        let foreign = report
+            .findings
+            .iter()
+            .filter(|finding| matches!(finding, Finding::UnknownAtBroker { .. }))
+            .count()
+            .saturating_add(
+                usize::try_from(report.unrepresentable_at_broker).unwrap_or(usize::MAX),
+            );
+        if foreign > 0 {
+            return Err(EngineError::ForeignOrders(foreign));
+        }
+        let working = self.working_quantities();
 
         let equity = self
             .gateway
@@ -161,7 +201,8 @@ where
             ..RebalanceReport::default()
         };
         for &symbol in &self.config.symbols {
-            let features = self.features_for(symbol, equity);
+            let working_qty = working.get(&symbol).copied().unwrap_or(Decimal::ZERO);
+            let features = self.features_for(symbol, equity, working_qty);
             let context = DecisionContext {
                 strategy_version_id: self.config.strategy_version_id,
                 symbol,
@@ -191,18 +232,36 @@ where
         Ok(out)
     }
 
+    /// Signed shares still to fill in the engine's own unresolved orders, per symbol: an
+    /// order sent earlier and not yet filled (a market order queued for the next open, an
+    /// order whose outcome is unknown). Counting them as held is what stops a second
+    /// rebalance before the fill from ordering the same shares again.
+    fn working_quantities(&self) -> BTreeMap<Symbol, Decimal> {
+        let mut working: BTreeMap<Symbol, Decimal> = BTreeMap::new();
+        for order in self.state.tracker.unresolved_orders() {
+            let remaining = order.intent.qty.as_decimal() - order.cum_filled_qty.as_decimal();
+            let signed = match order.intent.side {
+                OrderSide::Sell => -remaining,
+                _ => remaining,
+            };
+            *working.entry(order.intent.symbol).or_insert(Decimal::ZERO) += signed;
+        }
+        working
+    }
+
     /// The features one decision is made from, for `symbol`. The symbol's close, history and
-    /// momentum are absent until its window has bars, so the strategy skips it.
-    fn features_for(&self, symbol: Symbol, equity: Decimal) -> Features {
+    /// momentum are absent until its window has bars, so the strategy skips it. The position
+    /// is the shares held plus `working_qty`, the shares its unresolved orders will add.
+    fn features_for(&self, symbol: Symbol, equity: Decimal, working_qty: Decimal) -> Features {
         let mut features = Features::new();
         features.insert(
             feature::POSITION_QTY.to_owned(),
-            self.state.positions.get(symbol).qty,
+            self.state.positions.get(symbol).qty + working_qty,
         );
         features.insert(feature::EQUITY.to_owned(), equity);
         let n_assets = u64::try_from(self.config.symbols.len()).unwrap_or(u64::MAX);
         features.insert(feature::N_ASSETS.to_owned(), Decimal::from(n_assets));
-        if let Some(stats) = self.windows.get(&symbol).and_then(RollingStats::stats) {
+        if let Some(stats) = self.windows.get(&symbol).and_then(|w| w.stats.stats()) {
             features.insert(feature::CLOSE.to_owned(), stats.close);
             features.insert(
                 feature::HISTORY_DAYS.to_owned(),

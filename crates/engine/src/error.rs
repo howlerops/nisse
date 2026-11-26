@@ -60,6 +60,10 @@ pub enum EngineError {
     /// Reconciliation left an order in an unknown state, so the engine must not decide.
     #[error("not reconciled with the broker: {0} order(s) could not be resolved")]
     NotReconciled(usize),
+    /// The broker has open orders the engine did not send. Something else is trading the
+    /// account, so the engine's view of its positions cannot be trusted for sizing.
+    #[error("{0} open order(s) at the broker were not sent by the engine")]
+    ForeignOrders(usize),
     /// The decision could not be stored, so it must not be acted on.
     #[error("decision was not recorded: {0}")]
     DecisionNotRecorded(#[source] BoxError),
