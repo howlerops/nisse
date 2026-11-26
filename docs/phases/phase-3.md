@@ -59,7 +59,9 @@ Long-only by construction: the target is never negative. If `position_qty` is ne
 - `submit`: rejects (`SubmitError::Rejected`) a non-positive quantity, an order type other
   than market or limit, or a duplicate client order id; otherwise accepts, with venue order
   id `sim-<n>` and state `Accepted`, timestamp = the intent's.
-- `on_bar(bar)`: for each open order on the bar's symbol, in acceptance order:
+- `on_session(bars)` settles a whole session: sells on every bar first, then buys, then
+  marks; `on_bar(bar)` is a session of one bar. For each open order on a bar's symbol, in
+  acceptance order:
   - market: fills in full at `costs.price(side, bar.open, qty)`;
   - limit: fills in full at the open (through the cost model) only when the open is at or
     below the limit for a buy, at or above for a sell; otherwise stays open (a `Day` order
@@ -101,9 +103,10 @@ fill, so the order of the universe does not change the sizing.
 Group the bars by `ts_event` (one group per session, in time order). For each session:
 
 1. Set the clock to the session's close.
-2. For each bar: `broker.on_bar(bar)` (fills orders placed at the previous close, at this
-   bar's open), then apply every drained update with `trader.on_order_update`, then
-   `trader.on_bar(bar)`.
+2. `broker.on_session(&bars_of_this_session)`: fills the orders placed at the previous
+   close at this session's opens, all sells before any buy (a sale's proceeds can pay for a
+   purchase made at the same open). Then apply every drained update with
+   `trader.on_order_update`, then `trader.on_bar(bar)` for each bar.
 3. Record the equity point (`broker.account().equity`).
 4. If `calendar.is_last_session_of_month(date) == Some(true)` → `trader.rebalance()`.
 

@@ -58,28 +58,58 @@ impl SimBroker {
         }
     }
 
-    /// Advances the simulation by one bar: fills every open order for the bar's symbol at the
-    /// bar's **open** (through the cost model), then marks the symbol at the bar's close.
+    /// Advances the simulation by one bar (a session of one): fills every open order for the
+    /// bar's symbol at the bar's **open** (through the cost model), then marks the symbol at the bar's close.
     /// Market orders always fill; a limit order fills only if the open is at or better than
     /// its limit, at the open. Fills queue `OrderUpdate`s for [`Self::drain_updates`].
     /// Rules are in `docs/phases/phase-3.md`, "Simulated broker rules".
     pub fn on_bar(&self, bar: &Bar) -> Result<(), EngineError> {
-        let symbol = bar.bar_type.instrument_id().symbol;
-        let open = bar.open.as_decimal();
-        let close = bar.close.as_decimal();
-        if open <= Decimal::ZERO || close <= Decimal::ZERO {
-            return Err(EngineError::InvalidBar("bar prices must be positive"));
+        self.on_session(std::slice::from_ref(bar))
+    }
+
+    /// Advances the simulation by one session: every bar of that session at once. All sells
+    /// are settled before any buy, whatever the order of `bars`, because at a real open the
+    /// orders execute together and a sale's proceeds can pay for a purchase. Settling symbol
+    /// by symbol would cancel a buy for want of cash that a later symbol's sale provides.
+    /// After the orders, every symbol is marked at its bar's close.
+    pub fn on_session(&self, bars: &[Bar]) -> Result<(), EngineError> {
+        for bar in bars {
+            if bar.open.as_decimal() <= Decimal::ZERO || bar.close.as_decimal() <= Decimal::ZERO {
+                return Err(EngineError::InvalidBar("bar prices must be positive"));
+            }
         }
         let mut guard = self.lock();
         let state = &mut *guard;
+        for side in [OrderSide::Sell, OrderSide::Buy] {
+            for bar in bars {
+                Self::settle_orders(state, &self.costs, bar, side)?;
+            }
+        }
+        for bar in bars {
+            state
+                .marks
+                .insert(bar.bar_type.instrument_id().symbol, bar.close.as_decimal());
+        }
+        Ok(())
+    }
+
+    /// Settles the open orders of one side on one bar's symbol, in acceptance order.
+    fn settle_orders(
+        state: &mut SimState,
+        costs: &CostModel,
+        bar: &Bar,
+        side: OrderSide,
+    ) -> Result<(), EngineError> {
+        let symbol = bar.bar_type.instrument_id().symbol;
+        let open = bar.open.as_decimal();
         let mut i = 0;
         while let Some(order) = state.open.get(i).copied() {
-            if order.symbol != symbol {
+            if order.symbol != symbol || order.side != side {
                 i += 1;
                 continue;
             }
             let held = state.positions.get(symbol).qty;
-            match settle(&order, open, state.cash, held, &self.costs)? {
+            match settle(&order, open, state.cash, held, costs)? {
                 Settlement::Wait => i += 1,
                 Settlement::Cancel => {
                     state.open.remove(i);
@@ -137,7 +167,6 @@ impl SimBroker {
                 }
             }
         }
-        state.marks.insert(symbol, close);
         Ok(())
     }
 
@@ -1235,5 +1264,46 @@ mod tests {
         assert_eq!(account.equity.as_decimal(), d("1234.50"));
         assert!(!account.trading_blocked);
         assert_eq!(account.cash.currency.code.as_str(), "USD");
+    }
+
+    #[tokio::test]
+    async fn a_session_settles_sells_before_buys_so_proceeds_fund_purchases() {
+        // Fully invested in ZZZ; rotate into AAA. AAA's bar comes first in symbol order, so
+        // settling bar by bar would cancel the buy for want of cash.
+        let broker = SimBroker::new(d("1000"), CostModel::new(d("0"), d("0")).unwrap());
+        broker
+            .submit(&market("o1", "ZZZ", OrderSide::Buy, "10"))
+            .await
+            .unwrap();
+        broker
+            .on_session(&[bar("ZZZ", 1, "100", "100", "100", "100")])
+            .unwrap();
+        let _ = broker.drain_updates();
+
+        broker
+            .submit(&market("o2", "AAA", OrderSide::Buy, "20"))
+            .await
+            .unwrap();
+        broker
+            .submit(&market("o3", "ZZZ", OrderSide::Sell, "10"))
+            .await
+            .unwrap();
+        broker
+            .on_session(&[
+                bar("AAA", 2, "50", "50", "50", "50"),
+                bar("ZZZ", 2, "100", "100", "100", "100"),
+            ])
+            .unwrap();
+        let updates = broker.drain_updates();
+        assert_eq!(updates.len(), 2);
+        assert!(updates.iter().all(|u| u.order.state == OrderState::Filled));
+        assert_eq!(
+            updates[0].order.side,
+            OrderSide::Sell,
+            "the sale settles first"
+        );
+        let positions = broker.positions().await.unwrap();
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].symbol, Symbol::new("AAA"));
     }
 }
