@@ -1,6 +1,8 @@
 //! Locks the text form of the store enums. These strings are stored in Postgres and fixed by
 //! CHECK constraints, so the expected values are literal lists, not derived from the enums.
 
+use std::{fmt::Debug, str::FromStr};
+
 use nisse_core::{Action, CoreError, SubjectType, TrialKind};
 use strum::VariantArray;
 
@@ -24,23 +26,23 @@ fn subject_type_strings_are_stable() {
     assert_eq!(strings::<SubjectType>(), ["decision", "strategy_version"]);
 }
 
+/// Every variant of `T` parses back from its `Display` text, which equals its stored string.
+fn assert_round_trips<T>()
+where
+    T: VariantArray + Copy + PartialEq + Into<&'static str> + ToString + FromStr + Debug,
+{
+    for v in T::VARIANTS {
+        let text = v.to_string();
+        assert_eq!(text.parse::<T>().ok(), Some(*v));
+        assert_eq!(text, (*v).into());
+    }
+}
+
 #[test]
 fn enums_round_trip_through_text() {
-    for v in Action::VARIANTS {
-        let text = v.to_string();
-        assert_eq!(text.parse::<Action>().ok(), Some(*v));
-        assert_eq!(text, <&'static str>::from(*v));
-    }
-    for v in TrialKind::VARIANTS {
-        let text = v.to_string();
-        assert_eq!(text.parse::<TrialKind>().ok(), Some(*v));
-        assert_eq!(text, <&'static str>::from(*v));
-    }
-    for v in SubjectType::VARIANTS {
-        let text = v.to_string();
-        assert_eq!(text.parse::<SubjectType>().ok(), Some(*v));
-        assert_eq!(text, <&'static str>::from(*v));
-    }
+    assert_round_trips::<Action>();
+    assert_round_trips::<TrialKind>();
+    assert_round_trips::<SubjectType>();
 }
 
 #[test]

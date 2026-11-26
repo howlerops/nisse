@@ -1,6 +1,9 @@
 -- Assertion helpers for migrations/tests/*.sql. Loaded by scripts/test-migrations.sh before
 -- each test file, inside the transaction that the runner rolls back.
 
+
+-- TRUNCATE ... CASCADE in assert_append_only announces each cascade; keep test output quiet.
+SET LOCAL client_min_messages = warning;
 -- Fails the test unless `cond` is true (NULL counts as false).
 CREATE FUNCTION pg_temp.assert_true(cond boolean, msg text) RETURNS void
 LANGUAGE plpgsql AS $$
@@ -37,6 +40,8 @@ LANGUAGE plpgsql AS $$
 BEGIN
   PERFORM pg_temp.assert_raises(format('UPDATE %s SET ingest_ts = ingest_ts', tbl), '23001');
   PERFORM pg_temp.assert_raises(format('DELETE FROM %s', tbl), '23001');
-  PERFORM pg_temp.assert_raises(format('TRUNCATE %s', tbl), '23001');
+  -- CASCADE, because a plain TRUNCATE of a table that foreign keys point at is refused by
+  -- Postgres (0A000) before any trigger runs; the cascading form is the one the guard must stop.
+  PERFORM pg_temp.assert_raises(format('TRUNCATE %s CASCADE', tbl), '23001');
 END;
 $$;
