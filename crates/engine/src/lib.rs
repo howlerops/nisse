@@ -20,19 +20,30 @@ pub fn build_is_replayable() -> bool {
     env!("NISSE_GIT_DIRTY") == "0" && GIT_SHA.bytes().any(|b| b != b'0')
 }
 
+mod backtest;
+mod cost;
 mod decide;
 mod error;
+pub mod features;
 mod gateway;
+mod memory;
+pub mod metrics;
 mod order_service;
 mod order_tracker;
 mod positions;
 mod reconcile;
+mod sim_broker;
+pub mod strategies;
 mod strategy;
 mod sync;
+mod trader;
 
+pub use backtest::{BacktestConfig, BacktestRun, run_backtest};
+pub use cost::{CostModel, PricedFill};
 pub use decide::{DecisionContext, ReplayOutcome, decide, decide_and_record, replay};
 pub use error::{BoxError, EngineError};
 pub use gateway::{OrderGateway, Submitted};
+pub use memory::{MemoryStore, MemoryStoreError};
 pub use order_service::{
     OrderBookState, reconcile_and_record, record_stream_update, replace_and_record,
     submit_and_record,
@@ -40,5 +51,7 @@ pub use order_service::{
 pub use order_tracker::{Applied, OrderTracker, TrackedOrder};
 pub use positions::{Position, PositionBook};
 pub use reconcile::{Finding, reconcile};
+pub use sim_broker::{SimBroker, SimError};
 pub use strategy::{Strategy, Verdict};
 pub use sync::{StateChange, SyncOptions, SyncProblem, SyncReport, sync_with_broker};
+pub use trader::{RebalanceReport, Trader, TraderConfig};

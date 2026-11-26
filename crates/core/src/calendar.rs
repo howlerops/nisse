@@ -37,6 +37,31 @@ pub struct MarketCalendar {
 }
 
 impl MarketCalendar {
+    /// Builds a calendar from session close times alone, for backtests that have bars but no
+    /// broker calendar. Each close becomes a session dated by the UTC date of the close
+    /// (for a US close that is the same calendar day as in New York) and assumed to have
+    /// opened [`FULL_SESSION_NANOS`] earlier, so half-days are not recognised: use the
+    /// broker's calendar when that matters. `closes` must be strictly
+    /// increasing; duplicates are an `InvalidCalendar` error.
+    pub fn from_closes(closes: &[UnixNanos]) -> Result<Self, CoreError> {
+        let sessions = closes
+            .iter()
+            .map(|close| {
+                let date = i64::try_from(close.as_u64())
+                    .ok()
+                    .map(chrono::DateTime::from_timestamp_nanos)
+                    .map(|ts| ts.date_naive())
+                    .ok_or(CoreError::InvalidCalendar("close time out of range"))?;
+                Ok(Session {
+                    date,
+                    open: UnixNanos::from(close.as_u64().saturating_sub(FULL_SESSION_NANOS)),
+                    close: *close,
+                })
+            })
+            .collect::<Result<Vec<_>, CoreError>>()?;
+        Self::new(sessions)
+    }
+
     /// Builds a calendar.
     ///
     /// Errors with [`CoreError::InvalidCalendar`] when `sessions` is empty, a session has

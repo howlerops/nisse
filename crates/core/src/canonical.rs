@@ -146,6 +146,16 @@ fn is_plain_decimal(text: &str) -> bool {
     seen_digit
 }
 
+/// Identifies a set of bars by content (`decision.data_snapshot_id`): the hex SHA-256 of one
+/// line per bar, `symbol,ts_event,open,high,low,close,volume\n`, in the order given, with
+/// each decimal normalised. Two reads that return the same bars give the same id whatever
+/// files they came from.
+#[allow(unused_variables, reason = "stub: Phase 3 task B2")]
+#[must_use]
+pub fn bars_snapshot_id(bars: &[nautilus_model::data::Bar]) -> String {
+    todo!("Phase 3 task B2")
+}
+
 /// SHA-256 of `canonical_json(features_to_json(features))` (`decision.feature_hash`). Two
 /// feature sets with equal values hash equally even if the decimals were written differently
 /// (`1.50` and `1.5`).

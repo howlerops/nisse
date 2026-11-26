@@ -17,7 +17,8 @@ mod types;
 
 pub use calendar::{FULL_SESSION_NANOS, MarketCalendar, Session};
 pub use canonical::{
-    Features, canonical_json, config_hash, feature_hash, features_from_json, features_to_json,
+    Features, bars_snapshot_id, canonical_json, config_hash, feature_hash, features_from_json,
+    features_to_json,
 };
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use error::CoreError;
