@@ -10,8 +10,10 @@
 set -euo pipefail
 
 : "${DATABASE_URL:?set DATABASE_URL}"
-cd "$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
+cd "$(dirname "$0")/.."
 
+# NOTICEs (such as "relation already exists, skipping") are noise; errors still print.
+export PGOPTIONS="${PGOPTIONS:-} -c client_min_messages=warning"
 q() { psql "$DATABASE_URL" -X -q -v ON_ERROR_STOP=1 "$@"; }
 
 q -c "CREATE TABLE IF NOT EXISTS schema_migration (
@@ -19,7 +21,7 @@ q -c "CREATE TABLE IF NOT EXISTS schema_migration (
         checksum  TEXT NOT NULL,
         event_ts  TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
         ingest_ts TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
-      )" 2>/dev/null
+      )"
 
 for file in migrations/*.sql; do
   version="$(basename "$file" .sql)"
@@ -42,4 +44,12 @@ for file in migrations/*.sql; do
     exit 1
   fi
 done
+# A ledger row with no file means a migration was deleted or renamed after it ran.
+while read -r version; do
+  if [[ -n "$version" && ! -f "migrations/$version.sql" ]]; then
+    echo "migrate: $version is applied in the database but migrations/$version.sql is missing" >&2
+    exit 1
+  fi
+done < <(q -At -c "SELECT version FROM schema_migration ORDER BY version")
+
 echo "migrate: up to date"

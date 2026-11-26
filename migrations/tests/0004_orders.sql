@@ -95,9 +95,9 @@ SELECT pg_temp.assert_raises($q$
 $q$, '428C9');
 
 -- 4. Two partial fills for one order; cumulative quantity is the sum.
-INSERT INTO fill (client_order_id, px, qty, fee, event_ts)
-VALUES ('nisse-0001', 500.10, 0.5, 0, '2026-01-05T21:00:02Z'),
-       ('nisse-0001', 500.09, 1.0, -0.01, '2026-01-05T21:00:03Z');
+INSERT INTO fill (broker_fill_id, client_order_id, px, qty, fee, event_ts)
+VALUES ('exec-1-1', 'nisse-0001', 500.10, 0.5, 0, '2026-01-05T21:00:02Z'),
+       ('exec-1-2', 'nisse-0001', 500.09, 1.0, -0.01, '2026-01-05T21:00:03Z');
 
 SELECT pg_temp.assert_true(
   (SELECT sum(qty) FROM fill WHERE client_order_id = 'nisse-0001') = 1.5,
@@ -108,8 +108,8 @@ SELECT pg_temp.assert_true(
   'a negative fee (rebate) must be stored');
 
 -- 5. NUMERIC is exact: 0.1 + 0.2 is 0.3 (false with floating point).
-INSERT INTO fill (client_order_id, px, qty, fee, event_ts)
-VALUES ('nisse-0002', 0.1, 0.2, 0, '2026-01-05T21:00:04Z');
+INSERT INTO fill (broker_fill_id, client_order_id, px, qty, fee, event_ts)
+VALUES ('exec-2-1', 'nisse-0002', 0.1, 0.2, 0, '2026-01-05T21:00:04Z');
 
 SELECT pg_temp.assert_true(
   (SELECT px + qty = 0.3 FROM fill WHERE client_order_id = 'nisse-0002'),
@@ -117,38 +117,38 @@ SELECT pg_temp.assert_true(
 
 -- 6. fill rejections.
 SELECT pg_temp.assert_raises($q$
-  INSERT INTO fill (client_order_id, px, qty, fee, event_ts)
-  VALUES ('nisse-0001', 0, 1, 0, '2026-01-05T21:00:00Z')
+  INSERT INTO fill (broker_fill_id, client_order_id, px, qty, fee, event_ts)
+  VALUES ('exec-3-1', 'nisse-0001', 0, 1, 0, '2026-01-05T21:00:00Z')
 $q$, '23514');
 
 SELECT pg_temp.assert_raises($q$
-  INSERT INTO fill (client_order_id, px, qty, fee, event_ts)
-  VALUES ('nisse-0001', 500.10, 0, 0, '2026-01-05T21:00:00Z')
+  INSERT INTO fill (broker_fill_id, client_order_id, px, qty, fee, event_ts)
+  VALUES ('exec-4-1', 'nisse-0001', 500.10, 0, 0, '2026-01-05T21:00:00Z')
 $q$, '23514');
 
 SELECT pg_temp.assert_raises($q$
-  INSERT INTO fill (client_order_id, px, qty, fee, event_ts)
-  VALUES ('nisse-0001', 500.10, -1, 0, '2026-01-05T21:00:00Z')
+  INSERT INTO fill (broker_fill_id, client_order_id, px, qty, fee, event_ts)
+  VALUES ('exec-5-1', 'nisse-0001', 500.10, -1, 0, '2026-01-05T21:00:00Z')
 $q$, '23514');
 
 SELECT pg_temp.assert_raises($q$
-  INSERT INTO fill (client_order_id, px, qty, fee, event_ts)
-  VALUES ('', 500.10, 1, 0, '2026-01-05T21:00:00Z')
+  INSERT INTO fill (broker_fill_id, client_order_id, px, qty, fee, event_ts)
+  VALUES ('exec-6-1', '', 500.10, 1, 0, '2026-01-05T21:00:00Z')
 $q$, '23514');
 
 SELECT pg_temp.assert_raises($q$
-  INSERT INTO fill (client_order_id, px, qty, fee, event_ts)
-  VALUES ('nisse-0001', 500.10, 1, NULL, '2026-01-05T21:00:00Z')
+  INSERT INTO fill (broker_fill_id, client_order_id, px, qty, fee, event_ts)
+  VALUES ('exec-7-1', 'nisse-0001', 500.10, 1, NULL, '2026-01-05T21:00:00Z')
 $q$, '23502');
 
 SELECT pg_temp.assert_raises($q$
-  INSERT INTO fill (client_order_id, px, qty, fee, event_ts)
-  VALUES ('nisse-0001', NULL, 1, 0, '2026-01-05T21:00:00Z')
+  INSERT INTO fill (broker_fill_id, client_order_id, px, qty, fee, event_ts)
+  VALUES ('exec-8-1', 'nisse-0001', NULL, 1, 0, '2026-01-05T21:00:00Z')
 $q$, '23502');
 
 SELECT pg_temp.assert_raises($q$
-  INSERT INTO fill (client_order_id, px, qty, fee, event_ts)
-  VALUES ('nisse-0001', 500.10, 1, 0, NULL)
+  INSERT INTO fill (broker_fill_id, client_order_id, px, qty, fee, event_ts)
+  VALUES ('exec-9-1', 'nisse-0001', 500.10, 1, 0, NULL)
 $q$, '23502');
 
 -- 7. position_event: long, flat and short positions all succeed.
@@ -186,6 +186,35 @@ SELECT pg_temp.assert_raises($q$
   INSERT INTO position_event (symbol, qty_after, avg_cost, event_ts)
   VALUES ('SPY', 1, 1, NULL)
 $q$, '23502');
+
+-- A fill delivered twice (same broker execution id) is rejected, so it cannot be counted twice;
+-- NaN can never reach a price, a quantity or a risk limit.
+SELECT pg_temp.assert_raises($q$
+  INSERT INTO fill (broker_fill_id, client_order_id, px, qty, fee, event_ts)
+  VALUES ('exec-1-1', 'nisse-0001', 500.10, 0.5, 0, '2026-01-05T21:00:02Z')
+$q$, '23505');
+
+SELECT pg_temp.assert_raises($q$
+  INSERT INTO fill (broker_fill_id, client_order_id, px, qty, fee, event_ts)
+  VALUES ('', 'nisse-0001', 500.10, 0.5, 0, '2026-01-05T21:00:02Z')
+$q$, '23514');
+
+SELECT pg_temp.assert_raises($q$
+  INSERT INTO fill (broker_fill_id, client_order_id, px, qty, fee, event_ts)
+  VALUES ('exec-nan', 'nisse-0001', 'NaN', 'Infinity', 'NaN', '2026-01-05T21:00:02Z')
+$q$, '23514');
+
+SELECT pg_temp.assert_raises($q$
+  INSERT INTO order_event (decision_id, client_order_id, state, type, qty, event_ts)
+  VALUES ((SELECT min(id) FROM decision), 'nisse-0009', 'intent', 'market', 'NaN',
+          '2026-01-05T21:00:00Z')
+$q$, '23514');
+
+SELECT pg_temp.assert_raises($q$
+  INSERT INTO risk_check (decision_id, rule, limit_value, actual_value, passed, event_ts)
+  VALUES ((SELECT min(id) FROM decision), 'max_position_pct', 'NaN', 'Infinity', true,
+          '2026-01-05T21:00:00Z')
+$q$, '23514');
 
 -- 9. All three tables are append-only (checked after rows exist).
 SELECT pg_temp.assert_append_only('order_event');

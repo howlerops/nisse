@@ -9,7 +9,7 @@
 set -euo pipefail
 
 : "${DATABASE_URL:?set DATABASE_URL}"
-cd "$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
+cd "$(dirname "$0")/.."
 
 scratch="nisse_test_$$_$RANDOM"
 admin_url="$DATABASE_URL"
@@ -23,7 +23,9 @@ query="${DATABASE_URL#"$base"}"
 export DATABASE_URL="${base%/*}/$scratch$query"
 
 scripts/migrate.sh
-if scripts/migrate.sh | grep -q 'applying'; then
+# Captured first: a failing run inside an `if` pipeline would be read as "nothing applied".
+second_run="$(scripts/migrate.sh)"
+if grep -q 'applying' <<<"$second_run"; then
   echo "test-migrations: second run applied something; migrate.sh is not idempotent" >&2
   exit 1
 fi

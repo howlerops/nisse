@@ -9,6 +9,15 @@
 --   event_ts  TIMESTAMPTZ NOT NULL                            -- when it happened; the writer
 --                                                             -- supplies it from its clock
 --   ingest_ts TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()  -- when the store received it
+--
+-- Number columns use the two domains below instead of bare NUMERIC / DOUBLE PRECISION. Postgres
+-- accepts NaN and Infinity in both and sorts NaN above every number, so a bare `CHECK (px > 0)`
+-- would let a NaN price in for good.
+
+CREATE DOMAIN finite_numeric AS NUMERIC
+  CHECK (VALUE NOT IN ('NaN', 'Infinity', '-Infinity'));
+CREATE DOMAIN finite_double AS DOUBLE PRECISION
+  CHECK (VALUE NOT IN ('NaN', 'Infinity', '-Infinity'));
 
 CREATE FUNCTION nisse_forbid_mutation() RETURNS trigger
 LANGUAGE plpgsql AS $$

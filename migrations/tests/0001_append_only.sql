@@ -1,5 +1,13 @@
 -- Contract checks that hold for every table in the store, present and future.
 
+-- The number domains reject every non-finite value and keep exact decimals.
+CREATE TEMP TABLE finite_probe (n finite_numeric, d finite_double) ON COMMIT DROP;
+INSERT INTO finite_probe VALUES (0.1, 0.1), (-1, -1), (NULL, NULL);
+SELECT pg_temp.assert_true((SELECT sum(n) = -0.9 FROM finite_probe), 'finite_numeric is exact');
+SELECT pg_temp.assert_raises(
+  format('INSERT INTO finite_probe (%s) VALUES (%L)', col, bad), '23514')
+FROM unnest(ARRAY['n', 'd']) AS col, unnest(ARRAY['NaN', 'Infinity', '-Infinity']) AS bad;
+
 SELECT pg_temp.assert_append_only('schema_migration');
 
 DO $$
@@ -37,6 +45,16 @@ BEGIN
       t.relname || ' is missing the append_only trigger (call nisse_make_append_only)');
 
     PERFORM pg_temp.assert_append_only(t.oid::regclass);
+
+    PERFORM pg_temp.assert_true(
+      NOT EXISTS (
+        SELECT 1
+        FROM pg_attribute a
+        WHERE a.attrelid = t.oid
+          AND a.attnum > 0
+          AND NOT a.attisdropped
+          AND a.atttypid IN ('numeric'::regtype, 'float8'::regtype, 'float4'::regtype)),
+      t.relname || ' has a bare NUMERIC or float column; use finite_numeric / finite_double');
 
     IF t.relname <> 'schema_migration' THEN
       PERFORM pg_temp.assert_true(

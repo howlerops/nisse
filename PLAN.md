@@ -53,7 +53,7 @@ Two loops that meet only at a human-approved merge.
 
 ## Trade store and evals
 
-Store every decision, not just every fill. Rank strategy versions, not individual trades (single-trade P&L is mostly luck). All tables are append-only with `event_ts` and `ingest_ts`; corrections are new rows. The database enforces this: a trigger on every table rejects UPDATE, DELETE and TRUNCATE. The schema is in `migrations/`, applied by `scripts/migrate.sh`.
+Store every decision, not just every fill. Rank strategy versions, not individual trades (single-trade P&L is mostly luck). All tables are append-only with `event_ts` and `ingest_ts`; corrections are new rows. A trigger on every table rejects UPDATE, DELETE and TRUNCATE; a table owner or superuser can still disable it, so from Phase 2 the engine connects as a role with INSERT and SELECT only. The schema is in `migrations/`, applied by `scripts/migrate.sh`.
 
 ### Tables
 
@@ -64,7 +64,7 @@ Store every decision, not just every fill. Rank strategy versions, not individua
 | `decision` | event_ts, strategy_version_id, symbol, action [enter \| exit \| hold \| skip], intended_qty, expected_edge_bps, expected_vol, features, feature_hash, data_snapshot_id, rng_seed, reason_code |
 | `market_snapshot` | event_ts, symbol, bid, ask, mid, spread_bps, adv, vol, regime_tag |
 | `order_event` | decision_id, client_order_id, broker_order_id, event_ts, state, type, limit_px, qty |
-| `fill` | client_order_id, event_ts, px, qty, fee |
+| `fill` | client_order_id, broker_fill_id (unique), event_ts, px, qty, fee |
 | `position_event` | event_ts, symbol, qty_after, avg_cost |
 | `outcome_window` | decision_id, horizon, fwd_ret, bench_ret, mfe, mae |
 | `eval_score` | subject_id, subject_type, metric, value, eval_version |

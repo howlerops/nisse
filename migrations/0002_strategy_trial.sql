@@ -1,8 +1,9 @@
 -- strategy_version: one immutable strategy configuration at one git SHA; parent_id is the
 --   version it was derived from.
 -- trial_registry: one row per backtest, shadow or live evaluation ever run. The lifetime trial
---   count is the row count and never resets. result is NULL when a trial is registered before
---   it finishes.
+--   count is the row count and never resets. result is NULL on a row written before the run
+--   finishes; rows cannot be updated, so how a later result is attached to such a row is an
+--   open design point (see docs/phases/phase-0.md) to settle before Phase 3 writes trials.
 
 CREATE TABLE strategy_version (
   id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

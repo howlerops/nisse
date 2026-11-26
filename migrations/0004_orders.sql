@@ -2,10 +2,11 @@
 --   write-ahead intent, inserted BEFORE the order is sent to the broker, so broker_order_id is NULL
 --   on it and filled in on later rows. The list of state values is fixed in Phase 1 with the adapter.
 -- fill: one row per fill reported by the broker, keyed to its order by client_order_id. qty is the
---   quantity of that one fill; cumulative filled quantity is the sum over the order's fills. fee may
---   be negative (rebate).
+--   quantity of that one fill; cumulative filled quantity is the sum over the order's fills. That
+--   sum is only safe because broker_fill_id (the broker's execution id) is unique: a fill delivered
+--   twice (stream replay, restart) is rejected instead of counted twice. fee may be negative (rebate).
 -- position_event: the position in a symbol after a change. qty_after may be negative (short).
--- Prices, quantities and fees are NUMERIC (exact), never floating point.
+-- Prices, quantities and fees are finite_numeric (exact NUMERIC), never floating point.
 
 CREATE TABLE order_event (
   id               BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -14,8 +15,8 @@ CREATE TABLE order_event (
   broker_order_id  TEXT NULL,
   state            TEXT NOT NULL             CHECK (state <> ''),
   type             TEXT NOT NULL             CHECK (type <> ''),
-  limit_px         NUMERIC NULL              CHECK (limit_px > 0),
-  qty              NUMERIC NOT NULL          CHECK (qty > 0),
+  limit_px         finite_numeric NULL  CHECK (limit_px > 0),
+  qty              finite_numeric NOT NULL  CHECK (qty > 0),
   event_ts         TIMESTAMPTZ NOT NULL,
   ingest_ts        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
@@ -27,9 +28,10 @@ SELECT nisse_make_append_only('order_event');
 CREATE TABLE fill (
   id               BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   client_order_id  TEXT NOT NULL             CHECK (client_order_id <> ''),
-  px               NUMERIC NOT NULL          CHECK (px > 0),
-  qty              NUMERIC NOT NULL          CHECK (qty > 0),
-  fee              NUMERIC NOT NULL,
+  broker_fill_id   TEXT NOT NULL UNIQUE      CHECK (broker_fill_id <> ''),
+  px               finite_numeric NOT NULL  CHECK (px > 0),
+  qty              finite_numeric NOT NULL  CHECK (qty > 0),
+  fee              finite_numeric NOT NULL,
   event_ts         TIMESTAMPTZ NOT NULL,
   ingest_ts        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
@@ -40,8 +42,8 @@ SELECT nisse_make_append_only('fill');
 CREATE TABLE position_event (
   id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   symbol      TEXT NOT NULL                  CHECK (symbol <> ''),
-  qty_after   NUMERIC NOT NULL,
-  avg_cost    NUMERIC NOT NULL               CHECK (avg_cost >= 0),
+  qty_after   finite_numeric NOT NULL,
+  avg_cost    finite_numeric NOT NULL  CHECK (avg_cost >= 0),
   event_ts    TIMESTAMPTZ NOT NULL,
   ingest_ts   TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
