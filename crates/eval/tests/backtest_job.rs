@@ -36,7 +36,7 @@ use tokio_postgres::Client;
 /// 2026-01-05T09:46:40.123456Z: the `now` every job is given.
 const NOW: u64 = 1_767_600_000_123_456_000;
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
-/// Weekday closes from 2 January 2023 to 30 June 2023.
+/// Weekday closes from 4 January 2021 to 2 July 2021, well before the 2023 holdout.
 const SESSIONS: usize = 130;
 
 static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -81,9 +81,9 @@ fn utc(y: i32, m: u32, d: u32, h: u32, min: u32, s: u32, ns: u32) -> UnixNanos {
     UnixNanos::from(u64::try_from(at.and_utc().timestamp_nanos_opt().unwrap()).unwrap())
 }
 
-/// `SESSIONS` weekday closes at 21:00 UTC, starting on Monday 2 January 2023.
+/// `SESSIONS` weekday closes at 21:00 UTC, starting on Monday 4 January 2021.
 fn closes() -> Vec<UnixNanos> {
-    let mut day = NaiveDate::from_ymd_opt(2023, 1, 2).unwrap();
+    let mut day = NaiveDate::from_ymd_opt(2021, 1, 4).unwrap();
     let mut out = Vec::with_capacity(SESSIONS);
     while out.len() < SESSIONS {
         if day.weekday().num_days_from_monday() < 5 {
@@ -200,16 +200,16 @@ fn write_gates(path: &Path, holdout_start: &str, max_looks: u32) {
 }
 
 /// A job over FALL and RISE for the whole synthetic range, reading from `dir`. Its gates file
-/// is written into `dir` with the holdout after the data (2030), so an ordinary run is allowed.
+/// keeps the default holdout boundary (2023-01-01), after the data, so an ordinary run is allowed.
 /// Call `set_holdout` after the last `job` of a test, since jobs in one directory share the file.
 fn job(dir: &Path, strategy: Value) -> BacktestJob {
     let gates_path = dir.join("gates.json");
-    write_gates(&gates_path, "2030-01-01", 10);
+    write_gates(&gates_path, "2023-01-01", 10);
     BacktestJob {
         strategy_params: strategy,
         symbols: vec!["FALL".to_owned(), "RISE".to_owned()],
-        start: utc(2023, 1, 1, 0, 0, 0, 0),
-        end: utc(2023, 6, 30, 23, 59, 59, 999_999_999),
+        start: utc(2021, 1, 1, 0, 0, 0, 0),
+        end: utc(2021, 7, 31, 23, 59, 59, 999_999_999),
         starting_cash: dec("100000"),
         costs: CostModel::new(dec("2"), dec("0.0001")).unwrap(),
         bars_dir: dir.to_path_buf(),
@@ -267,11 +267,12 @@ fn error_text<T>(result: Result<T, EvalError>) -> String {
     result.err().expect("an error").to_string()
 }
 
-const RESULT_FIELDS: [&str; 26] = [
+const RESULT_FIELDS: [&str; 28] = [
     "returns",
     "returns_complete",
     "holdout",
     "holdout_start",
+    "holdout_sessions",
     "final_drawdown_mode",
     "orders_blocked",
     "risk_events",
@@ -280,6 +281,7 @@ const RESULT_FIELDS: [&str; 26] = [
     "bars_file",
     "requested_start",
     "requested_end",
+    "data_end",
     "costs",
     "summary_includes_warm_up",
     "summary",
@@ -366,6 +368,11 @@ async fn a_backtest_registers_runs_and_stores_its_result() {
         result["data_snapshot_id"],
         json!(bars_snapshot_id(&read_back))
     );
+
+    // The last bar read back, and an ordinary run has no sessions in the holdout.
+    let last_read = read_back.last().unwrap().ts_event;
+    assert_eq!(result["data_end"], json!(last_read.as_u64()));
+    assert_eq!(result["holdout_sessions"], json!(0));
 
     db.drop_db().await.unwrap();
 }
@@ -657,7 +664,7 @@ async fn an_ordinary_run_that_reaches_the_holdout_is_refused_and_writes_nothing(
     let store = Store::new(db.client().await.unwrap());
     let dir = bars_dir("touched", &market());
     let job = job(dir.path(), strategy_params());
-    set_holdout(&job, "2023-05-01", 10);
+    set_holdout(&job, "2021-05-03", 10);
     let trials_before = trial_count(&client).await;
     let versions_before = version_count(&client).await;
     let holdout_before = trial_registry::holdout_count(&client).await.unwrap();
@@ -667,7 +674,7 @@ async fn an_ordinary_run_that_reaches_the_holdout_is_refused_and_writes_nothing(
         .unwrap_err();
 
     assert!(
-        matches!(err, EvalError::HoldoutTouched(ref m) if m.contains("2023-05-01") && m.contains("2023-06-30")),
+        matches!(err, EvalError::HoldoutTouched(ref m) if m.contains("2021-05-03") && m.contains("2021-07-02")),
         "got {err:?}"
     );
     assert_eq!(trial_count(&client).await, trials_before);
@@ -687,8 +694,8 @@ async fn a_holdout_run_is_counted_and_marked_and_an_ordinary_run_before_it_is_no
     let dir = bars_dir("holdout-marked", &market());
     let full = job(dir.path(), strategy_params());
     let mut early = job(dir.path(), strategy_params());
-    early.end = utc(2023, 4, 28, 23, 59, 59, 999_999_999);
-    set_holdout(&full, "2023-05-01", 10);
+    early.end = utc(2021, 4, 28, 23, 59, 59, 999_999_999);
+    set_holdout(&full, "2021-05-03", 10);
     let trials_before = trial_count(&client).await;
     let holdout_before = trial_registry::holdout_count(&client).await.unwrap();
 
@@ -702,7 +709,12 @@ async fn a_holdout_run_is_counted_and_marked_and_an_ordinary_run_before_it_is_no
         holdout_before + 1
     );
     assert_eq!(outcome.result["holdout"], json!(true));
-    assert_eq!(outcome.result["holdout_start"], json!("2023-05-01"));
+    assert_eq!(outcome.result["holdout_start"], json!("2021-05-03"));
+    // The sessions on or after the boundary, counted from the synthetic closes.
+    let boundary = utc(2021, 5, 3, 0, 0, 0, 0).as_u64();
+    let holdout_sessions = closes().iter().filter(|ts| ts.as_u64() >= boundary).count();
+    assert!(holdout_sessions > 0);
+    assert_eq!(outcome.result["holdout_sessions"], json!(holdout_sessions));
     assert_eq!(
         trial_result::get(&client, outcome.trial_id).await.unwrap(),
         Some(outcome.result.clone())
@@ -713,7 +725,8 @@ async fn a_holdout_run_is_counted_and_marked_and_an_ordinary_run_before_it_is_no
         .unwrap();
 
     assert_eq!(before_holdout.result["holdout"], json!(false));
-    assert_eq!(before_holdout.result["holdout_start"], json!("2023-05-01"));
+    assert_eq!(before_holdout.result["holdout_start"], json!("2021-05-03"));
+    assert_eq!(before_holdout.result["holdout_sessions"], json!(0));
     assert_eq!(
         trial_registry::holdout_count(&client).await.unwrap(),
         holdout_before + 1
@@ -727,7 +740,7 @@ async fn a_holdout_run_whose_data_ends_before_the_holdout_is_an_invalid_job_and_
     let client = db.client().await.unwrap();
     let store = Store::new(db.client().await.unwrap());
     let dir = bars_dir("holdout-short", &market());
-    // The default boundary (2030) is after the data.
+    // The default boundary (2023-01-01) is after the data.
     let job = job(dir.path(), strategy_params());
     let trials_before = trial_count(&client).await;
     let versions_before = version_count(&client).await;
@@ -757,7 +770,7 @@ async fn the_holdout_is_retired_after_its_allowed_looks_and_the_refused_run_writ
     let store = Store::new(db.client().await.unwrap());
     let dir = bars_dir("retired", &market());
     let job = job(dir.path(), strategy_params());
-    set_holdout(&job, "2023-05-01", 2);
+    set_holdout(&job, "2021-05-03", 2);
 
     for _ in 0..2 {
         run_backtest_job(&store, &job, options(true, false, true), now())
@@ -788,7 +801,7 @@ async fn a_holdout_run_that_fails_after_registration_still_counts_as_a_look() {
     let dir = bars_dir("holdout-failing", &zero);
     let mut failing = job(dir.path(), strategy_params());
     failing.symbols = vec!["ZERO".to_owned()];
-    set_holdout(&failing, "2023-05-01", 10);
+    set_holdout(&failing, "2021-05-03", 10);
     let holdout_before = trial_registry::holdout_count(&client).await.unwrap();
 
     let err = run_backtest_job(&store, &failing, options(true, false, true), now())
@@ -817,6 +830,27 @@ async fn a_missing_gates_file_is_an_invalid_gates_error_and_writes_nothing() {
     let versions_before = version_count(&client).await;
 
     let err = run_backtest_job(&store, &missing, options(true, false, false), now())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, EvalError::InvalidGates(_)), "got {err:?}");
+    assert_eq!(trial_count(&client).await, trials_before);
+    assert_eq!(version_count(&client).await, versions_before);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_holdout_boundary_after_2023_is_an_invalid_gates_error_and_writes_nothing() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let store = Store::new(db.client().await.unwrap());
+    let dir = bars_dir("late-holdout", &market());
+    let job = job(dir.path(), strategy_params());
+    set_holdout(&job, "2023-01-02", 10);
+    let trials_before = trial_count(&client).await;
+    let versions_before = version_count(&client).await;
+
+    let err = run_backtest_job(&store, &job, options(true, false, false), now())
         .await
         .unwrap_err();
 

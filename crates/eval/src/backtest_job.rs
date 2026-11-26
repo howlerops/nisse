@@ -291,12 +291,19 @@ pub async fn run_backtest_job(
     let summary = metrics::summarize(&run.equity_curve, built.sessions_per_year)
         .map_or(Value::Null, |summary| summary.to_json());
     let (returns, returns_complete) = returns_json(&run.equity_curve);
+    // Zero for an ordinary run, which is refused when its last bar reaches the boundary.
+    let holdout_sessions = run
+        .equity_curve
+        .iter()
+        .filter(|point| point.0.as_u64() >= boundary.as_u64())
+        .count();
     let result = json!({
         "summary": summary,
         "returns": returns,
         "returns_complete": returns_complete,
         "holdout": options.holdout,
         "holdout_start": gates.holdout_start.to_string(),
+        "holdout_sessions": holdout_sessions,
         "git_sha": GIT_SHA,
         "dirty_build": !options.replayable,
         "data_snapshot_id": data_snapshot_id,
@@ -304,6 +311,7 @@ pub async fn run_backtest_job(
         "symbols": job.symbols,
         "requested_start": job.start.as_u64(),
         "requested_end": job.end.as_u64(),
+        "data_end": last_session.as_u64(),
         "costs": {
             "slippage_bps": job.costs.slippage_bps.to_string(),
             "fee_per_share": job.costs.fee_per_share.to_string(),
