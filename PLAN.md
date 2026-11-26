@@ -75,8 +75,10 @@ Store every decision, not just every fill. Rank strategy versions, not individua
 | `outcome_window` | decision_id, horizon, fwd_ret, bench_ret, mfe, mae |
 | `eval_score` | subject_id, subject_type, metric, value, eval_version |
 | `risk_check` | decision_id, rule, limit_value, actual_value, passed |
+| `risk_event` | kind [equity_peak \| drawdown_mode \| kill_switch \| limits_loaded], detail, event_ts |
+| `heartbeat` | source, event_ts |
 
-Every table also has `id` and `ingest_ts`. `order_event.client_order_id` is written with the intent row before submission, when `broker_order_id` is still unknown; fills refer to their order by `client_order_id`. Column types and constraints are in [`docs/phases/phase-0.md`](docs/phases/phase-0.md). A trial is registered in `trial_registry` before its run starts, so a run that crashes still counts; its outcome is a later row in `trial_result` (added in Phase 3, because rows are never updated).
+Every table also has `id` and `ingest_ts`. `order_event.client_order_id` is written with the intent row before submission, when `broker_order_id` is still unknown; fills refer to their order by `client_order_id`. Column types and constraints are in [`docs/phases/phase-0.md`](docs/phases/phase-0.md). A trial is registered in `trial_registry` before its run starts, so a run that crashes still counts; its outcome is a later row in `trial_result` (added in Phase 3, because rows are never updated). The risk state (equity peak, drawdown mode, kill switch) is the fold of `risk_event` rows in id order; every order's eight gate checks are `risk_check` rows written before the order is sent (Phase 4, [`docs/phases/phase-4.md`](docs/phases/phase-4.md)).
 
 **Nightly replay test:** rerunning a decision from its features, config hash and seed on the recorded git SHA must reproduce the same action. A strategy's decision is a pure function of its features (which include the current position), its parameters and the seed; `scripts/replay.sh` replays every decision made by the build at HEAD and writes a `replay_match` score per decision. Timestamps are stored to the microsecond.
 
@@ -150,7 +152,7 @@ Promote on statistical evidence across the whole trial history, never on paper o
 - PRs contain schema-validated configs and notes.
 - Risk gate, adapter and limits are sensitive paths. No CODEOWNERS or branch protection for now; reviewers are the owner and Claude (see CLAUDE.md).
 - CI runs schema checks, backtest and gates, then signs the artifact; the engine verifies the signature before loading.
-- Risk limits live outside the agent-writable repo.
+- Risk limits live outside the agent-writable repo in production; `config/limits/limits.json` is the reviewed default, and the code refuses a file looser than its fixed ceilings.
 - A human merges every PR.
 
 ## Risk controls and capital ramp
@@ -159,8 +161,8 @@ Promote on statistical evidence across the whole trial history, never on paper o
 
 - Portfolio vol target 8 to 10% annualized.
 - At most quarter-Kelly on the haircut Sharpe.
-- At most 0.5% of equity at risk per trade.
-- Halve exposure at 10% drawdown; flat at 15 to 20%; re-enter only through the gates.
+- At most 0.5% of equity at risk per trade, where "at risk" is the order's value times two daily standard deviations of the asset (the strategy has no stop price).
+- Halve exposure at 10% drawdown (back to normal below 5%); flat at 15%, latched until a person resets it; re-enter only through the gates.
 - Stale-data watchdog halts new entries.
 - Kill switch fails closed (cancel all, flatten optional) and is reachable from the phone UI.
 - An out-of-band way to disable trading at Alpaca.

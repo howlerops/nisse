@@ -261,6 +261,11 @@ pub async fn run_backtest_job(
         // The summary covers every session, including the flat warm-up before the first
         // trade, so its volatility and return understate the invested period.
         "summary_includes_warm_up": true,
+        // What the risk gate did: a run that ends `flat` stopped trading after a drawdown
+        // and never re-entered, which the summary alone would not show.
+        "final_drawdown_mode": run.final_mode.as_str(),
+        "orders_blocked": run.orders_blocked,
+        "risk_events": run.risk_events.len(),
         "sessions": run.equity_curve.len(),
         "decisions": run.decisions.len(),
         "fills": run.fills.len(),

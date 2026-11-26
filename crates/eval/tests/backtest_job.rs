@@ -239,7 +239,10 @@ fn error_text<T>(result: Result<T, EvalError>) -> String {
     result.err().expect("an error").to_string()
 }
 
-const RESULT_FIELDS: [&str; 19] = [
+const RESULT_FIELDS: [&str; 22] = [
+    "final_drawdown_mode",
+    "orders_blocked",
+    "risk_events",
     "limits_hash",
     "limits",
     "bars_file",
@@ -314,6 +317,9 @@ async fn a_backtest_registers_runs_and_stores_its_result() {
         })
     );
     assert_eq!(result["summary_includes_warm_up"], json!(true));
+    assert_eq!(result["final_drawdown_mode"], json!("normal"));
+    assert_eq!(result["orders_blocked"], json!(0));
+    assert!(result["risk_events"].as_u64().unwrap() >= 1);
     assert!(result["bars_file"].as_str().unwrap().ends_with(".parquet"));
     let limits = Limits::load(&job.limits_path).unwrap();
     assert_eq!(result["limits_hash"], json!(limits.hash().to_string()));
