@@ -15,6 +15,7 @@
 )]
 
 mod error;
+pub mod ingest;
 mod reader;
 mod writer;
 
