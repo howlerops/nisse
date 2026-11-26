@@ -193,6 +193,12 @@ fn limits() -> nisse_risk::Limits {
     .unwrap()
 }
 
+/// A clock just after the first week of test bars, for tests that feed bars without `feed`.
+fn after_the_bars() -> ManualClock {
+    ManualClock::new(UnixNanos::from(9 * 86_400_000_000_000_u64))
+}
+
+/// The clock starts before the first bar; `feed` moves it to each session's close.
 fn clock() -> ManualClock {
     ManualClock::new(UnixNanos::from(1_000_u64))
 }
@@ -232,8 +238,33 @@ fn engine<'a>(store: &'a MemoryStore, symbols: &[&str]) -> Engine<'a> {
     engine_with(store, clock(), symbols, 100_000)
 }
 
+/// A test clock that can be moved through a shared reference.
+trait SetClock {
+    fn set_to(&self, now: UnixNanos);
+}
+
+impl SetClock for ManualClock {
+    fn set_to(&self, now: UnixNanos) {
+        self.set(now);
+    }
+}
+
+impl SetClock for &ManualClock {
+    fn set_to(&self, now: UnixNanos) {
+        self.set(now);
+    }
+}
+
 /// What the backtest loop does for one session: fills, then the updates, then the bars.
-async fn feed<C: Clock>(trader: &mut Engine<'_, C>, session: &[Bar]) {
+///
+/// The clock moves to the session's close first, as it does in a backtest and in life: a bar
+/// stamped after the clock has no known age, and the gate would block buys as stale.
+async fn feed<C: Clock + SetClock>(trader: &mut Engine<'_, C>, session: &[Bar]) {
+    if let Some(bar) = session.first()
+        && bar.ts_event > trader.clock().now()
+    {
+        trader.clock().set_to(bar.ts_event);
+    }
     trader.broker().on_session(session).unwrap();
     let updates = trader.broker().drain_updates();
     for update in &updates {
@@ -578,7 +609,7 @@ async fn rejected_order_is_counted_and_the_rest_go_out() {
         OrderGateway::new(broker.clone(), &store),
         &store,
         &store,
-        clock(),
+        after_the_bars(),
         config(vec![sym(AAA), sym(BBB)]),
         OrderBookState::default(),
     )
@@ -860,7 +891,7 @@ fn gated_trader<'a>(
         OrderGateway::new(broker, store),
         store,
         sink,
-        clock(),
+        after_the_bars(),
         config(sorted),
         state,
     )

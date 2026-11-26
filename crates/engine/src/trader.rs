@@ -690,6 +690,12 @@ where
         }
     }
 
+    /// The clock the trader reads.
+    #[must_use]
+    pub const fn clock(&self) -> &C {
+        &self.clock
+    }
+
     /// The risk gate, read-only.
     #[must_use]
     pub const fn risk(&self) -> &RiskGate {
