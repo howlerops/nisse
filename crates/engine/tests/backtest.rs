@@ -802,3 +802,114 @@ async fn a_bar_outside_the_calendar_is_an_invalid_bar() {
         Err(EngineError::InvalidBar("bar outside the calendar"))
     ));
 }
+
+// ---- regression: the loop keeps exiting while flat -----------------------------------------
+
+/// AAA and BBB both rise 1% a session and are both entered at the first month end, each at a cap
+/// of 0.45 of equity: a gross of 0.9 × equity, under the 1.11 × equity limit. The cap is below
+/// 0.5 so the two buys leave cash for the next open: at 0.5 each they take all the cash, and the
+/// open of the second is a little above its close, so that buy would wait unfilled.
+///
+/// On the crash session AAA falls 35%. Half of the equity is AAA at the peak, so the equity falls
+/// by about 0.45 × 35% = 15.75% from its peak, past the flat threshold (15%). BBB has no bar that
+/// session, so at that step-down rebalance it has no close to decide from: it is `Skip`, and it
+/// stays held. The next session (not a month end) must rebalance anyway, because the account is
+/// flat with a position. This test fails if `|| trader.needs_flatten()` is removed from the
+/// backtest loop: that session would then have no decisions, BBB would stay held until the next
+/// month end, and the `decision(&next, "BBB")` assertion would fail.
+#[tokio::test]
+async fn a_flat_backtest_keeps_exiting_a_symbol_it_could_not_decide_for() {
+    let closes = closes();
+    let calendar = calendar_for(&closes);
+    let rise: Vec<Decimal> = vec![dec("0.01"); closes.len()];
+    let mut aaa_changes = rise.clone();
+    aaa_changes[CRASH] = dec("-0.35");
+    let aaa = shaped("AAA", &closes, dec("100"), &aaa_changes);
+    let mut bbb = shaped("BBB", &closes, dec("50"), &rise);
+    bbb.retain(|bar| bar.ts_event != closes[CRASH]);
+    let bars = merge(vec![aaa, bbb]);
+
+    let strat = TrendVolTarget::new(TrendParams {
+        max_weight: dec("0.45"),
+        ..params()
+    })
+    .unwrap();
+    let config = BacktestConfig {
+        window: strat.window_spec(),
+        ..config(free())
+    };
+    let run = run_backtest(strat, &bars, &calendar, config).await.unwrap();
+
+    // Both are bought at the first month end, and the gate lets both through.
+    let entered = decisions_at(&run, closes[FIRST_MONTH_END]);
+    assert_eq!(entered.len(), 2);
+    assert!(entered.iter().all(|d| d.action == Action::Enter));
+    assert_eq!(run.orders_blocked, 0);
+
+    // The crash session: the account goes flat; AAA is exited and BBB cannot be decided for.
+    assert_eq!(moves_to(&run, "flat").len(), 1);
+    assert_eq!(moves_to(&run, "flat")[0].ts, closes[CRASH]);
+    let at_crash = decisions_at(&run, closes[CRASH]);
+    assert_eq!(at_crash.len(), 2);
+    let decision = |list: &[&Decision], symbol: &str| -> Action {
+        list.iter()
+            .find(|d| d.symbol == sym(symbol))
+            .unwrap()
+            .action
+    };
+    assert_eq!(decision(&at_crash, "AAA"), Action::Exit);
+    assert_eq!(decision(&at_crash, "BBB"), Action::Skip);
+
+    // The next session is not a month end, and it still rebalances: BBB gets an exit decision.
+    assert_eq!(month_of(closes[CRASH]), month_of(closes[CRASH + 1]));
+    let next = decisions_at(&run, closes[CRASH + 1]);
+    assert_eq!(next.len(), 2);
+    assert_eq!(decision(&next, "BBB"), Action::Exit);
+
+    // Each sale fills at the open of the session after its decision: AAA at CRASH + 1, BBB at
+    // CRASH + 2.
+    let sold_at = |symbol: &str, ts: UnixNanos| -> Vec<&Fill> {
+        run.fills
+            .iter()
+            .filter(|f| f.ts == ts && decision_for(&run, f).symbol == sym(symbol))
+            .collect()
+    };
+    assert_eq!(sold_at("AAA", closes[CRASH + 1]).len(), 1);
+    let bbb_sales = sold_at("BBB", closes[CRASH + 2]);
+    assert_eq!(bbb_sales.len(), 1);
+    assert!(signed_qty(&run, bbb_sales[0]) < Decimal::ZERO);
+
+    // At the end nothing is held, and the account stays flat.
+    let held_at_end = |symbol: &str| -> Decimal {
+        run.fills
+            .iter()
+            .filter(|f| decision_for(&run, f).symbol == sym(symbol))
+            .map(|f| signed_qty(&run, f))
+            .sum()
+    };
+    assert_eq!(held_at_end("AAA"), Decimal::ZERO);
+    assert_eq!(held_at_end("BBB"), Decimal::ZERO);
+    assert_eq!(run.final_mode, DrawdownMode::Flat);
+
+    // Once everything is sold, decisions happen only at month ends again.
+    let sold_out = closes[CRASH + 2];
+    let month_ends: BTreeSet<u64> = closes
+        .iter()
+        .filter(|ts| **ts > sold_out)
+        .filter(|ts| {
+            calendar
+                .session_at(UnixNanos::from(ts.as_u64() - 1))
+                .and_then(|session| calendar.is_last_session_of_month(session.date))
+                == Some(true)
+        })
+        .map(|ts| ts.as_u64())
+        .collect();
+    let decided: BTreeSet<u64> = run
+        .decisions
+        .iter()
+        .filter(|decision| decision.ts > sold_out)
+        .map(|decision| decision.ts.as_u64())
+        .collect();
+    assert!(!month_ends.is_empty());
+    assert_eq!(decided, month_ends);
+}
