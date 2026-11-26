@@ -33,6 +33,11 @@ pub struct TrackedOrder {
     pub cum_filled_qty: Quantity,
     pub avg_fill_px: Option<Price>,
     pub last_update_ts: UnixNanos,
+    /// Set while the order is *presumed* never to have reached the broker (a lookup by client
+    /// order id found nothing). The state is `Rejected`, but the verdict is provisional: any
+    /// broker message about the order overturns it, and reconciliation keeps looking the
+    /// order up until the caller's recheck window has passed.
+    pub never_arrived_at: Option<UnixNanos>,
 }
 
 /// The effect of one broker update on a tracked order.
@@ -71,6 +76,7 @@ impl OrderTracker {
                     cum_filled_qty: Quantity::zero(intent.qty.precision),
                     avg_fill_px: None,
                     last_update_ts: intent.ts,
+                    never_arrived_at: None,
                 });
                 Ok(())
             }
@@ -132,8 +138,28 @@ impl OrderTracker {
             .checked_sub(tracked.cum_filled_qty.as_decimal())
             .ok_or_else(|| inconsistent(client_order_id, "cumulative fill quantity overflows"))?;
 
-        // Rule 1: an older message. Nothing changes.
+        // Any broker message about an order presumed never-arrived proves the broker has it,
+        // so it is treated like a snapshot and overturns the verdict.
+        let unconfirmed = tracked.never_arrived_at.is_some();
+        // A snapshot stamped before our latest broker-sourced update is a lagging read (for
+        // example an open-orders list that has not caught up with a cancel the stream already
+        // delivered). Local timestamps (an intent, a never-arrived verdict) do not count.
+        let lagging = authoritative
+            && !unconfirmed
+            && tracked.venue_order_id.is_some()
+            && ts < tracked.last_update_ts;
+        let authoritative = (authoritative && !lagging) || unconfirmed;
+
+        // Rule 1: the broker reports less filled than we hold. From the stream or a lagging
+        // read that is just an old message. From a current snapshot it is a contradiction the
+        // tracker cannot resolve (a busted trade, or a bad restore): report it.
         if delta < Decimal::ZERO {
+            if authoritative {
+                return Err(inconsistent(
+                    client_order_id,
+                    "broker cumulative fill is lower than recorded",
+                ));
+            }
             return Ok(Applied::default());
         }
 
@@ -141,13 +167,14 @@ impl OrderTracker {
         // state is behind ours (it is late); a snapshot is the broker's current word and wins.
         if delta.is_zero() {
             let stale = tracked.state.is_terminal() || order.state.rank() < tracked.state.rank();
-            if stale && !authoritative {
+            if (stale && !authoritative) || lagging {
                 return Ok(Applied::default());
             }
             let before = tracked.state;
             tracked.state = order.state;
             tracked.venue_order_id = Some(order.venue_order_id);
             tracked.last_update_ts = ts;
+            tracked.never_arrived_at = None;
             return Ok(Applied {
                 state_change: state_change(before, order.state),
                 fill: None,
@@ -183,18 +210,54 @@ impl OrderTracker {
         tracked.venue_order_id = Some(order.venue_order_id);
         tracked.last_update_ts = ts;
         tracked.state = order.state;
+        tracked.never_arrived_at = None;
         Ok(Applied {
             state_change: state_change(before, order.state),
             fill: Some(emitted),
         })
     }
 
-    /// Marks a tracked order as `Rejected` because the broker has no record of it (the submit
-    /// never arrived). No-op with `state_change: None` if the order is already terminal.
+    /// Marks a tracked order `Rejected` for a definite reason: the broker refused it, or it
+    /// was never sent because the intent could not be recorded. No-op with
+    /// `state_change: None` if the order is already terminal.
+    pub fn mark_rejected(
+        &mut self,
+        client_order_id: ClientOrderId,
+        ts: UnixNanos,
+    ) -> Result<Applied, EngineError> {
+        self.reject(client_order_id, ts, false)
+    }
+
+    /// Marks a tracked order `Rejected` because the broker has no record of it, so the submit
+    /// is presumed never to have arrived. The verdict is provisional (see
+    /// [`TrackedOrder::never_arrived_at`]). No-op if the order is already terminal.
     pub fn mark_never_arrived(
         &mut self,
         client_order_id: ClientOrderId,
         ts: UnixNanos,
+    ) -> Result<Applied, EngineError> {
+        self.reject(client_order_id, ts, true)
+    }
+
+    /// Makes a never-arrived verdict final: the order is no longer looked up. No-op if the
+    /// order carries no such verdict.
+    pub fn settle_never_arrived(
+        &mut self,
+        client_order_id: ClientOrderId,
+    ) -> Result<(), EngineError> {
+        let tracked = self
+            .orders
+            .get_mut(&client_order_id)
+            .ok_or_else(|| EngineError::UnknownOrder(client_order_id))?;
+        tracked.never_arrived_at = None;
+        Ok(())
+    }
+
+    fn reject(
+        &mut self,
+        client_order_id: ClientOrderId,
+        ts: UnixNanos,
+        provisional: bool,
     ) -> Result<Applied, EngineError> {
         let tracked = self
             .orders
@@ -206,6 +269,7 @@ impl OrderTracker {
         let before = tracked.state;
         tracked.state = OrderState::Rejected;
         tracked.last_update_ts = ts;
+        tracked.never_arrived_at = provisional.then_some(ts);
         Ok(Applied {
             state_change: state_change(before, OrderState::Rejected),
             fill: None,
@@ -220,6 +284,14 @@ impl OrderTracker {
     /// Orders that are not in a terminal state, in client order id order.
     pub fn open_orders(&self) -> impl Iterator<Item = &TrackedOrder> {
         self.orders.values().filter(|o| !o.state.is_terminal())
+    }
+
+    /// Orders that reconciliation must still look up at the broker: the open ones, plus those
+    /// with a provisional never-arrived verdict. In client order id order.
+    pub fn unresolved_orders(&self) -> impl Iterator<Item = &TrackedOrder> {
+        self.orders
+            .values()
+            .filter(|o| !o.state.is_terminal() || o.never_arrived_at.is_some())
     }
 }
 

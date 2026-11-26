@@ -2,6 +2,7 @@
 
 #![allow(
     clippy::expect_used,
+    clippy::unwrap_used,
     reason = "builders parse literals; a malformed literal is a bug in the test"
 )]
 
@@ -15,7 +16,8 @@ use nisse_core::{
     nautilus::{ClientOrderId, PositionSide, Price, Quantity, Symbol},
 };
 use nisse_engine::{
-    EngineError, Finding, OrderTracker, SyncReport, TrackedOrder, sync_with_broker,
+    EngineError, Finding, OrderTracker, StateChange, SyncOptions, SyncReport, TrackedOrder,
+    sync_with_broker,
 };
 use rust_decimal::Decimal;
 use support::{Call, FakeBroker, accepted_from, calls, intent, new_call_log, snapshot};
@@ -30,6 +32,14 @@ fn dec(s: &str) -> Decimal {
 
 fn symbol(s: &str) -> Symbol {
     Symbol::new(s)
+}
+
+/// Sync options with the given grace and a recheck window far longer than any test.
+fn opts(never_arrived_grace_nanos: u64) -> SyncOptions {
+    SyncOptions {
+        never_arrived_grace_nanos,
+        never_arrived_recheck_nanos: 1_000_000_000_000,
+    }
 }
 
 fn now() -> nisse_core::nautilus::UnixNanos {
@@ -80,7 +90,7 @@ async fn clean_state_reports_nothing_and_looks_up_no_orders() {
         .set_positions(vec![position("SPY", PositionSide::Long, "5")]);
     let mut positions = local(&[("SPY", "5")]);
 
-    let report = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), 0)
+    let report = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), opts(0))
         .await
         .unwrap();
 
@@ -88,7 +98,7 @@ async fn clean_state_reports_nothing_and_looks_up_no_orders() {
     assert_eq!(calls(&f.log), vec![Call::OpenOrders, Call::Positions]);
     assert_eq!(positions, local(&[("SPY", "5")]));
 
-    let again = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), 0)
+    let again = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), opts(0))
         .await
         .unwrap();
     assert_eq!(again, SyncReport::default());
@@ -104,7 +114,7 @@ async fn restart_mid_order_applies_drift_and_reports_the_fill() {
     f.broker.set_open_orders(vec![partial]);
     let mut positions = BTreeMap::new();
 
-    let report = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), 0)
+    let report = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), opts(0))
         .await
         .unwrap();
 
@@ -123,7 +133,7 @@ async fn restart_mid_order_applies_drift_and_reports_the_fill() {
     );
     assert!(positions.is_empty());
 
-    let again = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), 0)
+    let again = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), opts(0))
         .await
         .unwrap();
     assert!(again.fills.is_empty());
@@ -141,7 +151,7 @@ async fn filled_while_disconnected_is_found_by_id_and_reported() {
     f.broker.insert_order(filled);
     let mut positions = BTreeMap::new();
 
-    let report = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), 0)
+    let report = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), opts(0))
         .await
         .unwrap();
 
@@ -167,7 +177,7 @@ async fn filled_while_disconnected_is_found_by_id_and_reported() {
         ]
     );
 
-    let again = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), 0)
+    let again = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), opts(0))
         .await
         .unwrap();
     assert!(again.fills.is_empty());
@@ -186,7 +196,7 @@ async fn stale_open_list_applies_non_terminal_lookup_as_a_snapshot() {
     f.broker.insert_order(partial);
     let mut positions = BTreeMap::new();
 
-    let report = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), 0)
+    let report = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), opts(0))
         .await
         .unwrap();
 
@@ -214,7 +224,7 @@ async fn stale_open_list_with_unchanged_lookup_changes_nothing() {
     f.broker.insert_order(accepted_from(&i));
     let mut positions = BTreeMap::new();
 
-    let report = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), 0)
+    let report = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), opts(0))
         .await
         .unwrap();
 
@@ -238,7 +248,7 @@ async fn submit_that_never_arrived_is_rejected_at_now() {
     tracker.track_intent(i).unwrap();
     let mut positions = BTreeMap::new();
 
-    let report = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), 0)
+    let report = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), opts(0))
         .await
         .unwrap();
 
@@ -252,12 +262,44 @@ async fn submit_that_never_arrived_is_rejected_at_now() {
     let order = tracked(&tracker, "nisse-1-0").unwrap();
     assert_eq!(order.state, OrderState::Rejected);
     assert_eq!(order.last_update_ts, now());
+    assert_eq!(
+        order.never_arrived_at,
+        Some(now()),
+        "the verdict is provisional"
+    );
+    assert_eq!(
+        report.state_changes,
+        vec![StateChange {
+            client_order_id: cid("nisse-1-0"),
+            before: OrderState::Intent,
+            after: OrderState::Rejected,
+        }]
+    );
 
-    let again = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), 0)
+    // While the verdict is provisional the order is looked up again on every pass, but
+    // nothing changes.
+    let again = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), opts(0))
         .await
         .unwrap();
-    assert!(again.fills.is_empty());
-    assert!(again.findings.is_empty());
+    assert_eq!(again.findings, report.findings);
+    assert!(again.fills.is_empty() && again.state_changes.is_empty());
+
+    // Once the recheck window has passed, the verdict is final and the lookups stop.
+    let settle = SyncOptions {
+        never_arrived_grace_nanos: 0,
+        never_arrived_recheck_nanos: 0,
+    };
+    sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), settle)
+        .await
+        .unwrap();
+    assert_eq!(
+        tracked(&tracker, "nisse-1-0").unwrap().never_arrived_at,
+        None
+    );
+    let quiet = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), settle)
+        .await
+        .unwrap();
+    assert_eq!(quiet, SyncReport::default());
 }
 
 #[tokio::test]
@@ -269,7 +311,7 @@ async fn unknown_broker_order_is_reported_and_untouched() {
     let mut tracker = OrderTracker::new();
     let mut positions = BTreeMap::new();
 
-    let report = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), 0)
+    let report = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), opts(0))
         .await
         .unwrap();
 
@@ -286,7 +328,7 @@ async fn unknown_broker_order_is_reported_and_untouched() {
     assert_eq!(calls(&f.log), vec![Call::OpenOrders, Call::Positions]);
 
     // Still reported on every pass, because nothing is changed automatically.
-    let again = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), 0)
+    let again = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), opts(0))
         .await
         .unwrap();
     assert_eq!(
@@ -307,7 +349,7 @@ async fn positions_are_overwritten_and_flat_symbols_are_removed() {
     let mut tracker = OrderTracker::new();
     let mut positions = local(&[("SPY", "5"), ("QQQ", "3")]);
 
-    let report = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), 0)
+    let report = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), opts(0))
         .await
         .unwrap();
 
@@ -334,7 +376,7 @@ async fn positions_are_overwritten_and_flat_symbols_are_removed() {
     assert!(report.fills.is_empty());
     assert_eq!(positions, local(&[("SPY", "7"), ("TLT", "-2")]));
 
-    let again = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), 0)
+    let again = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), opts(0))
         .await
         .unwrap();
     assert!(again.fills.is_empty());
@@ -352,7 +394,7 @@ async fn broker_error_aborts_and_leaves_state_unchanged() {
     let mut positions = local(&[("SPY", "5")]);
     f.broker.fail_reads("down");
 
-    let result = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), 0).await;
+    let result = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), opts(0)).await;
 
     match result {
         Err(EngineError::Broker(_)) => {}
@@ -364,45 +406,149 @@ async fn broker_error_aborts_and_leaves_state_unchanged() {
 
 // Regression tests for the Phase 1 independent review.
 
+/// A tracker holding one order that a sync has (wrongly) judged never-arrived.
+async fn judged_never_arrived(f: &Fixture, id: &str) -> (OrderTracker, nisse_core::OrderIntent) {
+    let i = intent(id, "10", Some("500.10"));
+    let mut tracker = OrderTracker::new();
+    tracker.track_intent(i).unwrap();
+    let mut positions = BTreeMap::new();
+    sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), opts(0))
+        .await
+        .unwrap();
+    assert_eq!(tracked(&tracker, id).unwrap().state, OrderState::Rejected);
+    (tracker, i)
+}
+
 #[tokio::test]
-async fn never_arrived_verdict_is_reversed_when_the_order_turns_out_to_be_live() {
-    // Submit outcome unknown; the first sync runs before the broker has registered the order.
+async fn never_arrived_verdict_is_reversed_by_the_next_sync_when_the_order_is_live() {
+    // Submit outcome unknown; the first sync ran before the broker had registered the order.
+    let f = fixture();
+    let (mut tracker, i) = judged_never_arrived(&f, "nisse-1-0").await;
+    let live = accepted_from(&i);
+    f.broker.set_open_orders(vec![live]);
+    let mut positions = BTreeMap::new();
+
+    let report = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), opts(0))
+        .await
+        .unwrap();
+    assert_eq!(report.findings, vec![Finding::OrderDrift { order: live }]);
+    assert_eq!(
+        report.state_changes,
+        vec![StateChange {
+            client_order_id: cid("nisse-1-0"),
+            before: OrderState::Rejected,
+            after: OrderState::Accepted,
+        }],
+        "the backward transition is reported so it can be recorded"
+    );
+    let after = tracked(&tracker, "nisse-1-0").unwrap();
+    assert_eq!(after.state, OrderState::Accepted);
+    assert_eq!(after.venue_order_id, Some(live.venue_order_id));
+    assert_eq!(after.never_arrived_at, None);
+    assert_eq!(tracker.open_orders().count(), 1);
+
+    let again = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), opts(0))
+        .await
+        .unwrap();
+    assert_eq!(again, SyncReport::default(), "and the views now agree");
+}
+
+#[tokio::test]
+async fn never_arrived_verdict_is_reversed_by_a_stream_message() {
+    // Any broker message about the order proves the broker has it.
+    let f = fixture();
+    let (mut tracker, i) = judged_never_arrived(&f, "nisse-1-0").await;
+    let live = accepted_from(&i);
+    let applied = tracker.apply(&live, None, live.ts).unwrap();
+    assert_eq!(
+        applied.state_change,
+        Some((OrderState::Rejected, OrderState::Accepted))
+    );
+    assert_eq!(
+        tracked(&tracker, "nisse-1-0").unwrap().never_arrived_at,
+        None
+    );
+}
+
+#[tokio::test]
+async fn an_order_judged_never_arrived_that_then_fills_unseen_is_still_found() {
+    // The order was live after all and filled completely while nobody was listening: it is
+    // never in the open-orders list, so only the continued lookup by id can find it.
+    let f = fixture();
+    let (mut tracker, i) = judged_never_arrived(&f, "nisse-1-0").await;
+    f.broker
+        .insert_order(snapshot(&i, OrderState::Filled, "10", Some("500.05")));
+    let mut positions = BTreeMap::new();
+
+    let report = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), opts(0))
+        .await
+        .unwrap();
+    assert_eq!(report.fills.len(), 1, "the fill is not lost");
+    assert_eq!(report.fills[0].qty.as_decimal(), dec("10"));
+    assert_eq!(report.fills[0].px.as_decimal(), dec("500.05"));
+    assert_eq!(
+        tracked(&tracker, "nisse-1-0").unwrap().state,
+        OrderState::Filled
+    );
+}
+
+#[tokio::test]
+async fn a_lagging_open_orders_list_does_not_reopen_a_cancelled_order() {
     let f = fixture();
     let i = intent("nisse-1-0", "10", Some("500.10"));
     let mut tracker = OrderTracker::new();
     tracker.track_intent(i).unwrap();
-    let mut positions = BTreeMap::new();
+    let accepted = accepted_from(&i);
+    tracker.apply_snapshot(&accepted).unwrap();
+    // The stream delivers the cancel, stamped later than the accept.
+    let mut canceled = snapshot(&i, OrderState::Canceled, "0", None);
+    canceled.ts = nisse_core::nautilus::UnixNanos::from(accepted.ts.as_u64() + 10);
+    tracker.apply(&canceled, None, canceled.ts).unwrap();
 
-    sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), 0)
+    // The broker's REST list has not caught up: it still shows the older, accepted order.
+    f.broker.set_open_orders(vec![accepted]);
+    let mut positions = BTreeMap::new();
+    let report = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), opts(0))
         .await
         .unwrap();
+    assert!(report.state_changes.is_empty() && report.problems.is_empty());
     assert_eq!(
         tracked(&tracker, "nisse-1-0").unwrap().state,
-        OrderState::Rejected
+        OrderState::Canceled
     );
+}
 
-    // The order is in fact live. A late stream message alone must not be trusted to reopen a
-    // terminal order, but the next sync (the broker's current word) must.
-    let live = accepted_from(&i);
-    tracker.apply(&live, None, live.ts).unwrap();
-    f.broker.set_open_orders(vec![live]);
-    let report = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), 0)
+#[tokio::test]
+async fn a_current_snapshot_with_less_filled_than_recorded_is_a_reported_problem() {
+    let f = fixture();
+    let i = intent("nisse-1-0", "10", Some("500.10"));
+    let mut tracker = OrderTracker::new();
+    tracker.track_intent(i).unwrap();
+    tracker
+        .apply_snapshot(&snapshot(&i, OrderState::PartiallyFilled, "5", Some("10")))
+        .unwrap();
+
+    // Same timestamp or later, lower cumulative fill: a contradiction, not an old message.
+    f.broker.set_open_orders(vec![snapshot(
+        &i,
+        OrderState::PartiallyFilled,
+        "3",
+        Some("10"),
+    )]);
+    let mut positions = BTreeMap::new();
+    let report = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), opts(0))
         .await
         .unwrap();
-    assert_eq!(report.findings, vec![Finding::OrderDrift { order: live }]);
-    let after = tracked(&tracker, "nisse-1-0").unwrap();
-    assert_eq!(after.state, OrderState::Accepted);
-    assert_eq!(after.venue_order_id, Some(live.venue_order_id));
+    assert_eq!(report.problems.len(), 1);
+    assert!(report.problems[0].reason.contains("lower than recorded"));
     assert_eq!(
-        tracker.open_orders().count(),
-        1,
-        "the live order is tracked as open again"
+        tracked(&tracker, "nisse-1-0")
+            .unwrap()
+            .cum_filled_qty
+            .as_decimal(),
+        dec("5"),
+        "the recorded figure is kept"
     );
-
-    let again = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), 0)
-        .await
-        .unwrap();
-    assert_eq!(again, SyncReport::default(), "and the views now agree");
 }
 
 #[tokio::test]
@@ -415,16 +561,22 @@ async fn a_young_intent_is_not_declared_never_arrived() {
     let age = now().as_u64() - i.ts.as_u64();
 
     // Grace longer than the intent's age: the "not found" is not believed yet.
-    sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), age + 1)
-        .await
-        .unwrap();
+    sync_with_broker(
+        &f.broker,
+        &mut tracker,
+        &mut positions,
+        now(),
+        opts(age + 1),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         tracked(&tracker, "nisse-1-0").unwrap().state,
         OrderState::Intent
     );
 
     // Once the intent is old enough, it is.
-    sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), age)
+    sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), opts(age))
         .await
         .unwrap();
     assert_eq!(
@@ -446,14 +598,14 @@ async fn rejected_cancel_returns_pending_cancel_to_accepted() {
     let live = snapshot(&i, OrderState::Accepted, "0", None);
     f.broker.set_open_orders(vec![live]);
     let mut positions = BTreeMap::new();
-    sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), 0)
+    sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), opts(0))
         .await
         .unwrap();
     assert_eq!(
         tracked(&tracker, "nisse-1-0").unwrap().state,
         OrderState::Accepted
     );
-    let again = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), 0)
+    let again = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), opts(0))
         .await
         .unwrap();
     assert_eq!(again, SyncReport::default(), "sync converges");
@@ -476,7 +628,7 @@ async fn one_unappliable_order_does_not_stop_the_pass() {
         .set_positions(vec![position("SPY", PositionSide::Long, "3")]);
     let mut positions = BTreeMap::new();
 
-    let report = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), 0)
+    let report = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), opts(0))
         .await
         .unwrap();
     assert_eq!(report.problems.len(), 1);
@@ -500,7 +652,7 @@ async fn foreign_open_orders_are_counted_in_the_report() {
     f.broker.set_unrepresentable(2);
     let mut tracker = OrderTracker::new();
     let mut positions = BTreeMap::new();
-    let report = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), 0)
+    let report = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), opts(0))
         .await
         .unwrap();
     assert_eq!(report.unrepresentable_at_broker, 2);
@@ -521,6 +673,7 @@ async fn restored_order_does_not_re_emit_fills_recorded_before_the_crash() {
             cum_filled_qty: before_crash.cum_filled_qty,
             avg_fill_px: before_crash.avg_fill_px,
             last_update_ts: before_crash.ts,
+            never_arrived_at: None,
         })
         .unwrap();
     assert!(matches!(
@@ -536,7 +689,7 @@ async fn restored_order_does_not_re_emit_fills_recorded_before_the_crash() {
         Some("10"),
     )]);
     let mut positions = BTreeMap::new();
-    let report = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), 0)
+    let report = sync_with_broker(&f.broker, &mut tracker, &mut positions, now(), opts(0))
         .await
         .unwrap();
     assert_eq!(report.fills.len(), 1);

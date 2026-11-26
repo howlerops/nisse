@@ -554,10 +554,40 @@ async fn replace_with_a_different_symbol_or_side_is_refused_before_anything_is_r
         .await
         .unwrap_err();
     assert!(matches!(err, EngineError::ReplaceMismatch { .. }));
+    assert!(tracker.get(cid("nisse-1-1")).is_none());
+
+    // Each of these would describe an order the broker does not have, because a replace only
+    // sends quantity and limit price.
+    let mut other_symbol = intent("nisse-1-2", "10", Some("499.90"));
+    other_symbol.symbol = nisse_core::nautilus::Symbol::new("QQQ");
+    let as_market = intent("nisse-1-3", "10", None);
+    let mut other_tif = intent("nisse-1-4", "10", Some("499.90"));
+    other_tif.time_in_force = nisse_core::nautilus::TimeInForce::Gtc;
+    for bad in [other_symbol, as_market, other_tif] {
+        let err = f
+            .gateway
+            .replace(&mut tracker, cid("nisse-1-0"), &bad)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::ReplaceMismatch { .. }));
+        assert!(tracker.get(bad.client_order_id).is_none());
+    }
     assert_eq!(
         calls(&f.log).len(),
         recorded_before,
         "nothing recorded or sent"
     );
-    assert!(tracker.get(cid("nisse-1-1")).is_none());
+
+    // A dead original cannot be replaced either.
+    let original_order = *tracker.get(cid("nisse-1-0")).unwrap();
+    let canceled = snapshot(&original_order.intent, OrderState::Canceled, "0", None);
+    tracker.apply_snapshot(&canceled).unwrap();
+    let valid = intent("nisse-1-5", "8", Some("499.90"));
+    let err = f
+        .gateway
+        .replace(&mut tracker, cid("nisse-1-0"), &valid)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::ReplaceMismatch { .. }));
+    assert_eq!(calls(&f.log).len(), recorded_before);
 }

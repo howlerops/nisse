@@ -36,11 +36,11 @@ impl<B: Broker, L: IntentLog> OrderGateway<B, L> {
     ///
     /// 1. `tracker.track_intent(*intent)`; a duplicate client order id stops here.
     /// 2. `intents.record_intent(intent)`. If it fails, return `IntentNotRecorded` and do not
-    ///    call the broker (the tracker marks the order never-arrived at `intent.ts`).
+    ///    call the broker (the tracker marks the order rejected at `intent.ts`).
     /// 3. `broker.submit(intent)`, exactly once.
     ///    - `Ok(order)`: apply it to the tracker (event time `order.ts`) and return it with the
     ///      tracker's [`Applied`] (which carries the fill if it came back filled).
-    ///    - `Rejected`: mark the order never-arrived at `intent.ts`; return `OrderRejected`.
+    ///    - `Rejected`: mark the order rejected at `intent.ts`; return `OrderRejected`.
     ///    - `Unknown`: leave the tracker in `Intent` (reconciliation resolves it by client
     ///      order id) and return `OrderOutcomeUnknown`.
     pub async fn submit(
@@ -69,7 +69,14 @@ impl<B: Broker, L: IntentLog> OrderGateway<B, L> {
         let venue_order_id = tracked
             .venue_order_id
             .ok_or(EngineError::UnknownOrder(original))?;
-        if tracked.intent.symbol != replacement.symbol || tracked.intent.side != replacement.side {
+        // A replace can only change quantity and limit price (that is all the broker is sent),
+        // so everything else must match, and the original must still be live.
+        if tracked.state.is_terminal()
+            || tracked.intent.symbol != replacement.symbol
+            || tracked.intent.side != replacement.side
+            || tracked.intent.order_type != replacement.order_type
+            || tracked.intent.time_in_force != replacement.time_in_force
+        {
             return Err(EngineError::ReplaceMismatch {
                 original,
                 replacement: replacement.client_order_id,
@@ -112,7 +119,7 @@ impl<B: Broker, L: IntentLog> OrderGateway<B, L> {
     ) -> Result<(), EngineError> {
         tracker.track_intent(*intent)?;
         if let Err(source) = self.intents.record_intent(intent).await {
-            tracker.mark_never_arrived(intent.client_order_id, intent.ts)?;
+            tracker.mark_rejected(intent.client_order_id, intent.ts)?;
             return Err(EngineError::IntentNotRecorded {
                 client_order_id: intent.client_order_id,
                 source: Box::new(source),
@@ -139,7 +146,7 @@ where
             Ok(Submitted { order, applied })
         }
         Err(SubmitError::Rejected(source)) => {
-            tracker.mark_never_arrived(client_order_id, intent.ts)?;
+            tracker.mark_rejected(client_order_id, intent.ts)?;
             Err(EngineError::OrderRejected {
                 client_order_id,
                 source: Box::new(source),

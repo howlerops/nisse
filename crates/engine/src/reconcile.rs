@@ -17,7 +17,8 @@ pub enum Finding {
     /// The broker has this order open and its state or cumulative fill differs from the
     /// tracker's: apply the snapshot.
     OrderDrift { order: BrokerOrder },
-    /// The tracker thinks this order is open (or still only an intent) but it is not among
+    /// The tracker thinks this order is open (or still only an intent, or only provisionally
+    /// never-arrived) but it is not among
     /// the broker's open orders: look it up by client order id. It was filled, cancelled or
     /// expired while we were not listening, or it never arrived.
     NotOpenAtBroker { client_order_id: ClientOrderId },
@@ -82,7 +83,9 @@ fn push_order_findings(
         }
     }
 
-    for tracked in tracker.open_orders() {
+    // Includes orders presumed never-arrived: that verdict is provisional and they must keep
+    // being looked up, or a fill on one of them would never be found.
+    for tracked in tracker.unresolved_orders() {
         let client_order_id = tracked.intent.client_order_id;
         if !broker_ids.contains(&client_order_id) {
             out.push(Finding::NotOpenAtBroker { client_order_id });

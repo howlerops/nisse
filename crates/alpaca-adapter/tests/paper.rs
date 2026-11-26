@@ -32,7 +32,7 @@ use nisse_core::{
     Broker, Clock, DecisionId, IntentLog, OrderIntent, OrderState, SubmitError, SystemClock,
 };
 use nisse_engine::{
-    EngineError, OrderGateway, OrderTracker, Submitted, SyncReport, sync_with_broker,
+    EngineError, OrderGateway, OrderTracker, Submitted, SyncOptions, SyncReport, sync_with_broker,
 };
 
 /// Boxed error for test bodies, so setup, checks and cleanup can all use `?`.
@@ -41,8 +41,6 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 /// How many times `sync_until_canceled` polls the broker, and the wait between polls.
 const POLL_ATTEMPTS: u32 = 10;
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
-/// How old an intent must be before a broker "not found" is believed.
-const GRACE_NANOS: u64 = 30_000_000_000;
 
 /// Intent log for the gateway. Holds the intents in memory so the test can read them back
 /// after the gateway has been handed a reference to it.
@@ -131,7 +129,7 @@ async fn sync_once(
         tracker,
         &mut positions,
         SystemClock.now(),
-        GRACE_NANOS,
+        SyncOptions::default(),
     )
     .await
 }

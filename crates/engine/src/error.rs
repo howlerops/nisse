@@ -38,9 +38,11 @@ pub enum EngineError {
         #[source]
         source: BoxError,
     },
-    /// A replacement intent names a different symbol or side than the order it replaces.
+    /// A replacement differs from the order it replaces in more than quantity and limit price,
+    /// or that order is no longer live.
     #[error(
-        "replacement {replacement} does not match order {original} (symbol and side must be equal)"
+        "replacement {replacement} cannot replace {original}: the original must be live, and \
+         symbol, side, type and time in force must match"
     )]
     ReplaceMismatch {
         original: ClientOrderId,

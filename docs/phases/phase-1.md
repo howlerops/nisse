@@ -100,8 +100,10 @@ treat both as bytes. Reply to ping with pong.
 
 Let `delta = order.cum_filled_qty − tracked.cum_filled_qty`, compared as decimals.
 
-1. `delta < 0`: the message is older than what we know. Change nothing; return
-   `Applied::default()`.
+1. `delta < 0`: the broker reports less filled than we hold. From the stream, or from a
+   lagging snapshot (see rule 3), it is an old message: change nothing. From a current
+   snapshot it is a contradiction (a busted trade, a bad restore): return
+   `InconsistentBrokerData`, which sync reports as a problem.
 2. `delta > 0`: there is a new fill.
    - Set `cum_filled_qty`, `avg_fill_px`, `venue_order_id`, `last_update_ts = ts` from the
      message and **adopt the broker's state**, even if the tracked state was terminal (a fill
@@ -119,16 +121,23 @@ Let `delta = order.cum_filled_qty − tracked.cum_filled_qty`, compared as decim
    - From the **stream** (`apply`): if the tracked state is terminal, or `order.state.rank()`
      is lower than the tracked state's rank, change nothing (the message is late).
    - From a **REST snapshot** (`apply_snapshot`: submit response, open-orders entry, lookup by
-     id): always adopt the broker's state. A snapshot is the broker's current word, so it may
-     move the order "backwards": a rejected cancel returns `PendingCancel` to `Accepted`, and
-     an order wrongly marked never-arrived comes back to life.
+     id): adopt the broker's state. A snapshot is the broker's current word, so it may move
+     the order "backwards": a rejected cancel returns `PendingCancel` to `Accepted`. The one
+     exception is a *lagging* snapshot, stamped earlier than the tracker's latest
+     broker-sourced update (a REST list that has not caught up with a cancel the stream
+     already delivered): it is ignored.
+   - An order with a provisional never-arrived verdict (`never_arrived_at` set) is revived by
+     any broker message about it, stream or snapshot.
    - In both cases adopting sets the state, `venue_order_id` and `last_update_ts`.
 4. `state_change` is `Some((before, after))` only when the state actually changed.
 
 After a restart the tracker is rebuilt with `OrderTracker::restore`, from the last recorded
 `order_event` row of each open order (its `cum_filled_qty` and average price), not with
 `track_intent`. Otherwise the first snapshot would re-emit already-recorded fills under a
-synthetic id that the `fill.broker_fill_id` uniqueness cannot catch. Phase 2 does the loading.
+synthetic id that the `fill.broker_fill_id` uniqueness cannot catch. Phase 2 does the loading,
+and must write a fill's `fill` row and the `order_event` row carrying the new cumulative
+quantity in one transaction: if only the fill row survived a crash, the restored cumulative
+figure would be behind and the fill would be emitted again.
 
 ## Reconciliation rules (`reconcile`)
 
@@ -143,8 +152,15 @@ synthetic id that the `fill.broker_fill_id` uniqueness cannot catch. Phase 2 doe
 
 `sync_with_broker` applies the findings. Rules added after the independent review:
 
-- A "not found" answer for an order is believed only once its intent is older than the
-  caller's grace period, and even then the verdict is reversible: a later snapshot revives it.
+- A "not found" answer for an order is believed only once its intent is older than
+  `SyncOptions::never_arrived_grace_nanos` (default one minute). The verdict is provisional:
+  the order keeps being looked up on every pass for `never_arrived_recheck_nanos` (default
+  one day), so if it was live after all, even if it has since filled completely, it is revived
+  and its fill recovered. `mark_rejected` (broker refusal, intent not recorded) is definite.
+- `SyncReport::state_changes` lists every transition a pass made, including backward ones,
+  so the caller can write each as an `order_event` row.
+- `SyncReport::fills` are for the fill log only. Positions are overwritten from the broker in
+  the same pass, so the caller must not also add those quantities to its positions.
 - An order whose snapshot cannot be applied is listed in `SyncReport::problems` and skipped;
   the rest of the pass, including positions, still runs.
 - `Broker::open_orders` returns `OpenOrders { orders, unrepresentable }`. Open orders of a
@@ -155,7 +171,9 @@ synthetic id that the `fill.broker_fill_id` uniqueness cannot catch. Phase 2 doe
 
 Alpaca stamps a daily bar with the start of its day. `daily_bars` takes the calendar and an
 `as_of` time, stamps each bar at its session close (when it became knowable) and leaves out a
-bar whose session has not closed by `as_of`. Pagination stops with an error after 1000 pages.
+bar whose session has not closed by `as_of`. The official closing print and late corrections
+arrive shortly after the close, so callers should pass an `as_of` a few minutes behind their
+clock rather than the clock itself. Pagination stops with an error after 1000 pages.
 
 ## Order stream rules
 
@@ -183,7 +201,7 @@ placeholder credentials (`Credentials::new("test-key-id", "test-secret")`) again
 | T3 | Order stream | `crates/alpaca-adapter/src/stream.rs` | 2 (needs T0) |
 | T6 | Reconcile | `crates/engine/src/reconcile.rs` | 2 (needs T5) |
 | T7 | Order gateway | `crates/engine/src/gateway.rs`, `crates/engine/tests/support/mod.rs` | 2 (needs T5) |
-| T10 | Broker sync | `crates/engine/src/sync.rs` | 3 (needs T5, T6, T7's test support) |
+| T10 | Broker sync (`sync_with_broker(broker, tracker, positions, now, SyncOptions)`) | `crates/engine/src/sync.rs` | 3 (needs T5, T6, T7's test support) |
 | T9 | Paper tests | `crates/alpaca-adapter/tests/paper.rs`, `docs/runbooks/paper-tests.md` | 3 |
 
 ### Acceptance tests
@@ -315,7 +333,10 @@ that orders are placed far from the market and cancelled.
   `StreamEvent`. Phase 2 wires the stream, the timer and the store together; until then the
   "reconcile on a timer" box in #3 is only half done (the function exists and is tested).
 - Known gaps, accepted for now: while the consumer is slow the stream task cannot answer
-  pings (the idle timeout then reconnects); an order marked never-arrived that later fills
-  completely without ever being seen open is found only through the position mismatch; the
-  paper tests return early without a cancel attempt if a submit outcome is unknown (the
+  pings (the idle timeout then reconnects); `OrderGateway::cancel` reports every failure as
+  `Broker(..)` without telling "already done" from "unknown"; open orders and positions are
+  read at two instants, so a fill landing between them is in the adopted position before its
+  fill is logged; whether Alpaca's replacement order carries over the original's filled
+  quantity is unverified and needs a paper check before replace is used on a partly filled
+  order; the paper tests return early without a cancel attempt if a submit outcome is unknown (the
   runbook covers manual cleanup).

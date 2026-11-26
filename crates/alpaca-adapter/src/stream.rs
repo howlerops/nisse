@@ -226,7 +226,8 @@ fn fill_detail(
 /// Connects to `config.stream_url`, authenticates, subscribes to `trade_updates`, then
 /// forwards every update. `events` is bounded and sends wait for room (back-pressure): an
 /// order update is never dropped. On any connection or protocol failure it sends
-/// `Disconnected` (or `ConnectFailed` if it never got as far as listening), waits (starting at `min_reconnect_delay`, doubling to
+/// `Disconnected` (or `ConnectFailed` if it never got as far as listening), waits (starting at
+/// `min_reconnect_delay`, doubling to
 /// [`MAX_RECONNECT_DELAY`], reset after a successful connect) and reconnects. An
 /// authentication failure is returned as `Err` immediately: retrying bad credentials is
 /// pointless.

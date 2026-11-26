@@ -4,12 +4,34 @@
 use std::collections::BTreeMap;
 
 use nisse_core::{
-    Broker, BrokerOrder, Fill,
+    Broker, BrokerOrder, Fill, OrderState,
     nautilus::{ClientOrderId, Symbol, UnixNanos},
 };
 use rust_decimal::Decimal;
 
 use crate::{EngineError, Finding, OrderTracker, reconcile};
+
+/// Timing rules for [`sync_with_broker`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncOptions {
+    /// How old an intent must be before a "not found" from the broker is believed. A
+    /// just-sent order may simply not be registered yet.
+    pub never_arrived_grace_nanos: u64,
+    /// How long after a never-arrived verdict the order is still looked up on every pass. If
+    /// the broker turns out to have it after all (even already filled), it is revived and its
+    /// fills are recovered. After this the verdict is final.
+    pub never_arrived_recheck_nanos: u64,
+}
+
+impl Default for SyncOptions {
+    /// One minute of grace, one day of rechecks.
+    fn default() -> Self {
+        Self {
+            never_arrived_grace_nanos: 60 * 1_000_000_000,
+            never_arrived_recheck_nanos: 24 * 3_600 * 1_000_000_000,
+        }
+    }
+}
 
 /// An order whose broker snapshot could not be applied. The pass carries on with the others.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,12 +40,26 @@ pub struct SyncProblem {
     pub reason: String,
 }
 
+/// A state transition made during a pass. The caller records each as an `order_event` row;
+/// transitions can go "backwards" (`rejected` to `accepted` when a never-arrived verdict is
+/// overturned, `pending_cancel` to `accepted` when a cancel is refused).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StateChange {
+    pub client_order_id: ClientOrderId,
+    pub before: OrderState,
+    pub after: OrderState,
+}
+
 /// What one reconciliation pass changed or found.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SyncReport {
     /// Every difference found, in [`crate::reconcile`] order, before anything was applied.
     pub findings: Vec<Finding>,
-    /// Fills discovered while applying broker state (missed while disconnected).
+    /// Every order state transition the pass made, in the order it made them.
+    pub state_changes: Vec<StateChange>,
+    /// Fills discovered while applying broker state (missed while disconnected). These are
+    /// for the fill log only: positions are overwritten from the broker in the same pass, so
+    /// the caller must not also add these quantities to its positions.
     pub fills: Vec<Fill>,
     /// Orders whose snapshot could not be applied (inconsistent broker figures). They stay
     /// as they were and will be reported again on the next pass: alert on these.
@@ -38,12 +74,14 @@ pub struct SyncReport {
 /// 1. Fetch the broker's open orders and positions.
 /// 2. Compute findings with [`crate::reconcile`].
 /// 3. `OrderDrift`: apply the snapshot to the tracker (`apply_snapshot`: the broker's state
-///    wins, even over a local terminal state).
+///    wins, even over a local terminal state, unless the snapshot is older than what the
+///    tracker already has from the broker).
 /// 4. `NotOpenAtBroker`: fetch the order by client order id. Found: apply it. Not found
-///    (`Ok(None)`): if the intent is at least `never_arrived_grace_nanos` old, mark it
-///    never-arrived at `now`; if it is younger, leave it for a later pass, because the broker
-///    may simply not have registered a just-sent order yet. The verdict is not final either
-///    way: a later snapshot of the order revives it.
+///    (`Ok(None)`):
+///    - an order not yet judged: if its intent is at least `never_arrived_grace_nanos` old,
+///      mark it never-arrived at `now`; if younger, leave it for a later pass;
+///    - an order already judged never-arrived: keep it under watch until the verdict is
+///      `never_arrived_recheck_nanos` old, then make it final.
 /// 5. `PositionMismatch`: overwrite the local quantity with the broker's (remove the entry
 ///    when the broker is flat).
 /// 6. `UnknownAtBroker`: nothing is changed; it is only reported.
@@ -56,36 +94,31 @@ pub async fn sync_with_broker<B: Broker>(
     tracker: &mut OrderTracker,
     local_positions: &mut BTreeMap<Symbol, Decimal>,
     now: UnixNanos,
-    never_arrived_grace_nanos: u64,
+    options: SyncOptions,
 ) -> Result<SyncReport, EngineError> {
     let open = broker.open_orders().await.map_err(broker_error)?;
     let positions = broker.positions().await.map_err(broker_error)?;
 
-    let findings = reconcile(tracker, local_positions, &open.orders, &positions);
-    let mut fills = Vec::new();
-    let mut problems = Vec::new();
+    let mut report = SyncReport {
+        findings: reconcile(tracker, local_positions, &open.orders, &positions),
+        unrepresentable_at_broker: open.unrepresentable,
+        ..SyncReport::default()
+    };
 
-    for &finding in &findings {
+    for index in 0..report.findings.len() {
+        let Some(&finding) = report.findings.get(index) else {
+            break;
+        };
         match finding {
-            Finding::OrderDrift { order } => {
-                apply_snapshot(tracker, &order, &mut fills, &mut problems);
-            }
+            Finding::OrderDrift { order } => apply_snapshot(tracker, &order, &mut report),
             Finding::NotOpenAtBroker { client_order_id } => {
                 match broker
                     .order_by_client_id(client_order_id)
                     .await
                     .map_err(broker_error)?
                 {
-                    Some(order) => apply_snapshot(tracker, &order, &mut fills, &mut problems),
-                    None => {
-                        let old_enough = tracker.get(client_order_id).is_some_and(|tracked| {
-                            now.as_u64().saturating_sub(tracked.intent.ts.as_u64())
-                                >= never_arrived_grace_nanos
-                        });
-                        if old_enough {
-                            tracker.mark_never_arrived(client_order_id, now)?;
-                        }
-                    }
+                    Some(order) => apply_snapshot(tracker, &order, &mut report),
+                    None => not_found(tracker, client_order_id, now, options, &mut report)?,
                 }
             }
             Finding::PositionMismatch {
@@ -103,25 +136,60 @@ pub async fn sync_with_broker<B: Broker>(
         }
     }
 
-    Ok(SyncReport {
-        findings,
-        fills,
-        problems,
-        unrepresentable_at_broker: open.unrepresentable,
-    })
+    Ok(report)
 }
 
-/// Applies one broker snapshot, keeping any fill it produced. A snapshot that cannot be
-/// applied becomes a [`SyncProblem`] instead of ending the pass.
-fn apply_snapshot(
+/// The broker has no record of `client_order_id`.
+fn not_found(
     tracker: &mut OrderTracker,
-    order: &BrokerOrder,
-    fills: &mut Vec<Fill>,
-    problems: &mut Vec<SyncProblem>,
+    client_order_id: ClientOrderId,
+    now: UnixNanos,
+    options: SyncOptions,
+    report: &mut SyncReport,
+) -> Result<(), EngineError> {
+    let Some(tracked) = tracker.get(client_order_id) else {
+        return Ok(());
+    };
+    let age_of = |since: UnixNanos| now.as_u64().saturating_sub(since.as_u64());
+    match tracked.never_arrived_at {
+        Some(judged_at) => {
+            if age_of(judged_at) >= options.never_arrived_recheck_nanos {
+                tracker.settle_never_arrived(client_order_id)?;
+            }
+        }
+        None => {
+            if age_of(tracked.intent.ts) >= options.never_arrived_grace_nanos {
+                let applied = tracker.mark_never_arrived(client_order_id, now)?;
+                record_change(client_order_id, applied.state_change, report);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn record_change(
+    client_order_id: ClientOrderId,
+    change: Option<(OrderState, OrderState)>,
+    report: &mut SyncReport,
 ) {
+    if let Some((before, after)) = change {
+        report.state_changes.push(StateChange {
+            client_order_id,
+            before,
+            after,
+        });
+    }
+}
+
+/// Applies one broker snapshot, keeping the fill and state change it produced. A snapshot
+/// that cannot be applied becomes a [`SyncProblem`] instead of ending the pass.
+fn apply_snapshot(tracker: &mut OrderTracker, order: &BrokerOrder, report: &mut SyncReport) {
     match tracker.apply_snapshot(order) {
-        Ok(applied) => fills.extend(applied.fill),
-        Err(error) => problems.push(SyncProblem {
+        Ok(applied) => {
+            report.fills.extend(applied.fill);
+            record_change(order.client_order_id, applied.state_change, report);
+        }
+        Err(error) => report.problems.push(SyncProblem {
             client_order_id: order.client_order_id,
             reason: error.to_string(),
         }),

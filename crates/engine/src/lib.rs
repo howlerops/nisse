@@ -16,4 +16,4 @@ pub use error::{BoxError, EngineError};
 pub use gateway::{OrderGateway, Submitted};
 pub use order_tracker::{Applied, OrderTracker, TrackedOrder};
 pub use reconcile::{Finding, reconcile};
-pub use sync::{SyncProblem, SyncReport, sync_with_broker};
+pub use sync::{StateChange, SyncOptions, SyncProblem, SyncReport, sync_with_broker};
