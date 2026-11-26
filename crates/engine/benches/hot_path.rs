@@ -71,6 +71,7 @@ fn trend_decide(c: &mut Criterion) {
         (feature::N_ASSETS, Decimal::new(8, 0)),
         (feature::MOMENTUM, Decimal::new(10, 2)),
         (feature::VAR_DAILY, Decimal::new(101_587, 9)),
+        (feature::RISK_SCALE, Decimal::ONE),
     ] {
         features.insert(name.to_owned(), value);
     }

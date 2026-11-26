@@ -280,6 +280,7 @@ where
             self.state.positions.get(symbol).qty + working_qty,
         );
         features.insert(feature::EQUITY.to_owned(), equity);
+        features.insert(feature::RISK_SCALE.to_owned(), self.gate.risk_scale());
         let n_assets = u64::try_from(self.config.symbols.len()).unwrap_or(u64::MAX);
         features.insert(feature::N_ASSETS.to_owned(), Decimal::from(n_assets));
         let current = self
