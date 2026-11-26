@@ -117,8 +117,11 @@ Group the bars by `ts_event` (one group per session, in time order). For each se
    close at this session's opens, all sells before any buy (a sale's proceeds can pay for a
    purchase made at the same open). Then apply every drained update with
    `trader.on_order_update`, then `trader.on_bar(bar)` for each bar.
-3. Record the equity point (`broker.account().equity`).
-4. If `calendar.is_last_session_of_month(date) == Some(true)` → `trader.rebalance()`.
+3. Record the equity point (`broker.account().equity`), then `trader.observe_equity(equity)`
+   (phase 4: the drawdown state). It returns the mode change, if any.
+4. If `calendar.is_last_session_of_month(date) == Some(true)`, or the mode stepped down to a
+   smaller scale (normal → halved, normal → flat, halved → flat), → `trader.rebalance()`, once.
+   A step up does not rebalance; the next month end resizes.
 
 The final session of the data never rebalances (the calendar cannot know it is a month end),
 and orders placed at the last rebalance that never see another bar stay open: both are
