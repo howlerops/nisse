@@ -45,11 +45,12 @@ for file in migrations/*.sql; do
   fi
 done
 # A ledger row with no file means a migration was deleted or renamed after it ran.
-while read -r version; do
-  if [[ -n "$version" && ! -f "migrations/$version.sql" ]]; then
+ledger="$(q -At -c "SELECT version FROM schema_migration ORDER BY version")"
+for version in $ledger; do
+  if [[ ! -f "migrations/$version.sql" ]]; then
     echo "migrate: $version is applied in the database but migrations/$version.sql is missing" >&2
     exit 1
   fi
-done < <(q -At -c "SELECT version FROM schema_migration ORDER BY version")
+done
 
 echo "migrate: up to date"

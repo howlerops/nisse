@@ -51,6 +51,11 @@ Two loops that meet only at a human-approved merge.
 - No workflow engine: cron plus a Postgres state machine with idempotent steps.
 - No LLM call anywhere in the order path.
 
+### UI notes (Phase 8)
+
+- Take inspiration from [herdr-app](https://github.com/herdrdev/herdr-app), an app built with Native Shell, in particular its ability to open an agent that edits the app in real time, per user.
+- If nisse gets such an in-app agent, the existing boundaries still hold: it edits UI code only, never the engine, risk gate, adapter or limits; it never sees broker credentials; and it cannot place orders or change what the kill switch does. Anything it changes outside a user's own UI session still lands as a PR that a human merges.
+
 ## Trade store and evals
 
 Store every decision, not just every fill. Rank strategy versions, not individual trades (single-trade P&L is mostly luck). All tables are append-only with `event_ts` and `ingest_ts`; corrections are new rows. A trigger on every table rejects UPDATE, DELETE and TRUNCATE; a table owner or superuser can still disable it, so from Phase 2 the engine connects as a role with INSERT and SELECT only. The schema is in `migrations/`, applied by `scripts/migrate.sh`.
