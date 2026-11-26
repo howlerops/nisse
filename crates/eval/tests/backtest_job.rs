@@ -23,6 +23,7 @@ use nisse_eval::{
     EvalError,
     backtest_job::{BacktestJob, run_backtest_job},
 };
+use nisse_risk::Limits;
 use nisse_store::{
     Store,
     tables::{trial_registry, trial_result},
@@ -238,7 +239,9 @@ fn error_text<T>(result: Result<T, EvalError>) -> String {
     result.err().expect("an error").to_string()
 }
 
-const RESULT_FIELDS: [&str; 17] = [
+const RESULT_FIELDS: [&str; 19] = [
+    "limits_hash",
+    "limits",
     "bars_file",
     "requested_start",
     "requested_end",
@@ -312,6 +315,9 @@ async fn a_backtest_registers_runs_and_stores_its_result() {
     );
     assert_eq!(result["summary_includes_warm_up"], json!(true));
     assert!(result["bars_file"].as_str().unwrap().ends_with(".parquet"));
+    let limits = Limits::load(&job.limits_path).unwrap();
+    assert_eq!(result["limits_hash"], json!(limits.hash().to_string()));
+    assert_eq!(result["limits"], limits.to_json());
 
     // The snapshot id names the bars as they read back, not as they were written.
     let read_back = BarReader::open(dir.path())
@@ -323,6 +329,61 @@ async fn a_backtest_registers_runs_and_stores_its_result() {
         json!(bars_snapshot_id(&read_back))
     );
 
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_missing_limits_file_is_a_risk_error_and_writes_nothing() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let store = Store::new(db.client().await.unwrap());
+    let dir = bars_dir("missing-limits", &market());
+    let mut missing = job(dir.path(), strategy_params());
+    missing.limits_path = dir.path().join("no-such-limits.json");
+    let trials_before = trial_count(&client).await;
+    let versions_before = version_count(&client).await;
+
+    let err = run_backtest_job(&store, &missing, true, false, now())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, EvalError::Risk(_)), "got {err:?}");
+    assert_eq!(trial_count(&client).await, trials_before);
+    assert_eq!(version_count(&client).await, versions_before);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn limits_looser_than_the_ceilings_are_a_risk_error_and_write_nothing() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let store = Store::new(db.client().await.unwrap());
+    let dir = bars_dir("loose-limits", &market());
+    let repo_limits = PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../config/limits/limits.json"
+    ));
+    let mut loose: Value =
+        serde_json::from_str(&std::fs::read_to_string(&repo_limits).unwrap()).unwrap();
+    loose
+        .as_object_mut()
+        .unwrap()
+        .insert("max_risk_per_trade".to_owned(), json!("0.01"));
+    let loose_path = dir.path().join("loose-limits.json");
+    std::fs::write(&loose_path, loose.to_string()).unwrap();
+    let mut looser = job(dir.path(), strategy_params());
+    looser.limits_path = loose_path;
+    let trials_before = trial_count(&client).await;
+    let versions_before = version_count(&client).await;
+
+    let err = run_backtest_job(&store, &looser, true, false, now())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, EvalError::Risk(_)), "got {err:?}");
+    assert!(err.to_string().contains("max_risk_per_trade"), "{err}");
+    assert_eq!(trial_count(&client).await, trials_before);
+    assert_eq!(version_count(&client).await, versions_before);
     db.drop_db().await.unwrap();
 }
 
