@@ -13,14 +13,14 @@ VALUES ((SELECT id FROM strategy_version WHERE git_sha = repeat('a', 40)),
 
 -- 1. Intent row (broker_order_id NULL) first, then the broker's accepted row later.
 INSERT INTO order_event (decision_id, client_order_id, broker_order_id, state, type, limit_px, qty,
-                         event_ts)
-VALUES ((SELECT min(id) FROM decision), 'nisse-0001', NULL, 'intent', 'limit', 500.10, 1.5,
-        '2026-01-05T21:00:00Z');
+                         symbol, side, time_in_force, cum_filled_qty, event_ts)
+VALUES ((SELECT min(id) FROM decision), 'nisse-0001', NULL, 'intent', 'LIMIT', 500.10, 1.5,
+        'SPY', 'BUY', 'DAY', 0, '2026-01-05T21:00:00Z');
 
 INSERT INTO order_event (decision_id, client_order_id, broker_order_id, state, type, limit_px, qty,
-                         event_ts)
-VALUES ((SELECT min(id) FROM decision), 'nisse-0001', 'brk-1', 'accepted', 'limit', 500.10, 1.5,
-        '2026-01-05T21:00:01Z');
+                         symbol, side, time_in_force, cum_filled_qty, event_ts)
+VALUES ((SELECT min(id) FROM decision), 'nisse-0001', 'brk-1', 'accepted', 'LIMIT', 500.10, 1.5,
+        'SPY', 'BUY', 'DAY', 0, '2026-01-05T21:00:01Z');
 
 SELECT pg_temp.assert_true(
   (SELECT broker_order_id IS NULL AND state = 'intent' FROM order_event
@@ -28,9 +28,10 @@ SELECT pg_temp.assert_true(
   'earliest order_event for a client_order_id must be the intent row with broker_order_id NULL');
 
 -- 2. A market order has no limit price.
-INSERT INTO order_event (decision_id, client_order_id, state, type, limit_px, qty, event_ts)
-VALUES ((SELECT min(id) FROM decision), 'nisse-0003', 'intent', 'market', NULL, 2,
-        '2026-01-05T21:00:02Z');
+INSERT INTO order_event (decision_id, client_order_id, state, type, limit_px, qty,
+                         symbol, side, time_in_force, cum_filled_qty, event_ts)
+VALUES ((SELECT min(id) FROM decision), 'nisse-0003', 'intent', 'MARKET', NULL, 2,
+        'SPY', 'BUY', 'DAY', 0, '2026-01-05T21:00:02Z');
 
 SELECT pg_temp.assert_true(
   (SELECT limit_px IS NULL FROM order_event WHERE client_order_id = 'nisse-0003'),
@@ -38,60 +39,81 @@ SELECT pg_temp.assert_true(
 
 -- 3. order_event rejections.
 SELECT pg_temp.assert_raises($q$
-  INSERT INTO order_event (decision_id, client_order_id, state, type, qty, event_ts)
-  VALUES ((SELECT min(id) FROM decision), '', 'intent', 'limit', 1, '2026-01-05T21:00:00Z')
+  INSERT INTO order_event (decision_id, client_order_id, state, type, limit_px, qty,
+                           symbol, side, time_in_force, cum_filled_qty, event_ts)
+  VALUES ((SELECT min(id) FROM decision), '', 'intent', 'LIMIT', 500.10, 1,
+          'SPY', 'BUY', 'DAY', 0, '2026-01-05T21:00:00Z')
 $q$, '23514');
 
 SELECT pg_temp.assert_raises($q$
-  INSERT INTO order_event (decision_id, client_order_id, state, type, qty, event_ts)
-  VALUES ((SELECT min(id) FROM decision), 'nisse-0004', '', 'limit', 1, '2026-01-05T21:00:00Z')
+  INSERT INTO order_event (decision_id, client_order_id, state, type, limit_px, qty,
+                           symbol, side, time_in_force, cum_filled_qty, event_ts)
+  VALUES ((SELECT min(id) FROM decision), 'nisse-0004', '', 'LIMIT', 500.10, 1,
+          'SPY', 'BUY', 'DAY', 0, '2026-01-05T21:00:00Z')
 $q$, '23514');
 
 SELECT pg_temp.assert_raises($q$
-  INSERT INTO order_event (decision_id, client_order_id, state, type, qty, event_ts)
-  VALUES ((SELECT min(id) FROM decision), 'nisse-0004', 'intent', '', 1, '2026-01-05T21:00:00Z')
+  INSERT INTO order_event (decision_id, client_order_id, state, type, limit_px, qty,
+                           symbol, side, time_in_force, cum_filled_qty, event_ts)
+  VALUES ((SELECT min(id) FROM decision), 'nisse-0004', 'intent', '', NULL, 1,
+          'SPY', 'BUY', 'DAY', 0, '2026-01-05T21:00:00Z')
 $q$, '23514');
 
 SELECT pg_temp.assert_raises($q$
-  INSERT INTO order_event (decision_id, client_order_id, state, type, qty, event_ts)
-  VALUES ((SELECT min(id) FROM decision), 'nisse-0004', 'intent', 'limit', 0, '2026-01-05T21:00:00Z')
+  INSERT INTO order_event (decision_id, client_order_id, state, type, limit_px, qty,
+                           symbol, side, time_in_force, cum_filled_qty, event_ts)
+  VALUES ((SELECT min(id) FROM decision), 'nisse-0004', 'intent', 'LIMIT', 500.10, 0,
+          'SPY', 'BUY', 'DAY', 0, '2026-01-05T21:00:00Z')
 $q$, '23514');
 
 SELECT pg_temp.assert_raises($q$
-  INSERT INTO order_event (decision_id, client_order_id, state, type, qty, event_ts)
-  VALUES ((SELECT min(id) FROM decision), 'nisse-0004', 'intent', 'limit', -1, '2026-01-05T21:00:00Z')
+  INSERT INTO order_event (decision_id, client_order_id, state, type, limit_px, qty,
+                           symbol, side, time_in_force, cum_filled_qty, event_ts)
+  VALUES ((SELECT min(id) FROM decision), 'nisse-0004', 'intent', 'LIMIT', 500.10, -1,
+          'SPY', 'BUY', 'DAY', 0, '2026-01-05T21:00:00Z')
 $q$, '23514');
 
 SELECT pg_temp.assert_raises($q$
-  INSERT INTO order_event (decision_id, client_order_id, state, type, limit_px, qty, event_ts)
-  VALUES ((SELECT min(id) FROM decision), 'nisse-0004', 'intent', 'limit', 0, 1, '2026-01-05T21:00:00Z')
+  INSERT INTO order_event (decision_id, client_order_id, state, type, limit_px, qty,
+                           symbol, side, time_in_force, cum_filled_qty, event_ts)
+  VALUES ((SELECT min(id) FROM decision), 'nisse-0004', 'intent', 'LIMIT', 0, 1,
+          'SPY', 'BUY', 'DAY', 0, '2026-01-05T21:00:00Z')
 $q$, '23514');
 
 SELECT pg_temp.assert_raises($q$
-  INSERT INTO order_event (decision_id, client_order_id, state, type, qty, event_ts)
-  VALUES (999999, 'nisse-0004', 'intent', 'limit', 1, '2026-01-05T21:00:00Z')
+  INSERT INTO order_event (decision_id, client_order_id, state, type, limit_px, qty,
+                           symbol, side, time_in_force, cum_filled_qty, event_ts)
+  VALUES (999999, 'nisse-0004', 'intent', 'LIMIT', 500.10, 1,
+          'SPY', 'BUY', 'DAY', 0, '2026-01-05T21:00:00Z')
 $q$, '23503');
 
 SELECT pg_temp.assert_raises($q$
-  INSERT INTO order_event (decision_id, client_order_id, state, type, qty, event_ts)
-  VALUES ((SELECT min(id) FROM decision), NULL, 'intent', 'limit', 1, '2026-01-05T21:00:00Z')
+  INSERT INTO order_event (decision_id, client_order_id, state, type, limit_px, qty,
+                           symbol, side, time_in_force, cum_filled_qty, event_ts)
+  VALUES ((SELECT min(id) FROM decision), NULL, 'intent', 'LIMIT', 500.10, 1,
+          'SPY', 'BUY', 'DAY', 0, '2026-01-05T21:00:00Z')
 $q$, '23502');
 
 SELECT pg_temp.assert_raises($q$
-  INSERT INTO order_event (decision_id, client_order_id, state, type, qty, event_ts)
-  VALUES ((SELECT min(id) FROM decision), 'nisse-0004', 'intent', 'limit', NULL, '2026-01-05T21:00:00Z')
+  INSERT INTO order_event (decision_id, client_order_id, state, type, limit_px, qty,
+                           symbol, side, time_in_force, cum_filled_qty, event_ts)
+  VALUES ((SELECT min(id) FROM decision), 'nisse-0004', 'intent', 'LIMIT', 500.10, NULL,
+          'SPY', 'BUY', 'DAY', 0, '2026-01-05T21:00:00Z')
 $q$, '23502');
 
 SELECT pg_temp.assert_raises($q$
-  INSERT INTO order_event (decision_id, client_order_id, state, type, qty, event_ts)
-  VALUES ((SELECT min(id) FROM decision), 'nisse-0004', 'intent', 'limit', 1, NULL)
+  INSERT INTO order_event (decision_id, client_order_id, state, type, limit_px, qty,
+                           symbol, side, time_in_force, cum_filled_qty, event_ts)
+  VALUES ((SELECT min(id) FROM decision), 'nisse-0004', 'intent', 'LIMIT', 500.10, 1,
+          'SPY', 'BUY', 'DAY', 0, NULL)
 $q$, '23502');
 
 -- id is GENERATED ALWAYS, so an explicit id is rejected.
 SELECT pg_temp.assert_raises($q$
-  INSERT INTO order_event (id, decision_id, client_order_id, state, type, qty, event_ts)
-  VALUES (424242, (SELECT min(id) FROM decision), 'nisse-0004', 'intent', 'limit', 1,
-          '2026-01-05T21:00:00Z')
+  INSERT INTO order_event (id, decision_id, client_order_id, state, type, limit_px, qty,
+                           symbol, side, time_in_force, cum_filled_qty, event_ts)
+  VALUES (424242, (SELECT min(id) FROM decision), 'nisse-0004', 'intent', 'LIMIT', 500.10, 1,
+          'SPY', 'BUY', 'DAY', 0, '2026-01-05T21:00:00Z')
 $q$, '428C9');
 
 -- 4. Two partial fills for one order; cumulative quantity is the sum.
@@ -205,9 +227,10 @@ SELECT pg_temp.assert_raises($q$
 $q$, '23514');
 
 SELECT pg_temp.assert_raises($q$
-  INSERT INTO order_event (decision_id, client_order_id, state, type, qty, event_ts)
-  VALUES ((SELECT min(id) FROM decision), 'nisse-0009', 'intent', 'market', 'NaN',
-          '2026-01-05T21:00:00Z')
+  INSERT INTO order_event (decision_id, client_order_id, state, type, limit_px, qty,
+                           symbol, side, time_in_force, cum_filled_qty, event_ts)
+  VALUES ((SELECT min(id) FROM decision), 'nisse-0009', 'intent', 'MARKET', NULL, 'NaN',
+          'SPY', 'BUY', 'DAY', 0, '2026-01-05T21:00:00Z')
 $q$, '23514');
 
 SELECT pg_temp.assert_raises($q$
