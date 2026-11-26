@@ -133,7 +133,9 @@ pub async fn run_backtest<S: Strategy>(
         // A step down (to a smaller exposure scale) resizes at once, not at the next month end.
         // A step up waits for the month end.
         let stepped_down = step.is_some_and(|(from, to)| to.scale() < from.scale());
-        if month_end || stepped_down {
+        // While the scale is zero and something is still held (an order filled after the
+        // step, a symbol that could not be decided for), keep trying to exit every session.
+        if month_end || stepped_down || trader.needs_flatten() {
             let report = trader.rebalance().await?;
             orders_blocked = orders_blocked.saturating_add(report.orders_blocked);
         }

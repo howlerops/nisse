@@ -60,6 +60,9 @@ pub struct RebalanceReport {
 struct GateInputs {
     /// Shares held plus shares on order: the position the decision was made from.
     position_qty: Decimal,
+    /// Shares a sell may reduce: filled shares minus the engine's own unfilled sells. Shares
+    /// that are only on order are not sellable.
+    sellable_qty: Decimal,
     /// The symbol's last close, when it has any bar.
     reference_px: Option<Decimal>,
     /// The symbol's daily variance, when its window has enough returns.
@@ -111,6 +114,9 @@ pub struct Trader<S, B, L, D, K, C> {
     /// One preallocated window per symbol in the universe.
     windows: BTreeMap<Symbol, SymbolWindow>,
     decisions_made: u64,
+    /// The kill switch was engaged by this process. A refresh from the store never lowers
+    /// it (the store may not have the row yet); only `release_kill_switch` does.
+    kill_engaged_here: bool,
     /// The risk gate: limits, drawdown mode, kill switch, day-trade count.
     gate: RiskGate,
 }
@@ -170,6 +176,7 @@ where
             state,
             windows,
             decisions_made: 0,
+            kill_engaged_here: false,
             gate,
         })
     }
@@ -199,9 +206,16 @@ where
     /// simulated broker) and records what it changed. A fill also counts toward the day-trade
     /// limit.
     pub async fn on_order_update(&mut self, update: &OrderUpdate) -> Result<(), EngineError> {
+        let id = update.order.client_order_id;
+        let filled_before = self.state.tracker.get(id).map(|order| order.cum_filled_qty);
         record_stream_update(&mut self.state, &self.sink, update).await?;
-        if update.fill.is_some() {
-            self.record_day_trade_fill(update.order.client_order_id, update.ts);
+        // Only a fill that moved the order's filled quantity counts: a redelivered message
+        // is not a new fill and must not look like one on another day.
+        let filled_after = self.state.tracker.get(id).map(|order| order.cum_filled_qty);
+        if let (Some(before), Some(after)) = (filled_before, filled_after)
+            && after > before
+        {
+            self.record_day_trade_fill(id, update.ts);
         }
         Ok(())
     }
@@ -235,6 +249,8 @@ where
                 ts,
             }))
             .await?;
+            // Durably: a restart must not come back in a looser mode.
+            self.flush().await?;
         }
         Ok(observation.mode_change)
     }
@@ -256,8 +272,64 @@ where
                 true
             }
         };
+        // A switch engaged in this process stays engaged whatever the source says: its row
+        // may not have reached the store yet.
+        let engaged = engaged || self.kill_engaged_here;
         self.gate.set_kill_switch(engaged);
         engaged
+    }
+
+    /// Releases the kill switch: a person's decision, passed in by the caller. Records the
+    /// release durably first; if that fails the switch stays engaged.
+    pub async fn release_kill_switch(&mut self, by: &str) -> Result<(), EngineError> {
+        self.emit(StoreRecord::RiskEvent(RiskEvent {
+            kind: RiskEventKind::KillSwitch,
+            detail: serde_json::json!({ "engaged": false, "by": by }),
+            ts: self.clock.now(),
+        }))
+        .await?;
+        self.flush().await?;
+        self.kill_engaged_here = false;
+        self.gate.set_kill_switch(false);
+        Ok(())
+    }
+
+    /// Records which limits this process trades under (`limits_loaded`): call once at
+    /// start-up.
+    pub async fn record_limits_loaded(&self) -> Result<(), EngineError> {
+        let limits = self.gate.limits();
+        self.emit(StoreRecord::RiskEvent(RiskEvent {
+            kind: RiskEventKind::LimitsLoaded,
+            detail: serde_json::json!({
+                "hash": limits.hash().to_string(),
+                "limits": limits.to_json(),
+            }),
+            ts: self.clock.now(),
+        }))
+        .await?;
+        self.flush().await
+    }
+
+    /// Feeds the day-trade count with a fill from before this process started (the last
+    /// seven days of the `fill` table), so a restart does not reset the count.
+    pub fn record_past_fill(&mut self, symbol: Symbol, side: OrderSide, ts: UnixNanos) {
+        self.gate.day_trades_mut().record_fill(symbol, side, ts);
+    }
+
+    /// Whether the risk scale is zero (flat after a drawdown, or a flattening kill switch)
+    /// while a position or an open order remains: the caller should rebalance again. Exits
+    /// go through ordinary decisions, so a symbol the strategy cannot decide for (no current
+    /// bar, for example) stays held until it can; this is how the caller sees that.
+    #[must_use]
+    pub fn needs_flatten(&self) -> bool {
+        self.gate.risk_scale().is_zero()
+            && (self
+                .state
+                .positions
+                .quantities()
+                .values()
+                .any(|qty| !qty.is_zero())
+                || self.state.tracker.unresolved_orders().next().is_some())
     }
 
     /// Engages the kill switch: sets the flag, records the event, and cancels every open
@@ -266,13 +338,17 @@ where
     /// `Broker`.
     pub async fn engage_kill_switch(&mut self, by: &str) -> Result<(), EngineError> {
         self.gate.set_kill_switch(true);
-        let recorded = self
-            .emit(StoreRecord::RiskEvent(RiskEvent {
-                kind: RiskEventKind::KillSwitch,
-                detail: serde_json::json!({ "engaged": true, "by": by }),
-                ts: self.clock.now(),
-            }))
-            .await;
+        self.kill_engaged_here = true;
+        let event = StoreRecord::RiskEvent(RiskEvent {
+            kind: RiskEventKind::KillSwitch,
+            detail: serde_json::json!({ "engaged": true, "by": by }),
+            ts: self.clock.now(),
+        });
+        // Durably: a restart must find the switch engaged.
+        let recorded = match self.emit(event).await {
+            Ok(()) => self.flush().await,
+            Err(err) => Err(err),
+        };
         let cancelled = self
             .gateway
             .broker()
@@ -297,6 +373,13 @@ where
     }
 
     /// Sends one record to the sink. A sink failure means the store is gone.
+    async fn flush(&self) -> Result<(), EngineError> {
+        self.sink
+            .flush()
+            .await
+            .map_err(|err| EngineError::Store(Box::new(err)))
+    }
+
     async fn emit(&self, record: StoreRecord) -> Result<(), EngineError> {
         self.sink
             .emit(record)
@@ -335,7 +418,7 @@ where
         for fill in &report.fills {
             self.record_day_trade_fill(fill.client_order_id, fill.ts);
         }
-        let working = self.working_quantities();
+        let (working, working_sells) = self.working_quantities();
         // The newest bar any symbol has. A symbol whose last bar is older than that has a gap
         // in its data: it is decided without its price features, so the strategy skips it
         // instead of sizing an order from a stale close.
@@ -356,7 +439,8 @@ where
             now,
             equity,
             trading_blocked: account.trading_blocked,
-            data_age_nanos: newest_bar_ts.map(|ts| now.as_u64().saturating_sub(ts.as_u64())),
+            // A bar stamped after `now` has no known age: a clock or the feed is wrong.
+            data_age_nanos: newest_bar_ts.and_then(|ts| now.as_u64().checked_sub(ts.as_u64())),
         };
 
         // Phase A: decide for every symbol before any order is sent, all from one equity.
@@ -369,8 +453,9 @@ where
         for &symbol in &self.config.symbols {
             let working_qty = working.get(&symbol).copied().unwrap_or(Decimal::ZERO);
             let features = self.features_for(symbol, equity, working_qty, newest_bar_ts);
-            let position_qty = self.state.positions.get(symbol).qty + working_qty;
-            let inputs = self.gate_inputs(symbol, position_qty);
+            let held = self.state.positions.get(symbol).qty;
+            let selling = working_sells.get(&symbol).copied().unwrap_or(Decimal::ZERO);
+            let inputs = self.gate_inputs(symbol, held + working_qty, held - selling);
             let context = DecisionContext {
                 strategy_version_id: self.config.strategy_version_id,
                 symbol,
@@ -390,7 +475,19 @@ where
         // risk gate before it is sent. `running_gross` starts from the held book and grows with
         // every buy that may have gone out, so buys in one rebalance cannot together exceed the
         // exposure cap.
-        let mut running_gross = gross_exposure(&decided);
+        // A position in a symbol outside the universe is exposure this trader cannot price or
+        // reduce, so the total is unknown and buys fail the exposure rule.
+        let outside_universe = self
+            .state
+            .positions
+            .quantities()
+            .iter()
+            .any(|(symbol, qty)| !qty.is_zero() && !self.windows.contains_key(symbol));
+        let mut running_gross = if outside_universe {
+            None
+        } else {
+            gross_exposure(&decided)
+        };
         for (id, decision, inputs) in &decided {
             if decision.intended_qty < Decimal::ZERO {
                 self.send_checked(*id, decision, inputs, &facts, &mut running_gross, &mut out)
@@ -408,10 +505,16 @@ where
 
     /// The risk gate's inputs for one symbol: its position and its window's last close and
     /// daily variance (both absent when the window has no bar).
-    fn gate_inputs(&self, symbol: Symbol, position_qty: Decimal) -> GateInputs {
+    fn gate_inputs(
+        &self,
+        symbol: Symbol,
+        position_qty: Decimal,
+        sellable_qty: Decimal,
+    ) -> GateInputs {
         let stats = self.windows.get(&symbol).and_then(|w| w.stats.stats());
         GateInputs {
             position_qty,
+            sellable_qty,
             reference_px: stats.map(|s| s.close),
             var_daily: stats.and_then(|s| s.var_daily),
         }
@@ -441,7 +544,7 @@ where
             qty,
             reference_px: inputs.reference_px,
             var_daily: inputs.var_daily,
-            position_qty: inputs.position_qty,
+            sellable_qty: inputs.sellable_qty,
             equity: facts.equity,
             gross_exposure: *running_gross,
             data_age_nanos: facts.data_age_nanos,
@@ -465,6 +568,8 @@ where
             report.orders_blocked += 1;
             return Ok(());
         }
+        // The checks are on record before the order exists anywhere else.
+        self.flush().await?;
         let may_hold_exposure = self.send(decision_id, decision, report).await?;
         if may_hold_exposure && side == OrderSide::Buy {
             *running_gross = running_gross
@@ -478,17 +583,25 @@ where
     /// order sent earlier and not yet filled (a market order queued for the next open, an
     /// order whose outcome is unknown). Counting them as held is what stops a second
     /// rebalance before the fill from ordering the same shares again.
-    fn working_quantities(&self) -> BTreeMap<Symbol, Decimal> {
+    ///
+    /// The second map is the unfilled remainder of the sell orders alone, unsigned: shares
+    /// already promised to a sell, which another sell must not count on.
+    fn working_quantities(&self) -> (BTreeMap<Symbol, Decimal>, BTreeMap<Symbol, Decimal>) {
         let mut working: BTreeMap<Symbol, Decimal> = BTreeMap::new();
+        let mut sells: BTreeMap<Symbol, Decimal> = BTreeMap::new();
         for order in self.state.tracker.unresolved_orders() {
             let remaining = order.intent.qty.as_decimal() - order.cum_filled_qty.as_decimal();
+            let symbol = order.intent.symbol;
             let signed = match order.intent.side {
-                OrderSide::Sell => -remaining,
-                _ => remaining,
+                OrderSide::Sell => {
+                    *sells.entry(symbol).or_insert(Decimal::ZERO) += remaining;
+                    -remaining
+                }
+                OrderSide::Buy => remaining,
             };
-            *working.entry(order.intent.symbol).or_insert(Decimal::ZERO) += signed;
+            *working.entry(symbol).or_insert(Decimal::ZERO) += signed;
         }
-        working
+        (working, sells)
     }
 
     /// The features one decision is made from, for `symbol`. The symbol's close, history and

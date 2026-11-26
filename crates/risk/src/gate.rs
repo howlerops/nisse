@@ -4,7 +4,9 @@
 use nisse_core::nautilus::OrderSide;
 use rust_decimal::{Decimal, MathematicalOps, RoundingStrategy};
 
-use crate::{DayTradeTracker, DrawdownMode, DrawdownState, Limits};
+use nisse_core::{RiskEvent, RiskEventKind};
+
+use crate::{DayTradeTracker, DrawdownMode, DrawdownState, Limits, RiskError};
 
 /// The rule names stored in `risk_check.rule`, in evaluation order.
 pub mod rule {
@@ -38,6 +40,31 @@ pub struct RiskState {
     pub kill_switch_engaged: bool,
 }
 
+impl RiskState {
+    /// The state after `events` (every `risk_event` row, in id order): the drawdown state
+    /// from [`DrawdownState::restore`], and the kill switch from the newest `kill_switch`
+    /// event. An event that cannot be read is `InvalidEvent`: the state is unknown and the
+    /// caller must not trade.
+    pub fn restore(events: &[RiskEvent]) -> Result<Self, RiskError> {
+        let mut kill_switch_engaged = false;
+        for event in events {
+            if event.kind == RiskEventKind::KillSwitch {
+                kill_switch_engaged = event
+                    .detail
+                    .get("engaged")
+                    .and_then(serde_json::Value::as_bool)
+                    .ok_or_else(|| {
+                        RiskError::InvalidEvent("kill_switch: engaged must be a boolean".to_owned())
+                    })?;
+            }
+        }
+        Ok(Self {
+            drawdown: DrawdownState::restore(events)?,
+            kill_switch_engaged,
+        })
+    }
+}
+
 /// What the gate is told about one order. Everything is as of just before the order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrderCheck {
@@ -48,8 +75,10 @@ pub struct OrderCheck {
     pub reference_px: Option<Decimal>,
     /// Variance of the symbol's daily returns. `None` when there is not enough history.
     pub var_daily: Option<Decimal>,
-    /// Signed shares held plus the unfilled remainder of the engine's own open orders.
-    pub position_qty: Decimal,
+    /// Shares a sell may reduce: the filled, broker-confirmed position minus the unfilled
+    /// remainder of the engine's own open sell orders. Shares that are only on order (an
+    /// unfilled buy) are NOT counted: selling against them could leave the account short.
+    pub sellable_qty: Decimal,
     pub equity: Decimal,
     /// `Σ |held + working| × last close` over the universe. `None` when a held symbol has no
     /// close, so the figure is unknown.
@@ -154,7 +183,7 @@ impl RiskGate {
     pub fn check(&self, order: &OrderCheck) -> GateVerdict {
         let limits = &self.limits;
         let state = &self.state;
-        let held = order.position_qty.max(Decimal::ZERO);
+        let held = order.sellable_qty.max(Decimal::ZERO);
         let mut checks = Vec::with_capacity(rule::ALL.len());
         checks.push(kill_switch(state, limits, order, held));
         checks.push(account_blocked(order));
@@ -404,7 +433,7 @@ mod tests {
             qty: d("100"),
             reference_px: Some(d("100")),
             var_daily: Some(d("0.0001")),
-            position_qty: Decimal::ZERO,
+            sellable_qty: Decimal::ZERO,
             equity: d("1000000"),
             gross_exposure: Some(Decimal::ZERO),
             data_age_nanos: Some(0),
@@ -419,7 +448,7 @@ mod tests {
         OrderCheck {
             side: OrderSide::Sell,
             qty: d(qty),
-            position_qty: d(position),
+            sellable_qty: d(position),
             ..buy()
         }
     }
@@ -1080,7 +1109,7 @@ mod tests {
     fn an_overflowing_quantity_sell_is_still_evaluated_without_panicking() {
         let mut order = sell("0", "0");
         order.qty = Decimal::MAX;
-        order.position_qty = Decimal::MAX;
+        order.sellable_qty = Decimal::MAX;
         let verdict = check(&gate(), &order);
         assert!(verdict.approved());
         assert_eq!(verdict.checks.len(), 8);
@@ -1134,5 +1163,56 @@ mod tests {
         let mut halved = gate_in(DrawdownMode::Halved);
         halved.set_kill_switch(true);
         assert_eq!(halved.risk_scale(), d("0.5"));
+    }
+
+    fn event(kind: RiskEventKind, detail: serde_json::Value) -> RiskEvent {
+        RiskEvent {
+            kind,
+            detail,
+            ts: nisse_core::nautilus::UnixNanos::from(1_u64),
+        }
+    }
+
+    #[test]
+    fn risk_state_restores_the_newest_kill_switch_and_the_drawdown() {
+        use serde_json::json;
+        assert_eq!(RiskState::restore(&[]).unwrap(), RiskState::default());
+        let events = [
+            event(RiskEventKind::EquityPeak, json!({"peak": "100"})),
+            event(
+                RiskEventKind::KillSwitch,
+                json!({"engaged": true, "by": "a"}),
+            ),
+            event(
+                RiskEventKind::DrawdownMode,
+                json!({"mode": "halved", "equity": "90"}),
+            ),
+            event(RiskEventKind::LimitsLoaded, json!({"hash": "00"})),
+        ];
+        let state = RiskState::restore(&events).unwrap();
+        assert!(state.kill_switch_engaged);
+        assert_eq!(state.drawdown.mode, DrawdownMode::Halved);
+        assert_eq!(state.drawdown.peak, Some(Decimal::from(100)));
+
+        let mut released = events.to_vec();
+        released.push(event(RiskEventKind::KillSwitch, json!({"engaged": false})));
+        assert!(!RiskState::restore(&released).unwrap().kill_switch_engaged);
+    }
+
+    #[test]
+    fn risk_state_restore_refuses_an_unreadable_event() {
+        use serde_json::json;
+        for detail in [json!({}), json!({"engaged": "yes"})] {
+            let events = [event(RiskEventKind::KillSwitch, detail)];
+            assert!(matches!(
+                RiskState::restore(&events),
+                Err(RiskError::InvalidEvent(_))
+            ));
+        }
+        let bad_peak = [event(RiskEventKind::EquityPeak, json!({"peak": 1}))];
+        assert!(matches!(
+            RiskState::restore(&bad_peak),
+            Err(RiskError::InvalidEvent(_))
+        ));
     }
 }

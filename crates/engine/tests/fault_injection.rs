@@ -305,8 +305,10 @@ fn limits() -> nisse_risk::Limits {
     .unwrap()
 }
 
+/// A clock just after the test bars (days 0 to 8), so the newest bar has a known, small
+/// age. Tests about stale data move it themselves.
 fn clock() -> ManualClock {
-    ManualClock::new(UnixNanos::from(1_000_u64))
+    ManualClock::new(UnixNanos::from(9 * 86_400_000_000_000_u64))
 }
 
 /// A trader over the given universe (sorted here), with a simulated broker, decisions and
@@ -932,7 +934,7 @@ async fn c3_recovery_to_a_new_high_does_not_leave_flat() {
         qty: d("10"),
         reference_px: Some(d("100")),
         var_daily: Some(d("0.0001")),
-        position_qty: Decimal::ZERO,
+        sellable_qty: Decimal::ZERO,
         equity: d("120000"),
         gross_exposure: Some(Decimal::ZERO),
         data_age_nanos: Some(0),

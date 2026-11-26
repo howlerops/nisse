@@ -128,6 +128,17 @@ impl Limits {
             self.portfolio_vol >= d(5, 2) && self.portfolio_vol <= d(5, 1),
             "must be between 0.05 and 0.5",
         )?;
+        // The three together set the exposure cap, so the cap itself has a ceiling: each
+        // field at its own ceiling would otherwise allow ten times equity.
+        let leverage = self
+            .kelly_fraction
+            .checked_mul(self.haircut_sharpe)
+            .and_then(|product| product.checked_div(self.portfolio_vol));
+        check(
+            "haircut_sharpe",
+            leverage.is_some_and(|leverage| leverage <= d(15, 1)),
+            "kelly_fraction x haircut_sharpe / portfolio_vol (the exposure cap) must be at most 1.5",
+        )?;
         check(
             "drawdown_resume",
             self.drawdown_resume > zero,
@@ -322,6 +333,18 @@ mod tests {
         for (name, value) in cases {
             rejects(&with(name, value), name);
         }
+    }
+
+    #[test]
+    fn the_exposure_cap_itself_has_a_ceiling() {
+        // Each field is inside its own range, but together they would allow 10x equity.
+        let mut json = default_json();
+        json["haircut_sharpe"] = json!("2");
+        json["portfolio_vol"] = json!("0.05");
+        rejects(&json, "haircut_sharpe");
+        // 0.25 x 0.54 / 0.09 = 1.5 exactly: accepted. One step more is not.
+        assert!(Limits::from_json(&with("haircut_sharpe", json!("0.54"))).is_ok());
+        rejects(&with("haircut_sharpe", json!("0.541")), "haircut_sharpe");
     }
 
     #[test]

@@ -253,6 +253,11 @@ pub trait RecordSink: Send + Sync {
     type Error: std::error::Error + Send + Sync + 'static;
 
     fn emit(&self, record: StoreRecord) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Waits until every record emitted so far is durably written. Used where what happens
+    /// next must not outrun the record of why: the risk checks before an order goes out, a
+    /// kill switch, a drawdown mode change.
+    fn flush(&self) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
 /// Where the kill switch is read from. A caller that gets an error must treat the switch as

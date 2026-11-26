@@ -83,6 +83,11 @@ impl RecordSink for MemoryStore {
         self.lock().records.push(record);
         Ok(())
     }
+
+    /// Nothing is queued: a record is stored when `emit` returns.
+    async fn flush(&self) -> Result<(), MemoryStoreError> {
+        Ok(())
+    }
 }
 
 // The engine holds one store and hands it out three times; references implement the traits
@@ -108,6 +113,10 @@ impl RecordSink for &MemoryStore {
 
     async fn emit(&self, record: StoreRecord) -> Result<(), MemoryStoreError> {
         (**self).emit(record).await
+    }
+
+    async fn flush(&self) -> Result<(), MemoryStoreError> {
+        (**self).flush().await
     }
 }
 

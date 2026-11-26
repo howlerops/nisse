@@ -203,4 +203,8 @@ impl RecordSink for StoreWriter {
             .await
             .map_err(|_| StoreError::WriterStopped)
     }
+
+    async fn flush(&self) -> Result<(), StoreError> {
+        Self::flush(self).await
+    }
 }

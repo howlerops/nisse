@@ -9,15 +9,18 @@ pub const DAY_NANOS: u64 = 86_400_000_000_000;
 /// The window day trades are counted over: 7 calendar days, which always covers 5 sessions.
 pub const WINDOW_DAYS: u64 = 7;
 
-/// Which sides of each symbol filled on which UTC day, and the day trades that made.
+/// How many buy fills and sell fills each symbol had on each UTC day, and the day trades
+/// that made.
 ///
-/// A day trade is counted once per symbol per day, the first time the symbol has both a buy
-/// fill and a sell fill on that day.
+/// The day trades of a symbol on a day are the smaller of its buy fills and its sell fills:
+/// buy, sell, buy, sell is two. An order filled in several parts counts once per part, so
+/// the figure can overstate the broker's count and never understates it. The caller must
+/// record each fill once (a redelivered message is not a new fill).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DayTradeTracker {
-    /// `(day, symbol)` → `(bought, sold)` on that day. Days older than the window are
-    /// dropped as new fills arrive.
-    sides: BTreeMap<(u64, Symbol), (bool, bool)>,
+    /// `(day, symbol)` → `(buy fills, sell fills)` on that day. Days older than the window
+    /// are dropped as new fills arrive.
+    sides: BTreeMap<(u64, Symbol), (u32, u32)>,
 }
 
 impl DayTradeTracker {
@@ -29,14 +32,12 @@ impl DayTradeTracker {
     /// Records one fill. Entries older than the window (relative to this fill's day) are
     /// removed, so the map stays small.
     pub fn record_fill(&mut self, symbol: Symbol, side: OrderSide, ts: UnixNanos) {
-        let (bought, sold) = match side {
-            OrderSide::Buy => (true, false),
-            OrderSide::Sell => (false, true),
-        };
         let day = day_of(ts);
-        let entry = self.sides.entry((day, symbol)).or_insert((false, false));
-        entry.0 |= bought;
-        entry.1 |= sold;
+        let entry = self.sides.entry((day, symbol)).or_insert((0, 0));
+        match side {
+            OrderSide::Buy => entry.0 = entry.0.saturating_add(1),
+            OrderSide::Sell => entry.1 = entry.1.saturating_add(1),
+        }
 
         // Prune relative to the newest day seen, so an out-of-order fill never removes newer
         // data. The map is ordered by day, so its newest day is the last key.
@@ -49,17 +50,16 @@ impl DayTradeTracker {
         self.sides.retain(|&(d, _), _| d >= oldest_kept);
     }
 
-    /// Whether an order on `side` for `symbol`, filled on the day of `now`, would complete a
-    /// day trade that is not already counted: the opposite side has filled that day and this
-    /// side has not.
+    /// Whether an order on `side` for `symbol`, filled on the day of `now`, would complete
+    /// another day trade: the opposite side has more fills that day than this side.
     #[must_use]
     pub fn would_day_trade(&self, symbol: Symbol, side: OrderSide, now: UnixNanos) -> bool {
         let Some(&(bought, sold)) = self.sides.get(&(day_of(now), symbol)) else {
             return false;
         };
         match side {
-            OrderSide::Buy => sold && !bought,
-            OrderSide::Sell => bought && !sold,
+            OrderSide::Buy => sold > bought,
+            OrderSide::Sell => bought > sold,
         }
     }
 
@@ -68,16 +68,15 @@ impl DayTradeTracker {
     pub fn count_in_window(&self, now: UnixNanos) -> u32 {
         let today = day_of(now);
         let oldest = window_start(today);
-        let count = self
-            .sides
+        self.sides
             .iter()
-            .filter(|&(&(d, _), &(bought, sold))| d >= oldest && d <= today && bought && sold)
-            .count();
-        u32::try_from(count).unwrap_or(u32::MAX)
+            .filter(|&(&(d, _), _)| d >= oldest && d <= today)
+            .fold(0_u32, |count, (_, &(bought, sold))| {
+                count.saturating_add(bought.min(sold))
+            })
     }
 }
 
-/// The UTC day number of `ts`.
 fn day_of(ts: UnixNanos) -> u64 {
     ts.as_u64() / DAY_NANOS
 }
@@ -229,5 +228,23 @@ mod tests {
         assert_eq!(t.count_in_window(late_day_10), 0);
         assert_eq!(t.count_in_window(day_11_start), 0);
         assert!(!t.would_day_trade(aaa(), OrderSide::Sell, day_11_start));
+    }
+
+    #[test]
+    fn two_round_trips_in_one_symbol_on_one_day_count_two() {
+        let mut t = DayTradeTracker::new();
+        for (side, hour) in [
+            (OrderSide::Buy, 10),
+            (OrderSide::Sell, 11),
+            (OrderSide::Buy, 12),
+        ] {
+            t.record_fill(aaa(), side, ts(10, hour));
+        }
+        assert_eq!(t.count_in_window(ts(10, 13)), 1);
+        // The open buy can be closed again today: that would be the second day trade.
+        assert!(t.would_day_trade(aaa(), OrderSide::Sell, ts(10, 13)));
+        assert!(!t.would_day_trade(aaa(), OrderSide::Buy, ts(10, 13)));
+        t.record_fill(aaa(), OrderSide::Sell, ts(10, 14));
+        assert_eq!(t.count_in_window(ts(10, 15)), 2);
     }
 }

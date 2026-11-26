@@ -30,7 +30,7 @@ order.
 | `max_risk_per_trade` | `"0.005"` | > 0 and ≤ 0.005 |
 | `risk_sigmas` | `"2"` | ≥ 1 and ≤ 10 |
 | `kelly_fraction` | `"0.25"` | > 0 and ≤ 0.25 |
-| `haircut_sharpe` | `"0.4"` | > 0 and ≤ 2 |
+| `haircut_sharpe` | `"0.4"` | > 0 and ≤ 2, and `kelly_fraction × haircut_sharpe / portfolio_vol` (the exposure cap) ≤ 1.5 |
 | `portfolio_vol` | `"0.09"` | ≥ 0.05 and ≤ 0.5 |
 | `drawdown_halve` | `"0.10"` | > `drawdown_resume` and ≤ 0.10 |
 | `drawdown_flat` | `"0.15"` | > `drawdown_halve` and ≤ 0.20 |
@@ -48,7 +48,7 @@ result.
 
 Every rule is evaluated for every order, in this order, and each produces one `risk_check`
 row (`rule`, `limit_value`, `actual_value`, `passed`). The order goes out only if all pass.
-A "reducing sell" is a sell with `qty ≤ max(position_qty, 0)`. `-1` as `actual_value` means
+A "reducing sell" is a sell with `0 < qty ≤ max(sellable_qty, 0)`, where `sellable_qty` is the filled position minus the engine's own unfilled sells. Shares that are only on order (an unfilled buy) are not sellable: a sell against them could leave the account short. `-1` as `actual_value` means
 "could not be computed", which always fails.
 
 | # | Rule | Passes when | `limit_value` | `actual_value` |
@@ -57,7 +57,7 @@ A "reducing sell" is a sell with `qty ≤ max(position_qty, 0)`. `-1` as `actual
 | 2 | `account_blocked` | the broker does not report the account blocked | 0 | 1 if blocked else 0 |
 | 3 | `drawdown_flat` | a sell, or mode is not `flat` | `drawdown_flat` | current drawdown (0 when no peak yet) |
 | 4 | `stale_data` | a sell, or the newest bar's age is known and ≤ `max_bar_age_hours` | the limit in seconds | age in whole seconds, or -1 |
-| 5 | `no_short` | a buy, or a reducing sell | `max(position_qty, 0)` | sell quantity (0 for a buy) |
+| 5 | `no_short` | a buy, or a reducing sell | `max(sellable_qty, 0)` | sell quantity (0 for a buy) |
 | 6 | `risk_per_trade` | a sell, or `qty × px × risk_sigmas × sqrt(var_daily) ≤ max_risk_per_trade × equity` with `px`, `var_daily` present, `px > 0`, `var_daily ≥ 0`, `equity > 0` | `max_risk_per_trade × equity` | the risk in dollars, or -1 (0 for a sell) |
 | 7 | `kelly_exposure` | a sell, or `(gross_exposure + qty × px) / equity ≤ kelly_fraction × haircut_sharpe / portfolio_vol × scale` (scale 1, 0.5 or 0 by mode) | the cap | the ratio, or -1 (the ratio before the order for a sell) |
 | 8 | `day_trade_limit` | the order would not complete a day trade, or `day_trades_in_window + 1 ≤ max_day_trades` | `max_day_trades` | the count after the order |
@@ -95,7 +95,23 @@ square root is `rust_decimal`'s decimal square root (no `f64`).
   and not sent. Data age is `clock.now() − newest bar time` (unknown when there is no bar).
   Gross exposure is `Σ |held + working| × last close` over the universe; a symbol with a
   position and no close makes it unknown, which fails `kelly_exposure` for buys.
-- `Trader::on_order_update` records fills in the day-trade tracker.
+- `Trader::on_order_update` records fills in the day-trade tracker (only a fill that moved the
+  order's filled quantity; a redelivered message is not a new fill). After a restart the caller
+  feeds the last seven days of fills back with `Trader::record_past_fill`
+  (`Store::recent_fill_sides`).
+- Durability: `RecordSink::flush` is awaited after a kill-switch event, after a drawdown mode
+  change, and after an approved order's eight checks, before the order is submitted. A kill
+  switch engaged in the process is never lowered by `refresh_kill_switch`; only
+  `release_kill_switch` (a person's decision) lowers it.
+- Flat means the strategy's target is zero, and exits go through ordinary decisions. A symbol
+  the strategy cannot decide for (no current bar, not enough history) or whose buy is still
+  unfilled stays held; `Trader::needs_flatten` reports that, and `run_backtest` rebalances
+  every session while it is true.
+- A position in a symbol outside the universe makes gross exposure unknown, which fails
+  `kelly_exposure` for buys.
+- `day_trade_limit` can block an exit on the day of a buy fill when the count is at its
+  maximum. That is deliberate (a pattern-day-trade flag restricts the whole account) and is
+  **the owner's to confirm**.
 - `run_backtest` calls `observe_equity` every session and rebalances at once (same close)
   when the mode steps down, besides the month-end rebalance. `BacktestConfig` gains `limits`.
 
@@ -121,8 +137,8 @@ square root is `rust_decimal`'s decimal square root (no `f64`).
 
 Per bar nothing changes (`Trader::on_bar`). Per order: `RiskGate::check`, eight rules, a
 handful of decimal operations and one decimal square root, one small `Vec` of results. It runs
-a few times a month; no bench, but it must not allocate per rule beyond the result vector
-(rule names are `&'static str`).
+a few times a month; no bench. The gate itself allocates only the result vector (rule names
+are `&'static str`); the trader copies each name into its `risk_check` row.
 
 ## Not in this phase
 
