@@ -6,7 +6,7 @@ A deterministic Rust engine (built on NautilusTrader crates) trades through Alpa
 
 ## Status
 
-**Phase 2 (decision store).** The workspace, CI, store schema, Alpaca adapter, decision store and replay job exist. The adapter is tested against a local mock server and the store against a real Postgres; the adapter's paper round-trip tests are run by the owner (see [`docs/runbooks/paper-tests.md`](docs/runbooks/paper-tests.md)). There is no strategy and no running engine process yet. See [PLAN.md](PLAN.md) for the build plan and the GitHub issues for per-phase work.
+**Phase 3 (first strategy and backtest).** The workspace, CI, store schema, Alpaca adapter, decision store, replay job, a first strategy (monthly ETF trend with volatility targeting; rationale in [`docs/research/trend-v1-rationale.md`](docs/research/trend-v1-rationale.md)) and a backtest that runs through the same trading loop as live exist. Every backtest registers a trial. The adapter is tested against a local mock server and the store against a real Postgres; the adapter's paper round-trip tests and the bar download (`nisse-ingest`) need Alpaca credentials and are run by the owner (see [`docs/runbooks/paper-tests.md`](docs/runbooks/paper-tests.md)). No backtest on real data has been run yet, there is no risk gate and no running engine process. See [PLAN.md](PLAN.md) for the build plan and the GitHub issues for per-phase work.
 
 ## Layout
 
@@ -17,7 +17,8 @@ A deterministic Rust engine (built on NautilusTrader crates) trades through Alpa
 | `crates/risk` | Risk gate and kill switch |
 | `crates/alpaca-adapter` | Alpaca data and execution adapter |
 | `crates/store` | Append-only Postgres decision store |
-| `crates/eval` | Nightly evaluation jobs and promotion gates |
+| `crates/bars` | Daily bars in Parquet files, written and read through DuckDB |
+| `crates/eval` | Replay and backtest jobs; nightly evaluation and promotion gates later |
 | `migrations/` | Store schema as plain SQL, with tests in `migrations/tests/` |
 
 ## Development

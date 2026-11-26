@@ -66,6 +66,7 @@ Store every decision, not just every fill. Rank strategy versions, not individua
 |---|---|
 | `strategy_version` | id, git_sha, config_hash, params, parent_id |
 | `trial_registry` | strategy_version_id, kind [backtest \| shadow \| live], data_range, result |
+| `trial_result` | trial_id (unique), result, event_ts |
 | `decision` | event_ts, strategy_version_id, symbol, action [enter \| exit \| hold \| skip], intended_qty, expected_edge_bps, expected_vol, features, feature_hash, data_snapshot_id, rng_seed, reason_code |
 | `market_snapshot` | event_ts, symbol, bid, ask, mid, spread_bps, adv, vol, regime_tag |
 | `order_event` | decision_id, client_order_id, broker_order_id, event_ts, state, type, limit_px, qty, symbol, side, time_in_force, cum_filled_qty |
@@ -75,7 +76,7 @@ Store every decision, not just every fill. Rank strategy versions, not individua
 | `eval_score` | subject_id, subject_type, metric, value, eval_version |
 | `risk_check` | decision_id, rule, limit_value, actual_value, passed |
 
-Every table also has `id` and `ingest_ts`. `order_event.client_order_id` is written with the intent row before submission, when `broker_order_id` is still unknown; fills refer to their order by `client_order_id`. Column types and constraints are in [`docs/phases/phase-0.md`](docs/phases/phase-0.md).
+Every table also has `id` and `ingest_ts`. `order_event.client_order_id` is written with the intent row before submission, when `broker_order_id` is still unknown; fills refer to their order by `client_order_id`. Column types and constraints are in [`docs/phases/phase-0.md`](docs/phases/phase-0.md). A trial is registered in `trial_registry` before its run starts, so a run that crashes still counts; its outcome is a later row in `trial_result` (added in Phase 3, because rows are never updated).
 
 **Nightly replay test:** rerunning a decision from its features, config hash and seed on the recorded git SHA must reproduce the same action. A strategy's decision is a pure function of its features (which include the current position), its parameters and the seed; `scripts/replay.sh` replays every decision made by the build at HEAD and writes a `replay_match` score per decision. Timestamps are stored to the microsecond.
 
