@@ -3,7 +3,7 @@
 # decisions that this checkout cannot replay.
 #
 # The binary replays only decisions whose strategy version carries its own git SHA. For every
-# other SHA in `strategy_version` this script prints a notice and cannot replay it: building
+# other SHA that has decisions (a version with none has nothing to replay) this script prints a notice and cannot replay it: building
 # those commits and running the replay from each checkout is deployment work for a later phase
 # (Phase 6). Until then a skipped SHA fails the run, because "replay passed" must never mean
 # "nothing was replayed".
@@ -22,7 +22,8 @@ skipped=0
 
 # Captured first so a failing psql stops the script (process substitution would hide it).
 shas="$(psql "$DATABASE_URL" -X -q -At -v ON_ERROR_STOP=1 \
-  -c "SELECT DISTINCT git_sha FROM strategy_version ORDER BY 1")"
+  -c "SELECT DISTINCT v.git_sha FROM strategy_version v
+      JOIN decision d ON d.strategy_version_id = v.id ORDER BY 1")"
 while IFS= read -r sha; do
   [[ -z "$sha" || "$sha" == "$head" ]] && continue
   echo "replay: decisions exist for build $sha; replay them from a checkout of that commit" >&2

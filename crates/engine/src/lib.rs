@@ -34,7 +34,8 @@ pub use decide::{DecisionContext, ReplayOutcome, decide, decide_and_record, repl
 pub use error::{BoxError, EngineError};
 pub use gateway::{OrderGateway, Submitted};
 pub use order_service::{
-    OrderBookState, reconcile_and_record, record_stream_update, submit_and_record,
+    OrderBookState, reconcile_and_record, record_stream_update, replace_and_record,
+    submit_and_record,
 };
 pub use order_tracker::{Applied, OrderTracker, TrackedOrder};
 pub use positions::{Position, PositionBook};

@@ -69,6 +69,16 @@ pub struct SyncReport {
     pub unrepresentable_at_broker: u32,
 }
 
+impl SyncReport {
+    /// Whether every order's state is now known. `false` when any order could not be
+    /// reconciled (a failed lookup, inconsistent broker figures): the engine must not decide
+    /// on top of that, even though the pass itself returned `Ok`.
+    #[must_use]
+    pub fn is_reconciled(&self) -> bool {
+        self.problems.is_empty()
+    }
+}
+
 /// Reconciles `tracker` and `local_positions` with the broker, which is the source of truth.
 ///
 /// 1. Fetch the broker's open orders and positions.

@@ -711,3 +711,164 @@ async fn an_unknown_submit_outcome_records_nothing() {
     assert!(matches!(err, EngineError::OrderOutcomeUnknown { .. }));
     assert!(sink.records().is_empty());
 }
+
+// Regression tests for the second Phase 2 review pass.
+
+#[tokio::test]
+async fn an_intent_that_could_not_be_recorded_writes_no_order_row() {
+    // The order has no intent row of its own, so a `rejected` row would be an orphan, or
+    // (for a reused id) would land on another order's history.
+    let log = support::new_call_log();
+    let broker = FakeBroker::new(std::sync::Arc::clone(&log));
+    let intents = support::MemoryIntentLog::new(log);
+    intents.fail_with("duplicate key value violates unique constraint");
+    let gateway = nisse_engine::OrderGateway::new(broker, intents);
+    let i = intent("nisse-1-0", "10", Some("500.10"));
+    let mut state = OrderBookState::default();
+    let sink = MemorySink::new();
+
+    let err = nisse_engine::submit_and_record(&gateway, &mut state, &sink, &i)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::IntentNotRecorded { .. }));
+    assert!(sink.records().is_empty(), "nothing is written for it");
+}
+
+#[tokio::test]
+async fn replace_outcomes_are_recorded_like_submit_outcomes() {
+    let log = support::new_call_log();
+    let broker = FakeBroker::new(std::sync::Arc::clone(&log));
+    let original = intent("nisse-1-0", "10", Some("500.10"));
+    let partly_filled = intent("nisse-1-1", "10", Some("499.90"));
+    let refused = intent("nisse-1-2", "10", Some("499.80"));
+    // The first replacement comes back already partly filled; the second is refused.
+    broker.push_replace_result(Ok(snapshot(
+        &partly_filled,
+        OrderState::PartiallyFilled,
+        "4",
+        Some("499.85"),
+    )));
+    broker.push_replace_result(Err(nisse_core::SubmitError::Rejected(support::FakeError(
+        "order is not replaceable".to_owned(),
+    ))));
+    let gateway = nisse_engine::OrderGateway::new(broker, support::MemoryIntentLog::new(log));
+    let mut state = OrderBookState::default();
+    let sink = MemorySink::new();
+    nisse_engine::submit_and_record(&gateway, &mut state, &sink, &original)
+        .await
+        .unwrap();
+    let before = sink.records().len();
+
+    let replaced = nisse_engine::replace_and_record(
+        &gateway,
+        &mut state,
+        &sink,
+        cid("nisse-1-0"),
+        &partly_filled,
+    )
+    .await
+    .unwrap();
+    let fill = replaced.applied.fill.unwrap();
+    let records = sink.records();
+    assert_eq!(
+        records.len(),
+        before + 2,
+        "the order row with its fill, then the position"
+    );
+    assert!(
+        matches!(&records[before], StoreRecord::Order { event, fill: Some(f) }
+        if event.client_order_id == cid("nisse-1-1")
+            && event.state == OrderState::PartiallyFilled
+            && *f == fill)
+    );
+    assert_eq!(state.positions.get(spy()).qty, dec("4"));
+
+    let err =
+        nisse_engine::replace_and_record(&gateway, &mut state, &sink, cid("nisse-1-1"), &refused)
+            .await
+            .unwrap_err();
+    assert!(matches!(err, EngineError::OrderRejected { .. }));
+    let last = sink.records().last().cloned().unwrap();
+    assert!(matches!(last, StoreRecord::Order { event, fill: None }
+        if event.client_order_id == cid("nisse-1-2") && event.state == OrderState::Rejected));
+}
+
+#[tokio::test]
+async fn a_pass_with_a_failed_lookup_is_not_reconciled() {
+    let i = intent("nisse-1-0", "10", Some("500.10"));
+    let mut state = OrderBookState::default();
+    state.tracker.track_intent(i).unwrap();
+    let broker = broker();
+    broker.fail_lookups("timeout");
+    let sink = MemorySink::new();
+    let report = reconcile_and_record(&broker, &mut state, &sink, &clock(), opts(0))
+        .await
+        .unwrap();
+    assert!(
+        !report.is_reconciled(),
+        "the engine must not decide on this"
+    );
+    assert!(nisse_engine::SyncReport::default().is_reconciled());
+}
+
+#[tokio::test]
+async fn a_restored_never_arrived_order_is_still_looked_up_and_its_fill_found() {
+    // What `load_live` returns after a restart for an order that was judged never-arrived:
+    // rejected, with no broker id.
+    let i = intent("nisse-1-0", "10", Some("500.10"));
+    let mut state = OrderBookState::default();
+    state
+        .tracker
+        .restore_all(&[nisse_core::RestoredOrder {
+            intent: i,
+            venue_order_id: None,
+            state: OrderState::Rejected,
+            cum_filled_qty: nisse_core::nautilus::Quantity::from("0"),
+            avg_fill_px: None,
+            last_update_ts: at(5_000),
+        }])
+        .unwrap();
+    let restored = *state.tracker.get(cid("nisse-1-0")).unwrap();
+    assert_eq!(
+        restored.never_arrived_at,
+        Some(at(5_000)),
+        "the verdict is provisional"
+    );
+
+    // The broker had the order all along and filled it.
+    let broker = broker();
+    broker.insert_order(snapshot(&i, OrderState::Filled, "10", Some("500.05")));
+    let sink = MemorySink::new();
+    let report = reconcile_and_record(&broker, &mut state, &sink, &clock(), opts(0))
+        .await
+        .unwrap();
+    assert_eq!(report.fills.len(), 1);
+    assert_eq!(
+        state.tracker.get(cid("nisse-1-0")).unwrap().state,
+        OrderState::Filled
+    );
+
+    // An order restored with a broker id, or in any other state, is not provisional.
+    let mut other = OrderBookState::default();
+    let j = intent("nisse-2-0", "10", Some("500.10"));
+    let accepted = accepted_from(&j);
+    other
+        .tracker
+        .restore_all(&[nisse_core::RestoredOrder {
+            intent: j,
+            venue_order_id: Some(accepted.venue_order_id),
+            state: OrderState::Rejected,
+            cum_filled_qty: nisse_core::nautilus::Quantity::from("0"),
+            avg_fill_px: None,
+            last_update_ts: at(5_000),
+        }])
+        .unwrap();
+    assert_eq!(
+        other
+            .tracker
+            .get(cid("nisse-2-0"))
+            .unwrap()
+            .never_arrived_at,
+        None
+    );
+}

@@ -213,9 +213,15 @@ binary does.
 
 - **A failed lookup does not end a reconciliation pass.** It is a `SyncProblem` for that
   order; fills already applied in the pass are still reported and recorded.
-- **Gateway outcomes are recorded.** `submit_and_record` writes the row for what the broker
-  answered: an order that comes back already filled gets its fill and position recorded
-  (the later stream message carries no new quantity), and a rejection gets a `rejected` row.
+- **Gateway outcomes are recorded.** `submit_and_record` and `replace_and_record` write the
+  row for what the broker answered: an order that comes back already filled gets its fill
+  and position recorded (the later stream message carries no new quantity), and a broker
+  rejection gets a `rejected` row. When the intent itself could not be recorded nothing is
+  written: the order has no intent row, and for a reused id a `rejected` row would corrupt
+  another order's history.
+- **A pass with problems is not a reconciled state.** `SyncReport::is_reconciled()` is false
+  when any order could not be reconciled, even though the pass returned `Ok`. The engine loop
+  must not decide until it is true.
 - **Restart loading uses insertion order.** `order_event::load_live` takes an order's latest
   row by `id`, not `event_ts`: event times come from two clocks. Rows written by
   reconciliation carry the order's own last-update time, not the engine clock.
@@ -226,7 +232,8 @@ binary does.
 - **One intent row per client order id** (migration 0008, a partial unique index).
 - **`strategy_version::ensure` refuses a version whose `config_hash` is not the hash of its
   `params`.**
-- **`scripts/replay.sh` exits 3 when another build's decisions were skipped.** "Replay
+- **`scripts/replay.sh` exits 3 when another build's decisions were skipped** (builds that
+  have decisions; a strategy version with none has nothing to replay). "Replay
   passed" must not mean "nothing was replayed".
 - **`nisse_engine::build_is_replayable()`** is false for a dirty tree or an unknown commit; a
   trading process must refuse to start then (enforced when the engine binary exists).

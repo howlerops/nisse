@@ -18,6 +18,8 @@ fn main() {
 
     let is_sha = |s: &str| s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit());
     let from_env = std::env::var("NISSE_GIT_SHA").ok();
+    // The environment only vouches for the build when it supplied the SHA that is used.
+    let forced_clean = from_env.as_deref().is_some_and(is_sha);
     let from_git = Command::new("git")
         .args(["rev-parse", "HEAD"])
         .output()
@@ -41,7 +43,6 @@ fn main() {
         .ok()
         .filter(|out| out.status.success())
         .is_some_and(|out| out.stdout.is_empty());
-    let forced_clean = std::env::var("NISSE_GIT_SHA").is_ok();
     println!(
         "cargo:rustc-env=NISSE_GIT_DIRTY={}",
         if clean || forced_clean { "0" } else { "1" }

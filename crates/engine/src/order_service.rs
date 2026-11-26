@@ -80,8 +80,11 @@ pub async fn record_stream_update<K: RecordSink>(
 ///   the fill if there is one, and for a fill the position update and its
 ///   `StoreRecord::Position`. Without this a market order that comes back filled would never
 ///   get a fill row: the later stream message carries no new quantity.
-/// - definitely rejected, or the intent could not be recorded: one `StoreRecord::Order` with
-///   state `rejected`, so the store shows the order ended. The original error is returned.
+/// - definitely rejected by the broker: one `StoreRecord::Order` with state `rejected`, so
+///   the store shows the order ended. The original error is returned.
+/// - the intent could not be recorded: nothing is recorded. The order has no intent row of
+///   its own, so a `rejected` row would either be an orphan or, when the id was a reused one,
+///   land on top of another order's history.
 /// - outcome unknown: nothing is recorded; the order is still an intent and reconciliation
 ///   resolves it.
 ///
@@ -93,18 +96,49 @@ pub async fn submit_and_record<B: Broker, L: IntentLog, K: RecordSink>(
     sink: &K,
     intent: &OrderIntent,
 ) -> Result<Submitted, EngineError> {
-    match gateway.submit(&mut state.tracker, intent).await {
+    let result = gateway.submit(&mut state.tracker, intent).await;
+    record_outcome(state, sink, intent.client_order_id, result).await
+}
+
+/// Replaces a live order through the gateway and records what came back, exactly as
+/// [`submit_and_record`] does for the replacement order. The original order's own end
+/// (`replaced`) arrives from the broker through the stream or reconciliation.
+pub async fn replace_and_record<B: Broker, L: IntentLog, K: RecordSink>(
+    gateway: &OrderGateway<B, L>,
+    state: &mut OrderBookState,
+    sink: &K,
+    original: ClientOrderId,
+    replacement: &OrderIntent,
+) -> Result<Submitted, EngineError> {
+    let result = gateway
+        .replace(&mut state.tracker, original, replacement)
+        .await;
+    record_outcome(state, sink, replacement.client_order_id, result).await
+}
+
+/// Records the gateway's answer for the order `id`. Shared by submit and replace.
+async fn record_outcome<K: RecordSink>(
+    state: &mut OrderBookState,
+    sink: &K,
+    id: ClientOrderId,
+    result: Result<Submitted, EngineError>,
+) -> Result<Submitted, EngineError> {
+    match result {
         Ok(submitted) => {
-            let tracked = tracked_order(&state.tracker, intent.client_order_id)?;
+            let applied = submitted.applied;
+            if applied.state_change.is_none() && applied.fill.is_none() {
+                return Ok(submitted);
+            }
+            let tracked = tracked_order(&state.tracker, id)?;
             emit(
                 sink,
                 StoreRecord::Order {
                     event: order_row(&tracked, tracked.last_update_ts),
-                    fill: submitted.applied.fill,
+                    fill: applied.fill,
                 },
             )
             .await?;
-            if let Some(fill) = submitted.applied.fill {
+            if let Some(fill) = applied.fill {
                 let event = state.positions.apply_fill(
                     tracked.intent.symbol,
                     tracked.intent.side,
@@ -116,23 +150,16 @@ pub async fn submit_and_record<B: Broker, L: IntentLog, K: RecordSink>(
             }
             Ok(submitted)
         }
-        Err(
-            error @ (EngineError::OrderRejected { .. } | EngineError::IntentNotRecorded { .. }),
-        ) => {
-            let tracked = tracked_order(&state.tracker, intent.client_order_id)?;
-            // Best effort: when the intent could not be recorded the store is probably down,
-            // and the rejection that matters is the one returned to the caller.
-            let recorded = emit(
+        Err(error @ EngineError::OrderRejected { .. }) => {
+            let tracked = tracked_order(&state.tracker, id)?;
+            emit(
                 sink,
                 StoreRecord::Order {
                     event: order_row(&tracked, tracked.last_update_ts),
                     fill: None,
                 },
             )
-            .await;
-            if let Err(record_error) = recorded {
-                tracing::error!(error = %record_error, "could not record a rejected order");
-            }
+            .await?;
             Err(error)
         }
         Err(error) => Err(error),
@@ -234,7 +261,7 @@ pub async fn reconcile_and_record<B: Broker, K: RecordSink, C: Clock>(
         tracing::error!(
             client_order_id = %problem.client_order_id,
             reason = %problem.reason,
-            "broker snapshot could not be applied"
+            "order could not be reconciled"
         );
     }
     if report.unrepresentable_at_broker > 0 {
