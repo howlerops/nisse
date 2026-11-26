@@ -11,6 +11,11 @@ pub const OUTCOME_HORIZONS: [u32; 3] = [1, 5, 21];
 /// Sessions in the mean the regime compares the benchmark's close with.
 pub const REGIME_WINDOW: usize = 200;
 
+/// The oldest base bar a decision may be scored from, in nanoseconds: a decision is scored from
+/// the bar it was made on, so a base bar a day or more older means the decision's own bar is
+/// missing.
+pub const MAX_BASE_AGE_NANOS: u64 = 86_400_000_000_000;
+
 /// One daily bar of one symbol, as the scores need it. Series are sorted by `ts`, strictly
 /// increasing.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -58,9 +63,10 @@ impl Regime {
 }
 
 /// The outcome of a decision made at `decision_ts` over `horizon` sessions. `None` when it
-/// cannot be computed yet or at all: no symbol bar at or before the decision, fewer than
-/// `horizon` symbol bars after it, the benchmark lacking a bar at either end's timestamp, a
-/// non-positive or non-finite price, or `horizon == 0`.
+/// cannot be computed yet or at all: no symbol bar at or before the decision, a base bar (the
+/// last symbol bar at or before the decision) a day or more older than the decision
+/// ([`MAX_BASE_AGE_NANOS`]), fewer than `horizon` symbol bars after it, the benchmark lacking a
+/// bar at either end's timestamp, a non-positive or non-finite price, or `horizon == 0`.
 #[must_use]
 pub fn outcome(
     symbol_bars: &[BarPoint],
@@ -72,6 +78,10 @@ pub fn outcome(
         return None;
     }
     let t = index_at_or_before(symbol_bars, decision_ts)?;
+    let base_ts = symbol_bars.get(t)?.ts;
+    if decision_ts.as_u64().checked_sub(base_ts.as_u64())? >= MAX_BASE_AGE_NANOS {
+        return None;
+    }
     let sessions = usize::try_from(horizon).ok()?;
     let end = t.checked_add(sessions)?;
     if end >= symbol_bars.len() {
@@ -307,6 +317,40 @@ mod tests {
         let bench = series_from(1, &BENCH_CLOSES);
         assert!(outcome(&sym, &bench, at(0, 12), 1).is_none());
         assert!(outcome(&sym, &bench, at(0, 0), 1).is_none());
+    }
+
+    #[test]
+    fn base_bar_less_than_a_day_old_is_scored() {
+        let sym = symbol();
+        let bench = bench();
+
+        // 23 hours 59 minutes after the day 0 bar: still the decision's own session.
+        let just_under = UnixNanos::from(DAY_NANOS - 60_000_000_000);
+        let result = outcome(&sym, &bench, just_under, 1).expect("23h59m");
+        assert_close(result.fwd_ret, 0.02);
+    }
+
+    #[test]
+    fn base_bar_exactly_a_day_old_is_none() {
+        // Day 1 is missing, so a decision at day 1 00:00 is based on the day 0 bar, a day old.
+        let mut sym = symbol();
+        sym.remove(1);
+        let bench = bench();
+        assert!(outcome(&sym, &bench, at(1, 0), 1).is_none());
+        assert!(outcome(&sym, &bench, at(1, 0), 2).is_none());
+    }
+
+    #[test]
+    fn decision_day_missing_from_the_symbol_is_none() {
+        // Day 3 is missing, but days 4 and 5 exist: the decision must not be measured from day 2.
+        let mut sym = symbol();
+        sym.remove(3);
+        let bench = bench();
+        assert!(outcome(&sym, &bench, at(3, 12), 1).is_none());
+        assert!(outcome(&sym, &bench, at(3, 12), 2).is_none());
+        // Once the decision's own bar exists, the same series is scored from it.
+        let full = symbol();
+        assert!(outcome(&full, &bench, at(3, 12), 1).is_some());
     }
 
     #[test]
