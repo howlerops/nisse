@@ -1,7 +1,8 @@
 //! Alpaca trading REST client: the [`Broker`] implementation.
 
 use nisse_core::{
-    AccountSnapshot, Broker, BrokerOrder, BrokerPosition, OrderIntent, ReplaceRequest, SubmitError,
+    AccountSnapshot, Broker, BrokerOrder, BrokerPosition, OpenOrders, OrderIntent, ReplaceRequest,
+    SubmitError,
     nautilus::{ClientOrderId, VenueOrderId},
 };
 use reqwest::Method;
@@ -103,26 +104,31 @@ impl Broker for AlpacaTrading {
         }
     }
 
-    /// `GET /v2/orders?status=open&limit=500`. Orders of a kind this adapter never sends are
-    /// left out; any other undecodable order is an error.
-    async fn open_orders(&self) -> Result<Vec<BrokerOrder>, AdapterError> {
+    /// `GET /v2/orders?status=open&limit=500`. Orders of a kind this adapter never sends
+    /// (see [`AdapterError::Unsupported`]) are not ones the engine sent: they are counted in
+    /// `unrepresentable` rather than failing the call, so one hand-placed order cannot block
+    /// every reconciliation, yet its presence is still reported. Any other undecodable order
+    /// is an error.
+    async fn open_orders(&self) -> Result<OpenOrders, AdapterError> {
         let url = format!("{}/v2/orders", self.base_url);
         let wire: Vec<WireOrder> = self
             .http
             .get(&url, &[("status", "open"), ("limit", "500")])
             .await?;
-        // Orders this adapter cannot represent (other types or times in force) are not ones the
-        // engine sent; leaving them out keeps one hand-placed order from blocking every
-        // reconciliation. Their fills still surface as position mismatches.
-        let mut orders = Vec::with_capacity(wire.len());
+        let mut open = OpenOrders {
+            orders: Vec::with_capacity(wire.len()),
+            unrepresentable: 0,
+        };
         for order in wire {
             match order.into_broker_order() {
-                Ok(order) => orders.push(order),
-                Err(AdapterError::Unsupported(_)) => {}
+                Ok(order) => open.orders.push(order),
+                Err(AdapterError::Unsupported(_)) => {
+                    open.unrepresentable = open.unrepresentable.saturating_add(1);
+                }
                 Err(error) => return Err(error),
             }
         }
-        Ok(orders)
+        Ok(open)
     }
 
     /// `GET /v2/positions`.
@@ -571,7 +577,8 @@ mod tests {
             .mount(&server)
             .await;
         let config = config(server.uri());
-        let orders = trading(&config).open_orders().await.unwrap();
+        let open = trading(&config).open_orders().await.unwrap();
+        let orders = open.orders;
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0].venue_order_id.to_string(), ORDER_ID);
         assert_eq!(orders[0].state, OrderState::Submitted);
@@ -590,12 +597,14 @@ mod tests {
             .mount(&server)
             .await;
         let config = config(server.uri());
-        let orders = trading(&config).open_orders().await.unwrap();
+        let open = trading(&config).open_orders().await.unwrap();
+        let orders = open.orders;
         assert_eq!(
             orders.len(),
             1,
             "the stop order is not one we could have sent"
         );
+        assert_eq!(open.unrepresentable, 1, "but its presence is reported");
         assert_eq!(orders[0].venue_order_id.to_string(), ORDER_ID);
 
         let server = MockServer::start().await;

@@ -513,3 +513,51 @@ async fn fake_reads_answer_from_scripted_state_and_fail_when_set() {
         ]
     );
 }
+
+// Regression tests for the Phase 1 independent review.
+
+#[tokio::test]
+async fn cancel_asks_the_broker_with_the_venue_id_and_leaves_state_to_the_broker() {
+    let f = fixture();
+    let mut tracker = OrderTracker::new();
+    let i = intent("nisse-1-0", "10", Some("500.10"));
+    let order = f.gateway.submit(&mut tracker, &i).await.unwrap().order;
+
+    f.gateway.cancel(&tracker, cid("nisse-1-0")).await.unwrap();
+    assert_eq!(
+        calls(&f.log).last(),
+        Some(&Call::Cancel(order.venue_order_id))
+    );
+    assert_eq!(
+        tracked_state(&tracker, "nisse-1-0"),
+        Some(OrderState::Accepted),
+        "the order is cancelled only when the broker says so"
+    );
+
+    let err = f.gateway.cancel(&tracker, cid("nope")).await.unwrap_err();
+    assert!(matches!(err, EngineError::UnknownOrder(_)));
+}
+
+#[tokio::test]
+async fn replace_with_a_different_symbol_or_side_is_refused_before_anything_is_recorded() {
+    let f = fixture();
+    let mut tracker = OrderTracker::new();
+    let original = intent("nisse-1-0", "10", Some("500.10"));
+    f.gateway.submit(&mut tracker, &original).await.unwrap();
+    let recorded_before = calls(&f.log).len();
+
+    let mut other_side = intent("nisse-1-1", "10", Some("499.90"));
+    other_side.side = nisse_core::nautilus::OrderSide::Sell;
+    let err = f
+        .gateway
+        .replace(&mut tracker, cid("nisse-1-0"), &other_side)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::ReplaceMismatch { .. }));
+    assert_eq!(
+        calls(&f.log).len(),
+        recorded_before,
+        "nothing recorded or sent"
+    );
+    assert!(tracker.get(cid("nisse-1-1")).is_none());
+}

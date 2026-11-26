@@ -53,9 +53,9 @@ pub(crate) struct WireAccount {
     pub cash: String,
     pub buying_power: String,
     pub trading_blocked: bool,
-    #[serde(default)]
+    /// Required, like the other two flags: a missing flag must fail the read, not read as
+    /// "not blocked".
     pub account_blocked: bool,
-    #[serde(default)]
     pub trade_suspended_by_user: bool,
     pub currency: Option<String>,
 }
@@ -107,14 +107,13 @@ pub(crate) fn order_state(status: &str) -> Result<OrderState, AdapterError> {
     })
 }
 
-/// Rejects an empty identifier before it reaches a Nautilus id constructor, which panics on
-/// an empty string.
-fn ensure_present(text: &str, field: &str) -> Result<(), AdapterError> {
-    if text.is_empty() {
-        Err(AdapterError::Decode(format!("empty {field}")))
-    } else {
-        Ok(())
-    }
+/// Builds a Nautilus identifier with its checked constructor. The unchecked ones panic on
+/// empty, all-whitespace or non-ASCII text, and these strings come from the broker.
+fn checked_id<T, E: std::fmt::Display>(
+    built: Result<T, E>,
+    field: &str,
+) -> Result<T, AdapterError> {
+    built.map_err(|e| AdapterError::Decode(format!("bad {field}: {e}")))
 }
 
 fn parse_side(text: &str) -> Result<OrderSide, AdapterError> {
@@ -159,13 +158,15 @@ impl WireOrder {
                 ));
             }
         };
-        ensure_present(&self.id, "order id")?;
-        ensure_present(&self.client_order_id, "client order id")?;
-        ensure_present(&self.symbol, "symbol")?;
+        // The engine only writes plain ASCII client order ids, so one that Nautilus cannot hold
+        // belongs to an order placed by someone else: unsupported, not a decode failure.
+        let client_order_id = ClientOrderId::new_checked(&self.client_order_id).map_err(|_| {
+            AdapterError::Unsupported("client order id the engine could not have written")
+        })?;
         Ok(BrokerOrder {
-            client_order_id: ClientOrderId::new(&self.client_order_id),
-            venue_order_id: VenueOrderId::new(&self.id),
-            symbol: Symbol::new(&self.symbol),
+            client_order_id,
+            venue_order_id: checked_id(VenueOrderId::new_checked(&self.id), "order id")?,
+            symbol: checked_id(Symbol::new_checked(&self.symbol), "symbol")?,
             side: parse_side(&self.side)?,
             order_type,
             qty: parse_qty(qty)?,
@@ -185,7 +186,7 @@ impl WireOrder {
 
 impl WirePosition {
     pub(crate) fn into_broker_position(self) -> Result<BrokerPosition, AdapterError> {
-        ensure_present(&self.symbol, "symbol")?;
+        let symbol = checked_id(Symbol::new_checked(&self.symbol), "symbol")?;
         let side = match self.side.as_str() {
             "long" => PositionSide::Long,
             "short" => PositionSide::Short,
@@ -197,7 +198,7 @@ impl WirePosition {
         };
         let unsigned = self.qty.strip_prefix('-').unwrap_or(self.qty.as_str());
         Ok(BrokerPosition {
-            symbol: Symbol::new(&self.symbol),
+            symbol,
             side,
             qty: parse_qty(unsigned)?,
             avg_entry_px: parse_price(&self.avg_entry_price)?,
@@ -458,6 +459,41 @@ mod tests {
     }
 
     #[test]
+    fn hostile_identifiers_never_panic() {
+        // Nautilus' unchecked constructors panic on these; they come from the broker.
+        for bad in ["", "   ", "ordr\u{e9}"] {
+            let mut order = order_value();
+            order["client_order_id"] = json!(bad);
+            assert!(
+                matches!(order_from(order), Err(AdapterError::Unsupported(_))),
+                "a client order id of {bad:?} is someone else's order"
+            );
+            let mut order = order_value();
+            order["symbol"] = json!(bad);
+            // Must not panic; Nautilus accepts some non-ASCII symbols, so only blank ones
+            // are required to fail.
+            let result = order_from(order);
+            if bad.trim().is_empty() {
+                assert!(matches!(result, Err(AdapterError::Decode(_))));
+            }
+            let position: WirePosition = serde_json::from_value(json!({
+                "symbol": bad, "side": "long", "qty": "1", "avg_entry_price": "1",
+            }))
+            .unwrap();
+            let result = position.into_broker_position();
+            if bad.trim().is_empty() {
+                assert!(result.is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn a_missing_blocking_flag_fails_the_account_read() {
+        let missing = r#"{"equity":"10","cash":"10","buying_power":"10","trading_blocked":false}"#;
+        assert!(serde_json::from_str::<WireAccount>(missing).is_err());
+    }
+
+    #[test]
     fn unknown_fields_are_ignored() {
         let mut value = order_value();
         value["brand_new_field"] = json!({"nested": [1, 2, 3]});
@@ -533,6 +569,7 @@ mod tests {
         ] {
             let mut value = json!({
                 "equity": "1", "cash": "1", "buying_power": "1", "trading_blocked": false,
+                "account_blocked": false, "trade_suspended_by_user": false,
             });
             value[flag] = json!(true);
             let wire: WireAccount = serde_json::from_value(value).unwrap();
@@ -544,14 +581,14 @@ mod tests {
     #[test]
     fn account_currency_defaults_to_usd_and_bad_amount_is_decode() {
         let wire: WireAccount = serde_json::from_str(
-            r#"{"equity":"10","cash":"10","buying_power":"10","trading_blocked":false}"#,
+            r#"{"equity":"10","cash":"10","buying_power":"10","trading_blocked":false,"account_blocked":false,"trade_suspended_by_user":false}"#,
         )
         .unwrap();
         let account = wire.into_account_snapshot().unwrap();
         assert_eq!(account.equity, Money::from_str("10 USD").unwrap());
 
         let wire: WireAccount = serde_json::from_str(
-            r#"{"equity":"NaN","cash":"10","buying_power":"10","trading_blocked":false}"#,
+            r#"{"equity":"NaN","cash":"10","buying_power":"10","trading_blocked":false,"account_blocked":false,"trade_suspended_by_user":false}"#,
         )
         .unwrap();
         assert!(matches!(

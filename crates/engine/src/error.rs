@@ -38,6 +38,14 @@ pub enum EngineError {
         #[source]
         source: BoxError,
     },
+    /// A replacement intent names a different symbol or side than the order it replaces.
+    #[error(
+        "replacement {replacement} does not match order {original} (symbol and side must be equal)"
+    )]
+    ReplaceMismatch {
+        original: ClientOrderId,
+        replacement: ClientOrderId,
+    },
     /// A broker read failed during reconciliation.
     #[error("broker request failed: {0}")]
     Broker(#[source] BoxError),

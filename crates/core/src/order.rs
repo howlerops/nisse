@@ -156,6 +156,16 @@ pub struct AccountSnapshot {
     pub trading_blocked: bool,
 }
 
+/// The broker's open orders. `unrepresentable` counts open orders of a kind the engine never
+/// sends (another order type, a notional amount, an id it could not have written): they are
+/// not ours, so they are not tracked, but their presence means something else is trading the
+/// account and must be reported.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct OpenOrders {
+    pub orders: Vec<BrokerOrder>,
+    pub unrepresentable: u32,
+}
+
 /// A change to a live order. Brokers implement this as cancel-and-new, so the replacement gets
 /// its own client order id (and its own intent-log row).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,7 +216,7 @@ pub trait Broker: Send + Sync {
         client_order_id: ClientOrderId,
     ) -> impl Future<Output = Result<Option<BrokerOrder>, Self::Error>> + Send;
 
-    fn open_orders(&self) -> impl Future<Output = Result<Vec<BrokerOrder>, Self::Error>> + Send;
+    fn open_orders(&self) -> impl Future<Output = Result<OpenOrders, Self::Error>> + Send;
 
     fn positions(&self) -> impl Future<Output = Result<Vec<BrokerPosition>, Self::Error>> + Send;
 

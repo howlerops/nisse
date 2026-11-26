@@ -191,7 +191,8 @@ fn fill_detail(
     let price = price.ok_or_else(|| decode("fill without price"))?;
     let qty = qty.ok_or_else(|| decode("fill without qty"))?;
     Ok(FillDetail {
-        trade_id: TradeId::new(&execution_id),
+        trade_id: TradeId::new_checked(&execution_id)
+            .map_err(|e| AdapterError::Decode(format!("bad execution_id: {e}")))?,
         px: parse_price(&price)?,
         qty: parse_qty(&qty)?,
     })

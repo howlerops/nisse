@@ -22,8 +22,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use nisse_core::{
-    AccountSnapshot, Broker, BrokerOrder, BrokerPosition, DecisionId, IntentLog, OrderIntent,
-    OrderState, SubmitError,
+    AccountSnapshot, Broker, BrokerOrder, BrokerPosition, DecisionId, IntentLog, OpenOrders,
+    OrderIntent, OrderState, SubmitError,
     nautilus::{
         ClientOrderId, Money, OrderSide, OrderType, Price, Quantity, Symbol, TimeInForce,
         UnixNanos, VenueOrderId,
@@ -84,6 +84,7 @@ struct BrokerState {
     positions: Vec<BrokerPosition>,
     orders_by_client_id: BTreeMap<String, BrokerOrder>,
     fail_reads: Option<String>,
+    unrepresentable: u32,
 }
 
 /// A scripted [`Broker`].
@@ -131,6 +132,11 @@ impl FakeBroker {
     /// Replaces the positions returned by `positions`.
     pub fn set_positions(&self, positions: Vec<BrokerPosition>) {
         lock(&self.state).positions = positions;
+    }
+
+    /// Sets how many open orders `open_orders` reports as not representable.
+    pub fn set_unrepresentable(&self, count: u32) {
+        lock(&self.state).unrepresentable = count;
     }
 
     /// Makes `order_by_client_id` find this order (keyed by its client order id).
@@ -201,12 +207,16 @@ impl Broker for FakeBroker {
             .copied())
     }
 
-    async fn open_orders(&self) -> Result<Vec<BrokerOrder>, FakeError> {
+    async fn open_orders(&self) -> Result<OpenOrders, FakeError> {
         push(&self.log, Call::OpenOrders);
         if let Some(err) = self.read_failure() {
             return Err(err);
         }
-        Ok(lock(&self.state).open_orders.clone())
+        let state = lock(&self.state);
+        Ok(OpenOrders {
+            orders: state.open_orders.clone(),
+            unrepresentable: state.unrepresentable,
+        })
     }
 
     async fn positions(&self) -> Result<Vec<BrokerPosition>, FakeError> {

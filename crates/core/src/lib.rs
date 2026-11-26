@@ -19,8 +19,8 @@ pub use error::CoreError;
 pub use hash::Hash32;
 pub use ids::{DecisionId, StrategyVersionId};
 pub use order::{
-    AccountSnapshot, Broker, BrokerOrder, BrokerPosition, Fill, FillDetail, IntentLog, OrderIntent,
-    OrderState, OrderUpdate, ReplaceRequest, SubmitError,
+    AccountSnapshot, Broker, BrokerOrder, BrokerPosition, Fill, FillDetail, IntentLog, OpenOrders,
+    OrderIntent, OrderState, OrderUpdate, ReplaceRequest, SubmitError,
 };
 pub use types::{Action, SubjectType, TrialKind};
 

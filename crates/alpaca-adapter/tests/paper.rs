@@ -41,6 +41,8 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 /// How many times `sync_until_canceled` polls the broker, and the wait between polls.
 const POLL_ATTEMPTS: u32 = 10;
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// How old an intent must be before a broker "not found" is believed.
+const GRACE_NANOS: u64 = 30_000_000_000;
 
 /// Intent log for the gateway. Holds the intents in memory so the test can read them back
 /// after the gateway has been handed a reference to it.
@@ -124,7 +126,14 @@ async fn sync_once(
     tracker: &mut OrderTracker,
 ) -> Result<SyncReport, EngineError> {
     let mut positions = BTreeMap::new();
-    sync_with_broker(trading, tracker, &mut positions, SystemClock.now()).await
+    sync_with_broker(
+        trading,
+        tracker,
+        &mut positions,
+        SystemClock.now(),
+        GRACE_NANOS,
+    )
+    .await
 }
 
 /// Syncs until the tracker shows `id` as `Canceled`, at most `POLL_ATTEMPTS` times.

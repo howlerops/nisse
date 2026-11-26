@@ -77,15 +77,48 @@ impl OrderTracker {
         }
     }
 
-    /// Applies the broker's view of an order (from a stream update or a REST snapshot).
-    /// `fill` is the single execution the message reported, if any; `ts` is the event time.
-    /// The rules are in `docs/phases/phase-1.md`, "Order tracker rules". Errors with
-    /// `UnknownOrder` when the client order id is not tracked.
+    /// Restores an order from the store after a restart, with the cumulative figures already
+    /// recorded for it, so the first broker snapshot only yields fills that were not recorded
+    /// before the crash. Errors with `DuplicateOrder` if the id is already tracked.
+    pub fn restore(&mut self, order: TrackedOrder) -> Result<(), EngineError> {
+        match self.orders.entry(order.intent.client_order_id) {
+            Entry::Occupied(_) => Err(EngineError::DuplicateOrder(order.intent.client_order_id)),
+            Entry::Vacant(slot) => {
+                slot.insert(order);
+                Ok(())
+            }
+        }
+    }
+
+    /// Applies one message from the broker's order stream. `fill` is the single execution the
+    /// message reported, if any; `ts` is the event time. Stream messages can arrive late or
+    /// out of order, so one that reports no new fill never moves the state backwards and
+    /// never reopens a terminal order. The rules are in `docs/phases/phase-1.md`, "Order
+    /// tracker rules". Errors with `UnknownOrder` when the client order id is not tracked.
     pub fn apply(
         &mut self,
         order: &BrokerOrder,
         fill: Option<&FillDetail>,
         ts: UnixNanos,
+    ) -> Result<Applied, EngineError> {
+        self.apply_from(order, fill, ts, false)
+    }
+
+    /// Applies a REST snapshot of an order (a submit response, an open-orders entry, a lookup
+    /// by client order id). A snapshot is the broker's current word, so unless it is older
+    /// than what we know (lower cumulative fill) its state is adopted even when that moves
+    /// the order "backwards": a rejected cancel returns `PendingCancel` to `Accepted`, and an
+    /// order wrongly marked never-arrived comes back to life.
+    pub fn apply_snapshot(&mut self, order: &BrokerOrder) -> Result<Applied, EngineError> {
+        self.apply_from(order, None, order.ts, true)
+    }
+
+    fn apply_from(
+        &mut self,
+        order: &BrokerOrder,
+        fill: Option<&FillDetail>,
+        ts: UnixNanos,
+        authoritative: bool,
     ) -> Result<Applied, EngineError> {
         let client_order_id = order.client_order_id;
         let tracked = self
@@ -104,10 +137,11 @@ impl OrderTracker {
             return Ok(Applied::default());
         }
 
-        // Rule 3: no new fill. Adopt the broker's state unless we are already terminal or the
-        // broker's state is behind ours.
+        // Rule 3: no new fill. A stream message is ignored when we are already terminal or its
+        // state is behind ours (it is late); a snapshot is the broker's current word and wins.
         if delta.is_zero() {
-            if tracked.state.is_terminal() || order.state.rank() < tracked.state.rank() {
+            let stale = tracked.state.is_terminal() || order.state.rank() < tracked.state.rank();
+            if stale && !authoritative {
                 return Ok(Applied::default());
             }
             let before = tracked.state;

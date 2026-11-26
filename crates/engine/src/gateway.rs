@@ -63,16 +63,44 @@ impl<B: Broker, L: IntentLog> OrderGateway<B, L> {
         original: nisse_core::nautilus::ClientOrderId,
         replacement: &OrderIntent,
     ) -> Result<Submitted, EngineError> {
-        let venue_order_id = tracker
+        let tracked = tracker
             .get(original)
-            .and_then(|tracked| tracked.venue_order_id)
             .ok_or(EngineError::UnknownOrder(original))?;
+        let venue_order_id = tracked
+            .venue_order_id
+            .ok_or(EngineError::UnknownOrder(original))?;
+        if tracked.intent.symbol != replacement.symbol || tracked.intent.side != replacement.side {
+            return Err(EngineError::ReplaceMismatch {
+                original,
+                replacement: replacement.client_order_id,
+            });
+        }
         self.record(tracker, replacement).await?;
         let result = self
             .broker
             .replace(venue_order_id, &replace_request(replacement))
             .await;
         settle(tracker, replacement, result)
+    }
+
+    /// Asks the broker to cancel a tracked order. The tracker is not changed here: the order
+    /// becomes `PendingCancel` / `Canceled` when the broker says so (stream or sync), and it
+    /// may still fill first. Errors with `UnknownOrder` if the order is not tracked or the
+    /// broker has not acknowledged it yet (reconcile first), and with `Broker` if the request
+    /// fails; a failed cancel may or may not have taken effect, so reconcile.
+    pub async fn cancel(
+        &self,
+        tracker: &OrderTracker,
+        client_order_id: nisse_core::nautilus::ClientOrderId,
+    ) -> Result<(), EngineError> {
+        let venue_order_id = tracker
+            .get(client_order_id)
+            .and_then(|tracked| tracked.venue_order_id)
+            .ok_or(EngineError::UnknownOrder(client_order_id))?;
+        self.broker
+            .cancel(venue_order_id)
+            .await
+            .map_err(|e| EngineError::Broker(Box::new(e)))
     }
 
     /// Steps 1 and 2 of the write-ahead rule: track the intent, then write it to the intent
@@ -107,7 +135,7 @@ where
     let client_order_id = intent.client_order_id;
     match result {
         Ok(order) => {
-            let applied = tracker.apply(&order, None, order.ts)?;
+            let applied = tracker.apply_snapshot(&order)?;
             Ok(Submitted { order, applied })
         }
         Err(SubmitError::Rejected(source)) => {
