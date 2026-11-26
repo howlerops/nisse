@@ -1379,3 +1379,350 @@ async fn s13_once_flat_the_backtest_rebalances_only_at_month_ends() {
     assert!(!month_ends.is_empty());
     assert_eq!(decided, month_ends);
 }
+
+// ---- the second review: fills, sells, flattening and the kill switch -----------------------
+
+/// Cancel requests the broker received, by venue order id, in order.
+type CancelLog = Arc<Mutex<Vec<VenueOrderId>>>;
+
+fn new_cancel_log() -> CancelLog {
+    Arc::new(Mutex::new(Vec::new()))
+}
+
+fn cancels_of(log: &CancelLog) -> Vec<VenueOrderId> {
+    log.lock().unwrap_or_else(PoisonError::into_inner).clone()
+}
+
+/// A `Sim` that logs every cancel request. With `fill_on_submit` it answers each submit with the
+/// order already fully filled at 100, as a broker may, and does not queue it at the simulated
+/// exchange. Everything else is the `Sim`.
+#[derive(Debug)]
+struct Probe {
+    inner: Sim,
+    fill_on_submit: bool,
+    cancels: CancelLog,
+}
+
+impl Broker for Probe {
+    type Error = SimError;
+
+    async fn submit(&self, intent: &OrderIntent) -> Result<BrokerOrder, SubmitError<SimError>> {
+        if !self.fill_on_submit {
+            return self.inner.submit(intent).await;
+        }
+        calls_lock(&self.inner.calls)
+            .submits
+            .push(intent.client_order_id);
+        Ok(snapshot(
+            intent,
+            OrderState::Filled,
+            &intent.qty.to_string(),
+            Some("100"),
+        ))
+    }
+
+    async fn cancel(&self, venue_order_id: VenueOrderId) -> Result<(), SimError> {
+        self.cancels
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(venue_order_id);
+        self.inner.cancel(venue_order_id).await
+    }
+
+    async fn cancel_all(&self) -> Result<(), SimError> {
+        self.inner.cancel_all().await
+    }
+
+    async fn replace(
+        &self,
+        venue_order_id: VenueOrderId,
+        request: &ReplaceRequest,
+    ) -> Result<BrokerOrder, SubmitError<SimError>> {
+        self.inner.replace(venue_order_id, request).await
+    }
+
+    async fn order_by_client_id(
+        &self,
+        client_order_id: ClientOrderId,
+    ) -> Result<Option<BrokerOrder>, SimError> {
+        self.inner.order_by_client_id(client_order_id).await
+    }
+
+    async fn open_orders(&self) -> Result<OpenOrders, SimError> {
+        self.inner.open_orders().await
+    }
+
+    async fn positions(&self) -> Result<Vec<BrokerPosition>, SimError> {
+        self.inner.positions().await
+    }
+
+    async fn account(&self) -> Result<AccountSnapshot, SimError> {
+        self.inner.account().await
+    }
+}
+
+type ProbeEngine<'a, C> = Trader<TrendVolTarget, Probe, &'a MemoryStore, &'a MemoryStore, Rec, C>;
+
+/// A trader over AAA with a `Probe` broker and no starting book.
+fn probe_engine<'a>(
+    store: &'a MemoryStore,
+    sink: &Rec,
+    calls: &Handle,
+    cancels: &CancelLog,
+    clk: &'a ManualClock,
+    fill_on_submit: bool,
+) -> ProbeEngine<'a, &'a ManualClock> {
+    let probe = Probe {
+        inner: Sim::new(calls.clone()),
+        fill_on_submit,
+        cancels: Arc::clone(cancels),
+    };
+    Trader::new(
+        strategy(),
+        OrderGateway::new(probe, store),
+        store,
+        sink.clone(),
+        clk,
+        config(vec![sym(AAA)], limits()),
+        OrderBookState::default(),
+    )
+    .unwrap()
+}
+
+/// What the backtest loop does for one session with a `Probe` broker.
+async fn feed_probe<C: Clock>(trader: &mut ProbeEngine<'_, C>, session: &[Bar]) {
+    trader.broker().inner.on_session(session).unwrap();
+    for update in trader.broker().inner.drain_updates() {
+        trader.on_order_update(&update).await.unwrap();
+    }
+    for bar in session {
+        trader.on_bar(bar).unwrap();
+    }
+}
+
+/// T2-1. A fill in the broker's answer to a submit counts toward day trades, once.
+#[tokio::test]
+async fn t2_1_a_fill_in_the_submit_answer_counts_toward_day_trades_once() {
+    let store = MemoryStore::new();
+    let calls = new_calls();
+    let sink = Rec::new(calls.clone());
+    let cancels = new_cancel_log();
+    let clk = clock();
+    let mut trader = probe_engine(&store, &sink, &calls, &cancels, &clk, true);
+    for session in sessions(&[(AAA, &RISING_A)], 0) {
+        feed_probe(&mut trader, &session).await;
+    }
+
+    let report = trader.rebalance().await.unwrap();
+
+    assert_eq!(report.orders_submitted, 1);
+    let buy = store.intents()[0];
+    let now = clk.now();
+    assert_eq!(
+        trader.state().positions.get(sym(AAA)).qty,
+        buy.qty.as_decimal()
+    );
+    let days = trader.risk().day_trades();
+    assert!(days.would_day_trade(sym(AAA), OrderSide::Sell, now));
+    assert_eq!(days.count_in_window(now), 0);
+
+    // The stream then repeats the same fill: it is not a second fill.
+    let repeat = fill_update(
+        &buy,
+        OrderState::Filled,
+        &buy.qty.to_string(),
+        &buy.qty.to_string(),
+        "trade-1",
+        now.as_u64() + 1,
+    );
+    trader.on_order_update(&repeat).await.unwrap();
+
+    let days = trader.risk().day_trades();
+    assert!(days.would_day_trade(sym(AAA), OrderSide::Sell, now));
+    assert_eq!(days.count_in_window(now), 0);
+    assert_eq!(
+        trader.state().positions.get(sym(AAA)).qty,
+        buy.qty.as_decimal()
+    );
+}
+
+/// T2-2. Fills that a reconciliation pass finds count toward day trades even when the pass
+/// then ends with `ForeignOrders`.
+#[tokio::test]
+async fn t2_2_fills_found_by_a_pass_that_ends_in_foreign_orders_still_count() {
+    let store = MemoryStore::new();
+    let calls = new_calls();
+    let sink = Rec::new(calls.clone());
+    let cancels = new_cancel_log();
+    let clk = clock();
+    let mut trader = probe_engine(&store, &sink, &calls, &cancels, &clk, false);
+    for session in sessions(&[(AAA, &RISING_A)], 0) {
+        feed_probe(&mut trader, &session).await;
+    }
+    // The buy goes out at the close of day 6 and is not yet filled.
+    clk.set(UnixNanos::from(6 * DAY_NANOS + HOUR_NANOS));
+    trader.rebalance().await.unwrap();
+    let buy = store.intents()[0];
+    // Day 7 opens and the broker fills the buy. Its update is never fed to the engine: the next
+    // pass has to find the fill itself.
+    trader
+        .broker()
+        .inner
+        .on_session(&sessions(&[(AAA, &["109"])], 7)[0])
+        .unwrap();
+    // Someone else's order is open at the broker, which makes the next pass end in an error.
+    let foreign = order("foreign-1", OrderSide::Buy, "1");
+    trader.broker().inner.submit(&foreign).await.unwrap();
+    clk.set(UnixNanos::from(7 * DAY_NANOS + 2 * HOUR_NANOS));
+
+    let result = trader.rebalance().await;
+
+    assert!(matches!(result, Err(EngineError::ForeignOrders(1))));
+    assert_eq!(
+        trader
+            .state()
+            .tracker
+            .get(buy.client_order_id)
+            .unwrap()
+            .state,
+        OrderState::Filled
+    );
+    let now = clk.now();
+    let days = trader.risk().day_trades();
+    assert!(days.would_day_trade(sym(AAA), OrderSide::Sell, now));
+    assert_eq!(days.count_in_window(now), 0);
+}
+
+/// T2-3. Going flat with shares held and a buy still waiting sells what is held and cancels the
+/// buy.
+#[tokio::test]
+async fn t2_3_flat_with_shares_held_and_a_buy_waiting_sells_the_held_and_cancels_the_buy() {
+    let store = MemoryStore::new();
+    let calls = new_calls();
+    let sink = Rec::new(calls.clone());
+    let cancels = new_cancel_log();
+    let clk = clock();
+    let mut trader = probe_engine(&store, &sink, &calls, &cancels, &clk, false);
+    for session in sessions(&[(AAA, &RISING_A)], 0) {
+        feed_probe(&mut trader, &session).await;
+    }
+    // The first buy fills at the open of day 7: AAA is held.
+    set_equity(&calls, "100000");
+    trader.rebalance().await.unwrap();
+    feed_probe(&mut trader, &sessions(&[(AAA, &["109"])], 7)[0]).await;
+    let held = trader.state().positions.get(sym(AAA)).qty;
+    assert_eq!(held, store.intents()[0].qty.as_decimal());
+    // Equity rises to 120,000, so the target grows and a further buy goes out, unfilled.
+    set_equity(&calls, "120000");
+    let grown = trader.rebalance().await.unwrap();
+    assert_eq!(grown.orders_submitted, 1);
+    let waiting = store.intents()[1];
+    assert_eq!(waiting.side, OrderSide::Buy);
+    let waiting_venue = trader
+        .state()
+        .tracker
+        .get(waiting.client_order_id)
+        .unwrap()
+        .venue_order_id
+        .unwrap();
+    // Equity falls 20% below the 120,000 peak: flat.
+    set_equity(&calls, "96000");
+    assert_eq!(
+        trader.observe_equity(d("96000")).await.unwrap(),
+        Some((DrawdownMode::Normal, DrawdownMode::Flat))
+    );
+
+    let report = trader.rebalance().await.unwrap();
+
+    let (id, _, action) = report.decisions[0];
+    assert_eq!(action, Action::Exit);
+    let decision = store.decisions().last().cloned().unwrap();
+    assert_eq!(decision.intended_qty, -(held + waiting.qty.as_decimal()));
+    let sell = store.intents()[2];
+    assert_eq!(sell.side, OrderSide::Sell);
+    assert_eq!(sell.qty.as_decimal(), held);
+    let rows = risk_rows(&sink, id);
+    assert_eq!(rows.len(), 8);
+    assert!(rows.iter().all(|row| row.passed), "{rows:?}");
+    let no_short = rows.iter().find(|row| row.rule == rule::NO_SHORT).unwrap();
+    assert_eq!(no_short.actual_value, held);
+    assert_eq!(report.orders_submitted, 1);
+    assert_eq!(report.orders_blocked, 0);
+    assert_eq!(cancels_of(&cancels), vec![waiting_venue]);
+}
+
+/// T2-4. Going flat with nothing held and only a buy waiting cancels that buy.
+#[tokio::test]
+async fn t2_4_flat_with_only_a_buy_waiting_cancels_the_buy() {
+    let store = MemoryStore::new();
+    let calls = new_calls();
+    let sink = Rec::new(calls.clone());
+    let cancels = new_cancel_log();
+    let clk = clock();
+    let mut trader = probe_engine(&store, &sink, &calls, &cancels, &clk, false);
+    for session in sessions(&[(AAA, &RISING_A)], 0) {
+        feed_probe(&mut trader, &session).await;
+    }
+    trader.rebalance().await.unwrap();
+    let buy = store.intents()[0];
+    let venue = trader
+        .state()
+        .tracker
+        .get(buy.client_order_id)
+        .unwrap()
+        .venue_order_id
+        .unwrap();
+    set_equity(&calls, "80000");
+    trader.observe_equity(d("80000")).await.unwrap();
+
+    trader.rebalance().await.unwrap();
+
+    assert_eq!(cancels_of(&cancels), vec![venue]);
+}
+
+/// T2-5a. `set_kill_switch(false)` does not lower a switch engaged in this process.
+#[tokio::test]
+async fn t2_5_a_set_kill_switch_off_does_not_lower_a_switch_engaged_here() {
+    let store = MemoryStore::new();
+    let calls = new_calls();
+    let sink = Rec::new(calls.clone());
+    let clk = clock();
+    let mut trader = start(
+        &store,
+        &sink,
+        Sim::new(calls.clone()),
+        &clk,
+        &[AAA],
+        limits(),
+        OrderBookState::default(),
+    );
+    trader.engage_kill_switch("me").await.unwrap();
+
+    trader.set_kill_switch(false);
+
+    assert!(trader.risk().state().kill_switch_engaged);
+}
+
+/// T2-5b. A switch set only by `set_kill_switch(true)` is lowered by `set_kill_switch(false)`.
+#[tokio::test]
+async fn t2_5_b_set_kill_switch_off_lowers_a_switch_set_only_by_set_kill_switch() {
+    let store = MemoryStore::new();
+    let calls = new_calls();
+    let sink = Rec::new(calls.clone());
+    let clk = clock();
+    let mut trader = start(
+        &store,
+        &sink,
+        Sim::new(calls),
+        &clk,
+        &[AAA],
+        limits(),
+        OrderBookState::default(),
+    );
+    trader.set_kill_switch(true);
+    assert!(trader.risk().state().kill_switch_engaged);
+
+    trader.set_kill_switch(false);
+
+    assert!(!trader.risk().state().kill_switch_engaged);
+}
