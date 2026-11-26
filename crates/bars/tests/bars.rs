@@ -316,9 +316,10 @@ fn start_out_of_range_is_an_error() {
 }
 
 #[test]
-fn two_files_both_contribute_and_the_later_name_wins_a_duplicate() {
-    let dir = Scratch::new("overlap");
-    // Written first, but "b" sorts after "a": its bar for AAA day 1 must win.
+fn only_the_file_whose_name_sorts_last_is_read() {
+    let dir = Scratch::new("snapshots");
+    // Written first, but "b" sorts after "a": it is the snapshot that is read, whole. Rows
+    // from "a" are never spliced in, even for a day "b" does not have.
     write_bars(
         &dir.path().join("b.parquet"),
         &[flat("AAA", 1, "20.0"), flat("BBB", 1, "7.0")],
@@ -335,10 +336,9 @@ fn two_files_both_contribute_and_the_later_name_wins_a_duplicate() {
         .unwrap()
         .read(&["AAA", "BBB"], from, to)
         .unwrap();
-    assert_eq!(got.len(), 3);
+    assert_eq!(got.len(), 2);
     assert_same(&got[0], &flat("AAA", 1, "20.0"));
     assert_same(&got[1], &flat("BBB", 1, "7.0"));
-    assert_same(&got[2], &flat("AAA", 2, "11.0"));
 }
 
 #[test]
@@ -401,6 +401,16 @@ fn a_directory_with_a_glob_character_cannot_be_opened() {
         let err = BarReader::open(&sub).unwrap_err();
         assert!(matches!(err, BarsError::Data(_)), "{name}: got {err:?}");
     }
+}
+
+#[test]
+fn a_path_that_does_not_end_in_parquet_is_rejected_without_writing() {
+    let dir = Scratch::new("suffix");
+    for name in ["bars", "bars.csv", "bars.parquet.bak"] {
+        let err = write_bars(&dir.path().join(name), &[flat("AAA", 1, "1.0")]).unwrap_err();
+        assert!(matches!(err, BarsError::Data(_)), "{name}: got {err:?}");
+    }
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 }
 
 #[test]

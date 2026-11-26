@@ -5,6 +5,7 @@
 //! deliberate: a trial is registered before the run, so a run that fails or crashes still
 //! counts towards the lifetime trial count.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -12,7 +13,8 @@ use chrono::NaiveDate;
 use nisse_bars::BarReader;
 use nisse_core::{
     MarketCalendar, StrategyVersion, StrategyVersionId, Trial, TrialKind, bars_snapshot_id,
-    config_hash, nautilus::UnixNanos,
+    config_hash,
+    nautilus::{Symbol, UnixNanos},
 };
 use nisse_engine::{
     BacktestConfig, CostModel, EngineError, GIT_SHA, metrics, run_backtest, strategies,
@@ -123,7 +125,8 @@ pub struct JobOutcome {
 ///
 /// 1. Refuse a build that cannot be replayed unless `allow_dirty` (nothing is read or written).
 /// 2. Build the strategy from its parameters.
-/// 3. Read the bars in range. No bars is an error; nothing has been written yet.
+/// 3. Read the bars in range. No bars at all, or none for one of the requested symbols, is an
+///    error; nothing has been written yet.
 /// 4. Ensure the strategy version.
 /// 5. Register the trial, before the run.
 /// 6. Run the backtest. On failure the trial stays registered with no result.
@@ -145,6 +148,21 @@ pub async fn run_backtest_job(
     let (Some(first), Some(last)) = (bars.first(), bars.last()) else {
         return Err(EvalError::InvalidJob("no bars in range".to_owned()));
     };
+    // Every requested symbol must have bars. The strategy sizes each position from the number
+    // of assets, so a symbol missing from the files (a typo, a gap in the download) would
+    // silently change every weight, and the stored result could never be corrected.
+    let present: BTreeSet<Symbol> = bars
+        .iter()
+        .map(|bar| bar.bar_type.instrument_id().symbol)
+        .collect();
+    if let Some(missing) = symbols
+        .iter()
+        .find(|symbol| !present.iter().any(|have| have.as_str() == **symbol))
+    {
+        return Err(EvalError::InvalidJob(format!(
+            "no bars in range for {missing}"
+        )));
+    }
     let data_start = first.ts_event;
     let data_end = last
         .ts_event
@@ -203,6 +221,15 @@ pub async fn run_backtest_job(
         "dirty_build": !replayable,
         "data_snapshot_id": data_snapshot_id,
         "symbols": job.symbols,
+        "requested_start": job.start.as_u64(),
+        "requested_end": job.end.as_u64(),
+        "costs": {
+            "slippage_bps": job.costs.slippage_bps.to_string(),
+            "fee_per_share": job.costs.fee_per_share.to_string(),
+        },
+        // The summary covers every session, including the flat warm-up before the first
+        // trade, so its volatility and return understate the invested period.
+        "summary_includes_warm_up": true,
         "sessions": run.equity_curve.len(),
         "decisions": run.decisions.len(),
         "fills": run.fills.len(),

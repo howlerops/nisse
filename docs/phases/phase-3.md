@@ -139,8 +139,8 @@ correct, because there is no later price to fill them at.
 read back sorted by time then symbol with every price and volume exact (`0.1`, `178.235733`,
 a 9-decimal price), `bar_type` `SYM.ALPACA-1-DAY-LAST-EXTERNAL`, `ts_init == ts_event`;
 symbol filter; time filter inclusive at both ends; empty `symbols` → empty; empty directory →
-empty; `open` on a missing directory → error; two files: bars from both are returned, and
-for a duplicated `(symbol, ts_event)` the file whose name sorts last wins; writing to an
+empty; `open` on a missing directory → error; two files: only the file whose name
+sorts last is read (each file is a complete snapshot; files are never merged); writing to an
 existing path is an error and leaves the file unchanged; no temporary file is left after a
 successful or a failed write; an empty slice writes no file; the written file is a real
 Parquet file with `DECIMAL(28,9)` price columns (check with `DESCRIBE SELECT * FROM

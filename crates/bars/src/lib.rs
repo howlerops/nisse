@@ -5,6 +5,8 @@
 //! groups and columns the query does not need (projection and predicate pushdown).
 //!
 //! File layout: one directory of `*.parquet` files, each written once and never modified.
+//! Each file is a complete snapshot (one fetch, one feed, prices adjusted as of the fetch);
+//! the reader uses the file whose name sorts last and never merges files.
 //! Columns: `symbol VARCHAR`, `ts_event BIGINT` (UTC nanoseconds, the session close),
 //! `open`, `high`, `low`, `close` and `volume` as `DECIMAL(28, 9)`. Prices are exact decimals
 //! from the broker's text all the way into the file; nothing passes through a float.

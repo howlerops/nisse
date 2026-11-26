@@ -14,8 +14,9 @@ const STORED_SCALE: u32 = 9;
 /// Writes `bars` to the Parquet file at `path`, sorted by symbol then time, creating the
 /// parent directory if needed.
 ///
-/// The file is written under a temporary name in the same directory and renamed into place,
-/// so a reader never sees a half-written file and a failed write leaves nothing behind. An
+/// The file is written under a temporary name in the same directory and then linked into
+/// place (a link, unlike a rename, never replaces an existing file, even in a race), so a
+/// reader never sees a half-written file and a failed write leaves nothing behind. An
 /// existing file at `path` is an error (`Data`): bar files are written once, and a correction
 /// is a new file. An empty slice writes nothing and returns `Ok`.
 pub fn write_bars(path: &Path, bars: &[Bar]) -> Result<(), BarsError> {
@@ -23,6 +24,12 @@ pub fn write_bars(path: &Path, bars: &[Bar]) -> Result<(), BarsError> {
         return Ok(());
     }
     sql_path(path)?;
+    if path.extension().is_none_or(|ext| ext != "parquet") {
+        return Err(BarsError::Data(format!(
+            "{} must end in .parquet, or the reader would never see it",
+            path.display()
+        )));
+    }
     if path.exists() {
         return Err(BarsError::Data(format!(
             "{} already exists",
@@ -39,12 +46,13 @@ pub fn write_bars(path: &Path, bars: &[Bar]) -> Result<(), BarsError> {
     let tmp: PathBuf = path.with_file_name(format!("{file_name}.tmp-{}", std::process::id()));
     let tmp_text = sql_path(&tmp)?;
 
+    // A hard link fails when `path` already exists, where a rename would silently replace
+    // it: two writers racing for one name cannot both win.
     let result = write_temporary(tmp_text, bars)
-        .and_then(|()| std::fs::rename(&tmp, path).map_err(BarsError::from));
-    if result.is_err() {
-        // Best effort: the temporary file may not exist yet.
-        let _ = std::fs::remove_file(&tmp);
-    }
+        .and_then(|()| std::fs::hard_link(&tmp, path).map_err(BarsError::from));
+    // Best effort: on success the data stays under `path`; on failure the temporary file
+    // may not exist yet.
+    let _ = std::fs::remove_file(&tmp);
     result
 }
 

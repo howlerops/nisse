@@ -21,6 +21,10 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+# The lib's own test harness does not understand criterion's flags (`--baseline`).
+[lib]
+bench = false
+
 [[bench]]
 name = "hot_path"
 harness = false

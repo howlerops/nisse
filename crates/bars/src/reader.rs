@@ -16,10 +16,8 @@ use crate::{BarsError, VENUE};
 #[derive(Debug)]
 pub struct BarReader {
     conn: duckdb::Connection,
-    /// The directory the glob is built from; checked for Parquet files on each read.
+    /// The directory of bar files; looked at afresh on each read.
     dir: PathBuf,
-    /// `<dir>/*.parquet`, as DuckDB's `read_parquet` takes it.
-    glob: String,
 }
 
 impl BarReader {
@@ -31,21 +29,21 @@ impl BarReader {
                 dir.display()
             )));
         }
-        let dir_text = sql_path(dir)?;
-        let glob = format!("{dir_text}/*.parquet");
+        sql_path(dir)?;
         let conn = duckdb::Connection::open_in_memory()?;
         Ok(Self {
             conn,
             dir: dir.to_path_buf(),
-            glob,
         })
     }
 
     /// The daily bars of `symbols` with `start <= ts_event <= end`, sorted by time and then
-    /// symbol (the order the engine consumes them in). If the same `(symbol, ts_event)` is in
-    /// more than one file, the bar from the file whose name sorts last wins: a correction is
-    /// a new file, named later. An empty `symbols` slice, or a directory with no Parquet
-    /// files, gives an empty vector.
+    /// symbol (the order the engine consumes them in), from **one** file: the `*.parquet`
+    /// file whose name sorts last. Files are never merged. Each file is a complete snapshot
+    /// fetched at one time from one feed with prices adjusted as of that time, so splicing
+    /// rows from two fetches would put a false jump (a dividend, a split) at the join. A
+    /// correction or an extension is a new, complete file with a later name. An empty
+    /// `symbols` slice, or a directory with no Parquet files, gives an empty vector.
     ///
     /// One query; only the seven columns are read and the symbol and time filters are part of
     /// the scan.
@@ -55,9 +53,13 @@ impl BarReader {
         start: UnixNanos,
         end: UnixNanos,
     ) -> Result<Vec<Bar>, BarsError> {
-        if symbols.is_empty() || !self.has_parquet_file()? {
+        if symbols.is_empty() {
             return Ok(Vec::new());
         }
+        let Some(file) = self.latest_file()? else {
+            return Ok(Vec::new());
+        };
+        let file_text = sql_path(&file)?;
         let lo = i64::try_from(start.as_u64())
             .map_err(|_| BarsError::Data(format!("start {} out of range", start.as_u64())))?;
         let hi = i64::try_from(end.as_u64())
@@ -65,11 +67,7 @@ impl BarReader {
 
         let mut sql = format!(
             "SELECT symbol, ts_event, open, high, low, close, volume \
-             FROM (SELECT symbol, ts_event, open, high, low, close, volume, \
-             row_number() OVER (PARTITION BY symbol, ts_event ORDER BY filename DESC) AS rn \
-             FROM read_parquet('{}', filename = true) \
-             WHERE symbol IN (",
-            self.glob
+             FROM read_parquet('{file_text}') WHERE symbol IN ("
         );
         for index in 0..symbols.len() {
             if index > 0 {
@@ -77,7 +75,7 @@ impl BarReader {
             }
             sql.push('?');
         }
-        sql.push_str(") AND ts_event BETWEEN ? AND ?) WHERE rn = 1 ORDER BY ts_event, symbol");
+        sql.push_str(") AND ts_event BETWEEN ? AND ? ORDER BY ts_event, symbol");
 
         let mut params: Vec<&dyn ToSql> = Vec::with_capacity(symbols.len() + 2);
         for symbol in symbols {
@@ -114,16 +112,24 @@ impl BarReader {
         Ok(bars)
     }
 
-    /// Whether the directory holds at least one `*.parquet` file.
-    fn has_parquet_file(&self) -> Result<bool, BarsError> {
+    /// The `*.parquet` file in the directory whose name sorts last, if there is one.
+    fn latest_file(&self) -> Result<Option<PathBuf>, BarsError> {
+        let mut latest: Option<PathBuf> = None;
         for entry in std::fs::read_dir(&self.dir)? {
             let entry = entry?;
-            let is_parquet = entry.path().extension().is_some_and(|ext| ext == "parquet");
-            if is_parquet && entry.file_type()?.is_file() {
-                return Ok(true);
+            let path = entry.path();
+            let is_parquet = path.extension().is_some_and(|ext| ext == "parquet");
+            if !is_parquet || !entry.file_type()?.is_file() {
+                continue;
+            }
+            if latest
+                .as_ref()
+                .is_none_or(|best| path.file_name() > best.file_name())
+            {
+                latest = Some(path);
             }
         }
-        Ok(false)
+        Ok(latest)
     }
 }
 

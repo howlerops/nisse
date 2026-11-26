@@ -13,7 +13,7 @@ fn registry(params: &Value) -> Result<Box<dyn Strategy>, EvalError> {
     match nisse_engine::strategies::build(params) {
         Ok(built) => Ok(built.strategy),
         Err(EngineError::UnknownStrategy(name)) => Err(EvalError::UnknownStrategy(name)),
-        Err(other) => Err(EvalError::UnknownStrategy(other.to_string())),
+        Err(other) => Err(EvalError::Engine(other)),
     }
 }
 

@@ -234,7 +234,11 @@ fn error_text<T>(result: Result<T, EvalError>) -> String {
     result.err().expect("an error").to_string()
 }
 
-const RESULT_FIELDS: [&str; 12] = [
+const RESULT_FIELDS: [&str; 16] = [
+    "requested_start",
+    "requested_end",
+    "costs",
+    "summary_includes_warm_up",
     "summary",
     "git_sha",
     "dirty_build",
@@ -292,6 +296,16 @@ async fn a_backtest_registers_runs_and_stores_its_result() {
     assert_eq!(result["starting_cash"], json!("100000"));
     assert!(Decimal::from_str(result["final_equity"].as_str().unwrap()).is_ok());
     assert_eq!(result["seed"], json!(7));
+    assert_eq!(result["requested_start"], json!(job.start.as_u64()));
+    assert_eq!(result["requested_end"], json!(job.end.as_u64()));
+    assert_eq!(
+        result["costs"],
+        json!({
+            "slippage_bps": job.costs.slippage_bps.to_string(),
+            "fee_per_share": job.costs.fee_per_share.to_string(),
+        })
+    );
+    assert_eq!(result["summary_includes_warm_up"], json!(true));
 
     // The snapshot id names the bars as they read back, not as they were written.
     let read_back = BarReader::open(dir.path())
@@ -435,6 +449,30 @@ async fn no_bars_in_range_is_an_invalid_job_and_writes_nothing() {
 
     assert!(
         matches!(err, EvalError::InvalidJob(ref m) if m == "no bars in range"),
+        "got {err:?}"
+    );
+    assert_eq!(trial_count(&client).await, trials_before);
+    assert_eq!(version_count(&client).await, versions_before);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_requested_symbol_without_bars_is_an_invalid_job_and_writes_nothing() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let store = Store::new(db.client().await.unwrap());
+    let dir = bars_dir("missing-symbol", &market());
+    let mut with_typo = job(dir.path(), strategy_params());
+    with_typo.symbols.push("TYPO".to_owned());
+    let trials_before = trial_count(&client).await;
+    let versions_before = version_count(&client).await;
+
+    let err = run_backtest_job(&store, &with_typo, true, false, now())
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, EvalError::InvalidJob(ref m) if m == "no bars in range for TYPO"),
         "got {err:?}"
     );
     assert_eq!(trial_count(&client).await, trials_before);
