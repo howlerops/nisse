@@ -3,7 +3,7 @@
 
 use std::{fmt::Debug, fs, io, path::Path, str::FromStr};
 
-use nisse_core::{Action, CoreError, SubjectType, TrialKind};
+use nisse_core::{Action, CoreError, OrderState, SubjectType, TrialKind};
 use strum::VariantArray;
 
 /// The stored string of every variant of `T`, in declaration order.
@@ -80,5 +80,6 @@ where
 fn sql_check_lists_match_the_enums() -> io::Result<()> {
     assert_check_matches::<Action>("0003_decision.sql", "action")?;
     assert_check_matches::<TrialKind>("0002_strategy_trial.sql", "kind")?;
-    assert_check_matches::<SubjectType>("0005_evals.sql", "subject_type")
+    assert_check_matches::<SubjectType>("0005_evals.sql", "subject_type")?;
+    assert_check_matches::<OrderState>("0006_order_columns.sql", "state")
 }

@@ -12,5 +12,17 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+futures-util = { workspace = true }
 nisse-core = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+
+[dev-dependencies]
+nisse-engine = { workspace = true }
+wiremock = { workspace = true }

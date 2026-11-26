@@ -21,14 +21,27 @@ publish = false
 [workspace.dependencies]
 # Workspace crates
 nisse-core = { path = "crates/core" }
+nisse-engine = { path = "crates/engine" }
 
 # NautilusTrader (LGPL-3.0-only). Exact pin, recorded in PLAN.md; all nautilus-* crates
 # must share one version. Do not bump casually: the Rust API changes between releases.
 nautilus-core = "=0.68.0"
 nautilus-model = "=0.68.0"
 
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrono-tz = "0.10"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
+rust_decimal = "1.43"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
 strum = { version = "0.28", features = ["derive"] }
 thiserror = "2"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+
+# Test-only
+wiremock = "0.6"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
