@@ -6,6 +6,8 @@
 pub mod backtest_job;
 pub mod deadman;
 mod error;
+pub mod gates;
 pub mod replay;
+pub mod stats;
 
 pub use error::EvalError;

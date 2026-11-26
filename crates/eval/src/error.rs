@@ -22,6 +22,10 @@ pub enum EvalError {
     /// The engine failed while building or running a strategy.
     #[error(transparent)]
     Engine(#[from] nisse_engine::EngineError),
+    /// The gates file is missing a field, names an unknown one, or sets a threshold looser
+    /// than the plan allows.
+    #[error("invalid gates: {0}")]
+    InvalidGates(String),
     /// The risk limits file could not be read or is not acceptable.
     #[error(transparent)]
     Risk(#[from] nisse_risk::RiskError),
