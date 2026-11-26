@@ -153,6 +153,9 @@ pub async fn run_backtest_job(
     }
     let built = strategies::build(&job.strategy_params).map_err(strategy_error)?;
     let limits = Limits::load(&job.limits_path)?;
+    // Taken before `limits` moves into the run's config.
+    let limits_hash = limits.hash().to_string();
+    let limits_json = limits.to_json();
 
     let symbols: Vec<&str> = job.symbols.iter().map(String::as_str).collect();
     let reader = BarReader::open(&job.bars_dir)?;
@@ -265,6 +268,8 @@ pub async fn run_backtest_job(
         "starting_cash": job.starting_cash.to_string(),
         "final_equity": final_equity.to_string(),
         "seed": job.seed,
+        "limits_hash": limits_hash,
+        "limits": limits_json,
     });
     trial_result::insert(store.client(), trial_id, &result, now).await?;
 
