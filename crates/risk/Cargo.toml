@@ -1,0 +1,16 @@
+[package]
+name = "nisse-risk"
+description = "In-process risk gate: limits, drawdown step-down, kill switch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+nisse-core = { workspace = true }
+thiserror = { workspace = true }

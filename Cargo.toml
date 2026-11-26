@@ -1,0 +1,45 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/core",
+    "crates/engine",
+    "crates/risk",
+    "crates/alpaca-adapter",
+    "crates/store",
+    "crates/eval",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.99.1"
+license = "MIT"
+repository = "https://github.com/howlerops/nisse"
+publish = false
+
+# Every version is pinned here, once. Crates reference these with `dep = { workspace = true }`.
+[workspace.dependencies]
+# Workspace crates
+nisse-core = { path = "crates/core" }
+
+# NautilusTrader (LGPL-3.0-only). Exact pin, recorded in PLAN.md; all nautilus-* crates
+# must share one version. Do not bump casually: the Rust API changes between releases.
+nautilus-core = "=0.68.0"
+nautilus-model = "=0.68.0"
+
+strum = { version = "0.28", features = ["derive"] }
+thiserror = "2"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+redundant_clone = "warn"
+clone_on_ref_ptr = "warn"
+needless_collect = "warn"
+large_enum_variant = "warn"
+inefficient_to_string = "warn"
+trivially_copy_pass_by_ref = "warn"

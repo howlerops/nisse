@@ -1,0 +1,18 @@
+[package]
+name = "nisse-core"
+description = "Shared domain types for nisse; re-exports the NautilusTrader types the workspace uses"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+nautilus-core = { workspace = true }
+nautilus-model = { workspace = true }
+strum = { workspace = true }
+thiserror = { workspace = true }
