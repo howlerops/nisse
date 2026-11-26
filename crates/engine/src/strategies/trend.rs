@@ -740,8 +740,15 @@ mod tests {
 
     #[test]
     fn build_returns_the_strategy_for_its_name() {
-        let built = crate::strategies::build(&strategy().to_params()).map(|s| s.name());
-        assert_eq!(built.unwrap(), TREND_VOL_TARGET);
+        let Ok(built) = crate::strategies::build(&strategy().to_params()) else {
+            panic!("the trend strategy's own parameters must build");
+        };
+        assert_eq!(built.strategy.name(), TREND_VOL_TARGET);
+        assert_eq!(built.window, strategy().window_spec());
+        assert_eq!(
+            built.sessions_per_year,
+            strategy().params().sessions_per_year
+        );
     }
 
     #[test]
