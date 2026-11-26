@@ -2,7 +2,16 @@
 
 use nisse_core::{Broker, BrokerOrder, IntentLog, OrderIntent, ReplaceRequest, SubmitError};
 
-use crate::{EngineError, OrderTracker};
+use crate::{Applied, EngineError, OrderTracker};
+
+/// The broker's answer to a submit or replace, and what it changed in the tracker. `applied.fill`
+/// is set when the order came back already (partly) filled: the caller records it like any
+/// other fill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Submitted {
+    pub order: BrokerOrder,
+    pub applied: Applied,
+}
 
 /// Sends orders through a [`Broker`] with the write-ahead rule enforced: the intent is in the
 /// [`IntentLog`] and in the [`OrderTracker`] before the broker hears about it.
@@ -29,7 +38,8 @@ impl<B: Broker, L: IntentLog> OrderGateway<B, L> {
     /// 2. `intents.record_intent(intent)`. If it fails, return `IntentNotRecorded` and do not
     ///    call the broker (the tracker marks the order never-arrived at `intent.ts`).
     /// 3. `broker.submit(intent)`, exactly once.
-    ///    - `Ok(order)`: apply it to the tracker (event time `order.ts`) and return it.
+    ///    - `Ok(order)`: apply it to the tracker (event time `order.ts`) and return it with the
+    ///      tracker's [`Applied`] (which carries the fill if it came back filled).
     ///    - `Rejected`: mark the order never-arrived at `intent.ts`; return `OrderRejected`.
     ///    - `Unknown`: leave the tracker in `Intent` (reconciliation resolves it by client
     ///      order id) and return `OrderOutcomeUnknown`.
@@ -37,7 +47,7 @@ impl<B: Broker, L: IntentLog> OrderGateway<B, L> {
         &self,
         tracker: &mut OrderTracker,
         intent: &OrderIntent,
-    ) -> Result<BrokerOrder, EngineError> {
+    ) -> Result<Submitted, EngineError> {
         self.record(tracker, intent).await?;
         let result = self.broker.submit(intent).await;
         settle(tracker, intent, result)
@@ -52,7 +62,7 @@ impl<B: Broker, L: IntentLog> OrderGateway<B, L> {
         tracker: &mut OrderTracker,
         original: nisse_core::nautilus::ClientOrderId,
         replacement: &OrderIntent,
-    ) -> Result<BrokerOrder, EngineError> {
+    ) -> Result<Submitted, EngineError> {
         let venue_order_id = tracker
             .get(original)
             .and_then(|tracked| tracked.venue_order_id)
@@ -90,15 +100,15 @@ fn settle<E>(
     tracker: &mut OrderTracker,
     intent: &OrderIntent,
     result: Result<BrokerOrder, SubmitError<E>>,
-) -> Result<BrokerOrder, EngineError>
+) -> Result<Submitted, EngineError>
 where
     E: std::error::Error + Send + Sync + 'static,
 {
     let client_order_id = intent.client_order_id;
     match result {
         Ok(order) => {
-            tracker.apply(&order, None, order.ts)?;
-            Ok(order)
+            let applied = tracker.apply(&order, None, order.ts)?;
+            Ok(Submitted { order, applied })
         }
         Err(SubmitError::Rejected(source)) => {
             tracker.mark_never_arrived(client_order_id, intent.ts)?;

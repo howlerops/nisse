@@ -155,7 +155,15 @@ fn trade_update(data: StreamData) -> Result<StreamMessage, AdapterError> {
         "fill" | "partial_fill" => Some(fill_detail(execution_id, price, qty)?),
         _ => None,
     };
-    let order = order.into_broker_order()?;
+    // An order this adapter cannot represent (a stop order placed by hand in the web UI, say)
+    // is by construction not one the engine sent. Skipping it keeps one foreign order from
+    // forcing an endless reconnect loop; its effect on positions still shows up in
+    // reconciliation.
+    let order = match order.into_broker_order() {
+        Ok(order) => order,
+        Err(AdapterError::Unsupported(_)) => return Ok(StreamMessage::Ignored),
+        Err(error) => return Err(error),
+    };
     let ts = match timestamp {
         Some(text) => parse_ts(&text)?,
         None => order.ts,
@@ -510,6 +518,15 @@ mod tests {
         let text = json!({"stream": "trade_updates", "data": {"event": "new", "order": order}})
             .to_string();
         assert!(matches!(parse(&text), Err(AdapterError::Decode(_))));
+    }
+
+    #[test]
+    fn update_for_an_order_kind_we_never_send_is_ignored() {
+        let mut order = order_value("placed-by-hand");
+        order["type"] = json!("stop");
+        let text = json!({"stream": "trade_updates", "data": {"event": "new", "order": order}})
+            .to_string();
+        assert_eq!(parse(&text).unwrap(), StreamMessage::Ignored);
     }
 
     #[test]

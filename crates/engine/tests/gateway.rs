@@ -205,7 +205,7 @@ async fn accepted_submit_returns_scripted_order_and_applies_it() {
     f.broker.push_submit_result(Ok(scripted));
     let mut tracker = OrderTracker::new();
 
-    let order = f.gateway.submit(&mut tracker, &i).await.unwrap();
+    let order = f.gateway.submit(&mut tracker, &i).await.unwrap().order;
 
     assert_eq!(order, scripted);
     let tracked = tracker.get(cid("nisse-1-0")).unwrap();
@@ -220,7 +220,7 @@ async fn default_submit_is_accepted_from_the_intent() {
     let i = intent("nisse-1-0", "10", Some("500.10"));
     let mut tracker = OrderTracker::new();
 
-    let order = f.gateway.submit(&mut tracker, &i).await.unwrap();
+    let order = f.gateway.submit(&mut tracker, &i).await.unwrap().order;
 
     assert_eq!(order, accepted_from(&i));
     assert_eq!(order.state, OrderState::Accepted);
@@ -236,7 +236,11 @@ async fn immediately_filled_submit_moves_tracker_to_filled() {
         .push_submit_result(Ok(snapshot(&i, OrderState::Filled, "10", Some("500.10"))));
     let mut tracker = OrderTracker::new();
 
-    let order = f.gateway.submit(&mut tracker, &i).await.unwrap();
+    let submitted = f.gateway.submit(&mut tracker, &i).await.unwrap();
+    let fill = submitted.applied.fill.unwrap();
+    assert_eq!(fill.qty.as_decimal(), i.qty.as_decimal());
+    assert_eq!(fill.client_order_id, i.client_order_id);
+    let order = submitted.order;
 
     assert_eq!(order.state, OrderState::Filled);
     let tracked = tracker.get(cid("nisse-1-0")).unwrap();
@@ -263,7 +267,7 @@ async fn replace_records_replacement_then_calls_broker_with_original_venue_id() 
         .await
         .unwrap();
 
-    assert_eq!(order, scripted);
+    assert_eq!(order.order, scripted);
     assert_eq!(
         calls(&f.log),
         [

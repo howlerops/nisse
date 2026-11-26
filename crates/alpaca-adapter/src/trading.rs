@@ -103,14 +103,26 @@ impl Broker for AlpacaTrading {
         }
     }
 
-    /// `GET /v2/orders?status=open&limit=500`.
+    /// `GET /v2/orders?status=open&limit=500`. Orders of a kind this adapter never sends are
+    /// left out; any other undecodable order is an error.
     async fn open_orders(&self) -> Result<Vec<BrokerOrder>, AdapterError> {
         let url = format!("{}/v2/orders", self.base_url);
         let wire: Vec<WireOrder> = self
             .http
             .get(&url, &[("status", "open"), ("limit", "500")])
             .await?;
-        wire.into_iter().map(WireOrder::into_broker_order).collect()
+        // Orders this adapter cannot represent (other types or times in force) are not ones the
+        // engine sent; leaving them out keeps one hand-placed order from blocking every
+        // reconciliation. Their fills still surface as position mismatches.
+        let mut orders = Vec::with_capacity(wire.len());
+        for order in wire {
+            match order.into_broker_order() {
+                Ok(order) => orders.push(order),
+                Err(AdapterError::Unsupported(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(orders)
     }
 
     /// `GET /v2/positions`.
@@ -566,19 +578,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_orders_fails_on_the_first_bad_order() {
+    async fn open_orders_skips_foreign_order_kinds_but_fails_on_undecodable_ones() {
         let server = MockServer::start().await;
-        let mut bad = order_value();
-        bad["type"] = json!("stop");
+        let mut stop = order_value();
+        stop["type"] = json!("stop");
+        stop["client_order_id"] = json!("placed-by-hand");
         Mock::given(method("GET"))
             .and(path("/v2/orders"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!([order_value(), bad])))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([stop, order_value()])))
             .expect(1)
             .mount(&server)
             .await;
         let config = config(server.uri());
+        let orders = trading(&config).open_orders().await.unwrap();
+        assert_eq!(
+            orders.len(),
+            1,
+            "the stop order is not one we could have sent"
+        );
+        assert_eq!(orders[0].venue_order_id.to_string(), ORDER_ID);
+
+        let server = MockServer::start().await;
+        let mut bad = order_value();
+        bad["status"] = json!("bogus");
+        Mock::given(method("GET"))
+            .and(path("/v2/orders"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([order_value(), bad])))
+            .mount(&server)
+            .await;
+        let config = self::config(server.uri());
         let err = trading(&config).open_orders().await.unwrap_err();
-        assert!(matches!(err, AdapterError::Unsupported(_)));
+        assert!(matches!(err, AdapterError::Decode(_)));
     }
 
     #[tokio::test]
