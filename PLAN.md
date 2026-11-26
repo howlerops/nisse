@@ -16,7 +16,7 @@ Realistic good outcome: net Sharpe 0.3 to 0.6 with long stretches behind SPY. At
 | Area | Decision |
 |---|---|
 | Broker | Alpaca for paper and live (real order API, free paper environment on the same API, fractional shares, $0 stock commissions). |
-| Engine | NautilusTrader Rust crates, pinned at exactly `0.68.0` (released 2026-11-10; needs Rust 1.99.1, pinned in `rust-toolchain.toml`). Same engine for backtest and live. Rust API still changes between releases; licence is LGPL-3.0-only. |
+| Engine | NautilusTrader Rust crates, pinned at exactly `0.68.0` (released 2026-11-10; needs Rust 1.99.1, pinned in `rust-toolchain.toml`). Same engine for backtest and live. Rust API still changes between releases. NautilusTrader is LGPL-3.0-only; this repo's own code is MIT. |
 | Language | Rust only for the core. |
 | Adapter | Write our own Alpaca adapter (Alpaca is not an official Nautilus adapter; community ones are alpha). |
 | Agents | Claude Code cloud scheduled tasks on the subscription, no API token for now; hourly at most; output is PRs. |
@@ -147,7 +147,7 @@ Promote on statistical evidence across the whole trial history, never on paper o
 - Agents get a GitHub token scoped to the research repo only.
 - Treat every agent PR as untrusted input (agents read untrusted web content).
 - PRs contain schema-validated configs and notes.
-- Risk gate, adapter and limits need CODEOWNERS review.
+- Risk gate, adapter and limits are sensitive paths. No CODEOWNERS or branch protection for now; reviewers are the owner and Claude (see CLAUDE.md).
 - CI runs schema checks, backtest and gates, then signs the artifact; the engine verifies the signature before loading.
 - Risk limits live outside the agent-writable repo.
 - A human merges every PR.
@@ -199,7 +199,7 @@ Intraday is out of scope unless a gated strategy needs it. The day-trade limit s
 
 - [ ] Market data: free IEX feed or the $99/month SIP plan; decide before backtesting.
 - [ ] Whether Alpaca fractional orders can be limit orders (Alpaca docs disagree); test in paper.
-- [ ] ~~Pin a NautilusTrader version~~ (pinned at `0.68.0` in Phase 0); confirm LGPL-3.0 suits how this repo is published. Note the crates moved from `LGPL-3.0-or-later` to `LGPL-3.0-only`.
+- [x] NautilusTrader pinned at `0.68.0` (Phase 0). Licence decided 2026-11-26: this repo's own code is MIT. NautilusTrader stays a separate `LGPL-3.0-only` dependency that this repo does not relicense; its terms apply to that library if a built binary is ever given to someone else.
 - [ ] Confirm Native Shell can read Postgres through a Rust module before building screens.
 - [ ] Whether Anthropic's Commercial Terms or Usage Policy carry a securities clause like the Consumer Terms; read before moving agents to an API key.
 - [ ] Taxable account or IRA.
