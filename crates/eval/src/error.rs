@@ -15,7 +15,8 @@ pub enum EvalError {
     InvalidJob(String),
     /// The build has uncommitted changes, so its decisions could not be replayed.
     #[error(
-        "this build has uncommitted changes; its decisions could not be replayed (pass          --allow-dirty to run anyway)"
+        "this build has uncommitted changes; its decisions could not be replayed \
+         (pass --allow-dirty to run anyway)"
     )]
     DirtyBuild,
     /// The engine failed while building or running a strategy.

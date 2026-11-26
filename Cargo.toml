@@ -69,3 +69,8 @@ needless_collect = "warn"
 large_enum_variant = "warn"
 inefficient_to_string = "warn"
 trivially_copy_pass_by_ref = "warn"
+
+# DuckDB is compiled from source. With debug info its build directory is over 5 GB per
+# feature combination, which fills a development disk and slows CI caching.
+[profile.dev.package.libduckdb-sys]
+debug = false
