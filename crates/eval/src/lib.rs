@@ -8,6 +8,7 @@ pub mod deadman;
 mod error;
 pub mod execution;
 pub mod execution_job;
+pub mod gate_report;
 pub mod gates;
 pub mod outcome;
 pub mod replay;
