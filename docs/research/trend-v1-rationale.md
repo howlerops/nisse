@@ -12,8 +12,9 @@ broad ETFs:
 1. Hold the asset only if its own return over roughly the past year, leaving out the most
    recent month, is positive. Otherwise hold none of it (the cash sits idle).
 2. Size each held asset so that it contributes an equal share of a 9% annual portfolio
-   volatility target, using its own volatility over the past 60 sessions, capped at 25% of
-   equity per asset. There is no leverage and no shorting.
+   volatility target, using its own volatility over the past 60 sessions, capped at 12.5% of
+   equity per asset (one eighth, so the eight caps add up to exactly the account). There is
+   no leverage and no shorting.
 3. Trade the difference at the next session's open, unless the change is too small to bother.
 
 ## Why it might work
@@ -64,7 +65,7 @@ Chosen for breadth of asset class, long history and liquidity, before looking at
 | Skip | 21 sessions | Leaves out the most recent month, where returns tend to reverse |
 | Volatility window | 60 sessions | About a quarter: responsive without chasing single weeks |
 | Portfolio volatility target | 9% a year | Middle of the 8 to 10% range in PLAN.md |
-| Cap per asset | 25% of equity | Unlevered with eight assets even if four are held at the cap |
+| Cap per asset | 12.5% of equity | One eighth: the portfolio cannot exceed 100% of equity even if all eight assets are held at the cap |
 | Minimum trade | 25 dollars | Skips changes that are noise at this account size |
 | Rebalance | Last session of each month | Monthly, as planned; swing holding periods only |
 
