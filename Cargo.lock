@@ -1919,6 +1919,7 @@ dependencies = [
  "nisse-store",
  "rust_decimal",
  "serde_json",
+ "sha2",
  "thiserror",
  "tokio",
  "tokio-postgres",

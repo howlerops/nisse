@@ -7,9 +7,11 @@ pub mod backtest_job;
 pub mod deadman;
 mod error;
 pub mod execution;
+pub mod execution_job;
 pub mod gates;
 pub mod outcome;
 pub mod replay;
+pub mod score_job;
 pub mod stats;
 
 pub use error::EvalError;
