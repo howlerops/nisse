@@ -309,8 +309,3 @@ pub async fn risk_breaches<C: GenericClient>(
 fn parse_symbol(text: &str) -> Result<Symbol, StoreError> {
     Symbol::new_checked(text).map_err(|e| StoreError::Data(format!("bad stored symbol: {e}")))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-}
