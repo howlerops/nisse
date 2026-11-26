@@ -1,19 +1,17 @@
 //! The only way an order leaves the engine: write the intent, then submit.
 
-use nisse_core::{Broker, BrokerOrder, IntentLog, OrderIntent, ReplaceRequest};
+use nisse_core::{Broker, BrokerOrder, IntentLog, OrderIntent, ReplaceRequest, SubmitError};
 
 use crate::{EngineError, OrderTracker};
 
 /// Sends orders through a [`Broker`] with the write-ahead rule enforced: the intent is in the
 /// [`IntentLog`] and in the [`OrderTracker`] before the broker hears about it.
 #[derive(Debug)]
-#[allow(dead_code, reason = "stub: Phase 1 task T7 reads the fields")]
 pub struct OrderGateway<B, L> {
     broker: B,
     intents: L,
 }
 
-#[allow(unused_variables, reason = "stub: Phase 1 task T7")]
 impl<B: Broker, L: IntentLog> OrderGateway<B, L> {
     #[must_use]
     pub fn new(broker: B, intents: L) -> Self {
@@ -40,7 +38,9 @@ impl<B: Broker, L: IntentLog> OrderGateway<B, L> {
         tracker: &mut OrderTracker,
         intent: &OrderIntent,
     ) -> Result<BrokerOrder, EngineError> {
-        todo!("Phase 1 task T7")
+        self.record(tracker, intent).await?;
+        let result = self.broker.submit(intent).await;
+        settle(tracker, intent, result)
     }
 
     /// Replaces a live order. `replacement` is the full intent of the new order (its
@@ -53,12 +53,68 @@ impl<B: Broker, L: IntentLog> OrderGateway<B, L> {
         original: nisse_core::nautilus::ClientOrderId,
         replacement: &OrderIntent,
     ) -> Result<BrokerOrder, EngineError> {
-        todo!("Phase 1 task T7")
+        let venue_order_id = tracker
+            .get(original)
+            .and_then(|tracked| tracked.venue_order_id)
+            .ok_or(EngineError::UnknownOrder(original))?;
+        self.record(tracker, replacement).await?;
+        let result = self
+            .broker
+            .replace(venue_order_id, &replace_request(replacement))
+            .await;
+        settle(tracker, replacement, result)
+    }
+
+    /// Steps 1 and 2 of the write-ahead rule: track the intent, then write it to the intent
+    /// log. On `Err` the broker has not been called.
+    async fn record(
+        &self,
+        tracker: &mut OrderTracker,
+        intent: &OrderIntent,
+    ) -> Result<(), EngineError> {
+        tracker.track_intent(*intent)?;
+        if let Err(source) = self.intents.record_intent(intent).await {
+            tracker.mark_never_arrived(intent.client_order_id, intent.ts)?;
+            return Err(EngineError::IntentNotRecorded {
+                client_order_id: intent.client_order_id,
+                source: Box::new(source),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Step 3 of the write-ahead rule: applies the broker's answer for an intent that is already
+/// recorded, and maps it to the caller's result. Shared by `submit` and `replace`.
+fn settle<E>(
+    tracker: &mut OrderTracker,
+    intent: &OrderIntent,
+    result: Result<BrokerOrder, SubmitError<E>>,
+) -> Result<BrokerOrder, EngineError>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let client_order_id = intent.client_order_id;
+    match result {
+        Ok(order) => {
+            tracker.apply(&order, None, order.ts)?;
+            Ok(order)
+        }
+        Err(SubmitError::Rejected(source)) => {
+            tracker.mark_never_arrived(client_order_id, intent.ts)?;
+            Err(EngineError::OrderRejected {
+                client_order_id,
+                source: Box::new(source),
+            })
+        }
+        Err(SubmitError::Unknown(source)) => Err(EngineError::OrderOutcomeUnknown {
+            client_order_id,
+            source: Box::new(source),
+        }),
     }
 }
 
 /// The [`ReplaceRequest`] that turns the live order into `replacement`.
-#[allow(dead_code, reason = "stub: Phase 1 task T7 uses it")]
 fn replace_request(replacement: &OrderIntent) -> ReplaceRequest {
     ReplaceRequest {
         new_client_order_id: replacement.client_order_id,
