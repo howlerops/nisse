@@ -10,4 +10,7 @@ pub enum CoreError {
     /// A string did not name a variant of a store enum ([`crate::Action`] and friends).
     #[error("unknown enum value: {0}")]
     UnknownVariant(#[from] strum::ParseError),
+    /// Sessions handed to [`crate::MarketCalendar::new`] were empty, unordered or overlapping.
+    #[error("invalid calendar: {0}")]
+    InvalidCalendar(&'static str),
 }

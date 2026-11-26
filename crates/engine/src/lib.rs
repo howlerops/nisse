@@ -3,9 +3,17 @@
 //!
 //! Rules that hold for everything in this crate: no LLM or network call in the order path, and
 //! time and randomness only from injected sources, so the same features, config hash, seed and
-//! git SHA reproduce the same decision. Phase 0 is scaffold only; the engine actor arrives in
-//! Phase 2.
+//! git SHA reproduce the same decision. The broker is reached only through the
+//! [`nisse_core::Broker`] trait.
 
 mod error;
+mod gateway;
+mod order_tracker;
+mod reconcile;
+mod sync;
 
-pub use error::EngineError;
+pub use error::{BoxError, EngineError};
+pub use gateway::OrderGateway;
+pub use order_tracker::{Applied, OrderTracker, TrackedOrder};
+pub use reconcile::{Finding, reconcile};
+pub use sync::{SyncReport, sync_with_broker};
