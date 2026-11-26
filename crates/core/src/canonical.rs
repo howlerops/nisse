@@ -150,10 +150,26 @@ fn is_plain_decimal(text: &str) -> bool {
 /// line per bar, `symbol,ts_event,open,high,low,close,volume\n`, in the order given, with
 /// each decimal normalised. Two reads that return the same bars give the same id whatever
 /// files they came from.
-#[allow(unused_variables, reason = "stub: Phase 3 task B2")]
 #[must_use]
 pub fn bars_snapshot_id(bars: &[nautilus_model::data::Bar]) -> String {
-    todo!("Phase 3 task B2")
+    use std::fmt::Write as _;
+
+    let mut text = String::with_capacity(bars.len() * 64);
+    for bar in bars {
+        // Writing to a `String` cannot fail.
+        let _ = writeln!(
+            text,
+            "{},{},{},{},{},{},{}",
+            bar.bar_type.instrument_id().symbol.as_str(),
+            bar.ts_event.as_u64(),
+            normalised_text(&bar.open.as_decimal()),
+            normalised_text(&bar.high.as_decimal()),
+            normalised_text(&bar.low.as_decimal()),
+            normalised_text(&bar.close.as_decimal()),
+            normalised_text(&bar.volume.as_decimal()),
+        );
+    }
+    sha256_hash(text.as_bytes()).to_string()
 }
 
 /// SHA-256 of `canonical_json(features_to_json(features))` (`decision.feature_hash`). Two
@@ -443,5 +459,128 @@ mod tests {
             hex(feature_hash(&features(&[("a", "1.50")]))),
             "87d1686a3b72d474dd6a634812da8bd415587b9d0411af8c2399acd06b59ad61"
         );
+    }
+
+    // bars_snapshot_id
+
+    use crate::nautilus::{
+        AggregationSource, Bar, BarAggregation, BarSpecification, BarType, InstrumentId, Price,
+        PriceType, Quantity, Symbol, UnixNanos, Venue,
+    };
+
+    const TS: u64 = 1_641_243_600_000_000_000;
+
+    /// A valid daily bar for `symbol` at `ts`.
+    fn bar(
+        symbol: &str,
+        ts: u64,
+        open: &str,
+        high: &str,
+        low: &str,
+        close: &str,
+        volume: &str,
+    ) -> Bar {
+        let instrument_id = InstrumentId::new(Symbol::new(symbol), Venue::new("ALPACA"));
+        let spec = BarSpecification::new(1, BarAggregation::Day, PriceType::Last);
+        let bar_type = BarType::new(instrument_id, spec, AggregationSource::External);
+        Bar::new(
+            bar_type,
+            Price::from(open),
+            Price::from(high),
+            Price::from(low),
+            Price::from(close),
+            Quantity::from(volume),
+            UnixNanos::from(ts),
+            UnixNanos::from(ts),
+        )
+    }
+
+    /// The reference bar: AAPL, 178.20 / 178.26 / 178.20 / 178.21, volume 1118. Every price is
+    /// written to two places, as `Bar` requires one precision per bar.
+    fn aapl() -> Bar {
+        bar("AAPL", TS, "178.20", "178.26", "178.20", "178.21", "1118")
+    }
+
+    fn sha256_hex(text: &str) -> String {
+        let digest = Sha256::digest(text.as_bytes());
+        digest.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn bars_snapshot_id_is_64_lowercase_hex() {
+        let id = bars_snapshot_id(&[aapl()]);
+        assert_eq!(id.len(), 64);
+        assert!(
+            id.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        );
+    }
+
+    #[test]
+    fn bars_snapshot_id_is_equal_for_the_same_bars() {
+        let first = [aapl(), bar("TSLA", TS, "1", "1", "1", "1", "1")];
+        let second = [aapl(), bar("TSLA", TS, "1", "1", "1", "1", "1")];
+        assert_eq!(bars_snapshot_id(&first), bars_snapshot_id(&second));
+    }
+
+    #[test]
+    fn bars_snapshot_id_changes_with_any_field_of_any_bar() {
+        let base = bars_snapshot_id(&[aapl()]);
+        let changed = [
+            bar("AAPM", TS, "178.20", "178.26", "178.20", "178.21", "1118"),
+            bar(
+                "AAPL",
+                TS + 1,
+                "178.20",
+                "178.26",
+                "178.20",
+                "178.21",
+                "1118",
+            ),
+            bar("AAPL", TS, "178.21", "178.26", "178.20", "178.21", "1118"),
+            bar("AAPL", TS, "178.20", "178.27", "178.20", "178.21", "1118"),
+            bar("AAPL", TS, "178.20", "178.26", "178.10", "178.21", "1118"),
+            bar("AAPL", TS, "178.20", "178.26", "178.20", "178.22", "1118"),
+            bar("AAPL", TS, "178.20", "178.26", "178.20", "178.21", "1119"),
+        ];
+        assert_eq!(changed.len(), 7);
+        for (i, altered) in changed.iter().enumerate() {
+            assert_ne!(
+                base,
+                bars_snapshot_id(std::slice::from_ref(altered)),
+                "field {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn bars_snapshot_id_changes_when_the_order_changes() {
+        let a = aapl();
+        let b = bar("TSLA", TS, "1", "1", "1", "1", "1");
+        assert_ne!(bars_snapshot_id(&[a, b]), bars_snapshot_id(&[b, a]));
+    }
+
+    #[test]
+    fn bars_snapshot_id_ignores_price_spelling() {
+        let padded = bar("AAPL", TS, "1.20", "1.60", "1.10", "1.50", "1");
+        let plain = bar("AAPL", TS, "1.2", "1.6", "1.1", "1.5", "1");
+        assert_eq!(bars_snapshot_id(&[padded]), bars_snapshot_id(&[plain]));
+    }
+
+    #[test]
+    fn bars_snapshot_id_of_no_bars_is_sha256_of_empty_string() {
+        assert_eq!(
+            bars_snapshot_id(&[]),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn bars_snapshot_id_is_sha256_of_the_literal_text() {
+        let expected = sha256_hex(
+            "AAPL,1641243600000000000,178.2,178.26,178.2,178.21,1118\nTSLA,1641243600000000000,1,1,1,1,1\n",
+        );
+        let bars = [aapl(), bar("TSLA", TS, "1", "1", "1", "1", "1")];
+        assert_eq!(bars_snapshot_id(&bars), expected);
     }
 }
