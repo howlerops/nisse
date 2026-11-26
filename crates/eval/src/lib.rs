@@ -6,7 +6,9 @@
 pub mod backtest_job;
 pub mod deadman;
 mod error;
+pub mod execution;
 pub mod gates;
+pub mod outcome;
 pub mod replay;
 pub mod stats;
 
