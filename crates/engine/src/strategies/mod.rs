@@ -3,7 +3,7 @@
 
 mod trend;
 
-pub use trend::{TREND_VOL_TARGET, TrendParams, TrendVolTarget};
+pub use trend::{TREND_VOL_TARGET, TrendParams, TrendVolTarget, feature};
 
 use serde_json::Value;
 

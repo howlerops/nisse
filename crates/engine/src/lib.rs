@@ -6,6 +6,11 @@
 //! git SHA reproduce the same decision. The broker is reached only through the
 //! [`nisse_core::Broker`] trait.
 
+#![allow(
+    dead_code,
+    reason = "Phase 3 in progress: stubs call nothing yet. LEAD: remove before the PR."
+)]
+
 /// The git commit this build was made from: 40 lowercase hex characters (all zeros when the
 /// build could not tell; see `build.rs`). Stored in `strategy_version.git_sha`.
 pub const GIT_SHA: &str = env!("NISSE_GIT_SHA");

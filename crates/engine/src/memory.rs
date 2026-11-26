@@ -120,6 +120,14 @@ mod tests {
 
     use super::*;
 
+    /// Records through the `&MemoryStore` implementation, as the engine does.
+    async fn by_ref(store: &MemoryStore, decision: &Decision) -> DecisionId {
+        async fn record<L: DecisionLog>(log: L, decision: &Decision) -> DecisionId {
+            log.record_decision(decision).await.ok().unwrap()
+        }
+        record(store, decision).await
+    }
+
     #[tokio::test]
     async fn keeps_what_it_is_given_in_order_and_numbers_decisions_from_one() {
         let store = MemoryStore::new();
@@ -138,10 +146,7 @@ mod tests {
             reason_code: "within_band".to_owned(),
             ts: UnixNanos::from(1),
         };
-        assert_eq!(
-            (&store).record_decision(&decision).await.unwrap(),
-            DecisionId(1)
-        );
+        assert_eq!(by_ref(&store, &decision).await, DecisionId(1));
         assert_eq!(
             store.record_decision(&decision).await.unwrap(),
             DecisionId(2)

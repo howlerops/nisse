@@ -9,6 +9,11 @@
 //! `open`, `high`, `low`, `close` and `volume` as `DECIMAL(28, 9)`. Prices are exact decimals
 //! from the broker's text all the way into the file; nothing passes through a float.
 
+#![allow(
+    dead_code,
+    reason = "Phase 3 in progress: stubs call nothing yet. LEAD: remove before the PR."
+)]
+
 mod error;
 mod reader;
 mod writer;
