@@ -232,7 +232,8 @@ a `new` event without `timestamp` uses `updated_at`; `partial_fill` missing `exe
 `tokio-tungstenite` server on `127.0.0.1:0` (use a `ws://` URL): auth then listen are sent
 with the credentials; `Connected` then updates arrive in order, from both text and binary
 frames; when the server drops the connection the task sends `Disconnected`, reconnects and
-sends `Connected` again; `unauthorized` makes `run_order_stream` return `Err`;
+sends `Connected` again; a connection attempt that fails before listening sends
+`ConnectFailed { reason }`; `unauthorized` makes `run_order_stream` return `Err`;
 back-pressure: with a channel of capacity 1 and a slow consumer, all N updates still arrive,
 in order; dropping the receiver makes the task return `Ok(())`.
 

@@ -8,11 +8,6 @@
 //! the write-ahead submit path) lives in `nisse-engine` and reaches this crate through the
 //! [`nisse_core::Broker`] trait.
 
-#![allow(
-    dead_code,
-    reason = "Phase 1 in progress: stubs call nothing yet. LEAD: remove before the PR."
-)]
-
 mod calendar;
 mod config;
 mod data;

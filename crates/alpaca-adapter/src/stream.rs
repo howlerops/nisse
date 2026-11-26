@@ -38,7 +38,7 @@ const UNAUTHORIZED: &str = "authorization rejected by server";
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// What the stream task sends to its consumer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(
     clippy::large_enum_variant,
     reason = "boxing the update would add a heap allocation per order event"
@@ -46,8 +46,16 @@ type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 pub enum StreamEvent {
     /// Authenticated and listening. Sent after every (re)connect: reconcile now.
     Connected,
-    /// The connection dropped; a reconnect follows.
-    Disconnected,
+    /// An established connection dropped; a reconnect follows. `reason` is for the operator
+    /// and never contains credentials.
+    Disconnected {
+        reason: String,
+    },
+    /// A connection attempt failed before it was listening; another attempt follows after the
+    /// back-off delay. Repeated occurrences mean order updates are not arriving.
+    ConnectFailed {
+        reason: String,
+    },
     Update(OrderUpdate),
 }
 
@@ -194,7 +202,7 @@ fn fill_detail(
 /// Connects to `config.stream_url`, authenticates, subscribes to `trade_updates`, then
 /// forwards every update. `events` is bounded and sends wait for room (back-pressure): an
 /// order update is never dropped. On any connection or protocol failure it sends
-/// `Disconnected`, waits (starting at `min_reconnect_delay`, doubling to
+/// `Disconnected` (or `ConnectFailed` if it never got as far as listening), waits (starting at `min_reconnect_delay`, doubling to
 /// [`MAX_RECONNECT_DELAY`], reset after a successful connect) and reconnects. An
 /// authentication failure is returned as `Err` immediately: retrying bad credentials is
 /// pointless.
@@ -219,15 +227,18 @@ pub async fn run_order_stream(
             Attempt::Unauthorized => {
                 return Err(AdapterError::Stream(UNAUTHORIZED.to_owned()));
             }
-            // The error detail is not surfaced: the consumer learns of the loss through
-            // `Disconnected` and reconciles on the next `Connected`.
-            Attempt::Failed(_) => {}
-        }
-        if connected {
-            if events.send(StreamEvent::Disconnected).await.is_err() {
-                return Ok(());
+            Attempt::Failed(error) => {
+                let reason = error.to_string();
+                let event = if connected {
+                    delay = min_reconnect_delay;
+                    StreamEvent::Disconnected { reason }
+                } else {
+                    StreamEvent::ConnectFailed { reason }
+                };
+                if events.send(event).await.is_err() {
+                    return Ok(());
+                }
             }
-            delay = min_reconnect_delay;
         }
         tokio::select! {
             () = sleep(delay) => {}
@@ -768,12 +779,38 @@ mod tests {
             client_id_of(&update_of(next_event(&mut rx).await)),
             "order-1"
         );
-        assert_eq!(next_event(&mut rx).await, StreamEvent::Disconnected);
+        assert!(matches!(
+            next_event(&mut rx).await,
+            StreamEvent::Disconnected { .. }
+        ));
         assert_eq!(next_event(&mut rx).await, StreamEvent::Connected);
         assert_eq!(
             client_id_of(&update_of(next_event(&mut rx).await)),
             "order-2"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_connect_attempts_are_reported_without_credentials() {
+        // Nothing listens on this port, so every attempt fails before the handshake.
+        let config = test_config("ws://127.0.0.1:9");
+        let credentials = Credentials::new("test-key-id", "test-secret");
+        let (tx, mut rx) = mpsc::channel(4);
+        let handle = tokio::spawn(async move {
+            run_order_stream(&config, &credentials, tx, Duration::from_millis(10)).await
+        });
+        for _ in 0..2 {
+            match next_event(&mut rx).await {
+                StreamEvent::ConnectFailed { reason } => {
+                    assert!(!reason.is_empty());
+                    assert!(!reason.contains("test-secret") && !reason.contains("test-key-id"));
+                }
+                other => panic!("expected ConnectFailed, got {other:?}"),
+            }
+        }
+        drop(rx);
+        let result = timeout(Duration::from_secs(5), handle).await;
+        assert!(matches!(result, Ok(Ok(Ok(())))));
     }
 
     #[tokio::test]
@@ -839,7 +876,10 @@ mod tests {
         let (mut rx, task) = start(&url, 4, Duration::from_secs(3600));
 
         assert_eq!(next_event(&mut rx).await, StreamEvent::Connected);
-        assert_eq!(next_event(&mut rx).await, StreamEvent::Disconnected);
+        assert!(matches!(
+            next_event(&mut rx).await,
+            StreamEvent::Disconnected { .. }
+        ));
         drop(rx);
 
         let result = timeout(Duration::from_secs(5), task)
@@ -859,7 +899,10 @@ mod tests {
         let (mut rx, _task) = start(&url, 8, Duration::from_millis(10));
 
         assert_eq!(next_event(&mut rx).await, StreamEvent::Connected);
-        assert_eq!(next_event(&mut rx).await, StreamEvent::Disconnected);
+        assert!(matches!(
+            next_event(&mut rx).await,
+            StreamEvent::Disconnected { .. }
+        ));
         assert_eq!(next_event(&mut rx).await, StreamEvent::Connected);
         assert_eq!(
             client_id_of(&update_of(next_event(&mut rx).await)),
@@ -881,7 +924,10 @@ mod tests {
         let (mut rx, _task) = start(&url, 8, Duration::from_millis(10));
 
         assert_eq!(next_event(&mut rx).await, StreamEvent::Connected);
-        assert_eq!(next_event(&mut rx).await, StreamEvent::Disconnected);
+        assert!(matches!(
+            next_event(&mut rx).await,
+            StreamEvent::Disconnected { .. }
+        ));
         assert_eq!(next_event(&mut rx).await, StreamEvent::Connected);
         assert_eq!(
             client_id_of(&update_of(next_event(&mut rx).await)),

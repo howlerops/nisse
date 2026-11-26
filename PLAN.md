@@ -68,7 +68,7 @@ Store every decision, not just every fill. Rank strategy versions, not individua
 | `trial_registry` | strategy_version_id, kind [backtest \| shadow \| live], data_range, result |
 | `decision` | event_ts, strategy_version_id, symbol, action [enter \| exit \| hold \| skip], intended_qty, expected_edge_bps, expected_vol, features, feature_hash, data_snapshot_id, rng_seed, reason_code |
 | `market_snapshot` | event_ts, symbol, bid, ask, mid, spread_bps, adv, vol, regime_tag |
-| `order_event` | decision_id, client_order_id, broker_order_id, event_ts, state, type, limit_px, qty |
+| `order_event` | decision_id, client_order_id, broker_order_id, event_ts, state, type, limit_px, qty, symbol, side, time_in_force, cum_filled_qty |
 | `fill` | client_order_id, broker_fill_id (unique), event_ts, px, qty, fee |
 | `position_event` | event_ts, symbol, qty_after, avg_cost |
 | `outcome_window` | decision_id, horizon, fwd_ret, bench_ret, mfe, mae |
@@ -169,7 +169,8 @@ Promote on statistical evidence across the whole trial history, never on paper o
 
 - Client order IDs persisted before submission in a write-ahead intent log.
 - Reconcile positions and orders against Alpaca on startup and on a timer (broker is source of truth).
-- Partial fills handled by cumulative quantity.
+- Partial fills handled by cumulative quantity: fills are derived from how far the broker's cumulative filled quantity moved, so duplicated, replayed or out-of-order messages cannot double-count.
+- State-changing broker requests are sent once and never retried; an unknown outcome is resolved by looking the client order id up at the broker.
 - Exchange calendar with half-days.
 
 ### Ramp

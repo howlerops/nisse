@@ -6,7 +6,7 @@ A deterministic Rust engine (built on NautilusTrader crates) trades through Alpa
 
 ## Status
 
-**Phase 0 (scaffold).** The Cargo workspace, CI and store schema exist; there is no trading code yet. See [PLAN.md](PLAN.md) for the build plan and the GitHub issues for per-phase work.
+**Phase 1 (Alpaca adapter).** The workspace, CI, store schema and the Alpaca adapter exist, tested against a local mock server. The adapter's paper round-trip tests are run by the owner (see [`docs/runbooks/paper-tests.md`](docs/runbooks/paper-tests.md)). There is no strategy yet. See [PLAN.md](PLAN.md) for the build plan and the GitHub issues for per-phase work.
 
 ## Layout
 

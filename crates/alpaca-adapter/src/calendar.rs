@@ -55,6 +55,7 @@ fn sessions_from_wire(days: &[WireDay]) -> Result<Vec<Session>, AdapterError> {
 /// Converts Alpaca calendar entries to sessions. `date` is `YYYY-MM-DD`; `open` and `close`
 /// are `HH:MM` in America/New_York local time (so a half-day shows `close` of `13:00`) and are
 /// converted to UTC with the tz database, which handles daylight saving.
+#[cfg(test)]
 pub(crate) fn sessions_from_json(json: &str) -> Result<Vec<Session>, AdapterError> {
     let days: Vec<WireDay> =
         serde_json::from_str(json).map_err(|e| AdapterError::Decode(e.to_string()))?;
