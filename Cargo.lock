@@ -1898,6 +1898,7 @@ version = "0.0.0"
 dependencies = [
  "criterion",
  "nisse-core",
+ "nisse-risk",
  "rust_decimal",
  "serde_json",
  "thiserror",
@@ -1914,6 +1915,7 @@ dependencies = [
  "nisse-bars",
  "nisse-core",
  "nisse-engine",
+ "nisse-risk",
  "nisse-store",
  "rust_decimal",
  "serde_json",
@@ -1928,6 +1930,8 @@ name = "nisse-risk"
 version = "0.0.0"
 dependencies = [
  "nisse-core",
+ "rust_decimal",
+ "serde_json",
  "thiserror",
 ]
 

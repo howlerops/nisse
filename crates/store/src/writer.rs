@@ -76,6 +76,7 @@ impl Buffers {
             StoreRecord::Snapshot(row) => self.snapshots.push(row),
             StoreRecord::Position(row) => self.positions.push(row),
             StoreRecord::Risk(row) => self.risks.push(row),
+            StoreRecord::RiskEvent(_) => todo!("Phase 4 task S2. LEAD: must be gone before the PR"),
             StoreRecord::Order { event, fill } => self.orders.push((event, fill)),
         }
     }

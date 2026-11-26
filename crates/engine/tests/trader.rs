@@ -180,7 +180,18 @@ fn config(symbols: Vec<Symbol>) -> TraderConfig {
             never_arrived_grace_nanos: 0,
             never_arrived_recheck_nanos: 0,
         },
+        limits: limits(),
+        risk: nisse_risk::RiskState::default(),
     }
+}
+
+/// The reviewed limits file in the repository.
+fn limits() -> nisse_risk::Limits {
+    nisse_risk::Limits::load(std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../config/limits/limits.json"
+    )))
+    .unwrap()
 }
 
 fn clock() -> ManualClock {

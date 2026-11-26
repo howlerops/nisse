@@ -19,6 +19,7 @@ use nisse_core::{
 use nisse_engine::{
     BacktestConfig, CostModel, EngineError, GIT_SHA, metrics, run_backtest, strategies,
 };
+use nisse_risk::Limits;
 use nisse_store::{
     Store,
     tables::{trial_registry, trial_result},
@@ -29,7 +30,8 @@ use serde_json::{Map, Value, json};
 use crate::EvalError;
 
 /// Top-level fields a job file may hold. Anything else is an error.
-const JOB_FIELDS: [&str; 8] = [
+const JOB_FIELDS: [&str; 9] = [
+    "limits_path",
     "strategy",
     "symbols",
     "start",
@@ -52,13 +54,15 @@ pub struct BacktestJob {
     pub starting_cash: Decimal,
     pub costs: CostModel,
     pub bars_dir: PathBuf,
+    /// The risk limits file the run is gated by.
+    pub limits_path: PathBuf,
     pub seed: u64,
 }
 
 impl BacktestJob {
     /// Parses the config file's JSON:
     /// {"strategy": {..params incl. "strategy"..}, "symbols": ["SPY", ..], "start": "2015-01-01", "end": "2024-12-31",
-    ///  "starting_cash": "100000", "costs": {"slippage_bps": "2", "fee_per_share": "0.0001"}, "bars_dir": "data/bars", "seed": 0}
+    ///  "starting_cash": "100000", "costs": {"slippage_bps": "2", "fee_per_share": "0.0001"}, "bars_dir": "data/bars", "limits_path": "config/limits/limits.json", "seed": 0}
     /// Decimals are JSON strings (never floats; a JSON number for a decimal field is an error). `start` is 00:00:00 UTC of its date and `end` is 23:59:59.999999999 UTC of its date. `seed` is optional (default 0). Unknown top-level fields are an error. Errors are `EvalError::InvalidJob(String)` naming the field.
     pub fn from_json(value: &Value) -> Result<Self, EvalError> {
         let object = value
@@ -93,6 +97,11 @@ impl BacktestJob {
                 .as_str()
                 .ok_or_else(|| invalid("bars_dir", "must be a string"))?,
         );
+        let limits_path = PathBuf::from(
+            field(object, "limits_path")?
+                .as_str()
+                .ok_or_else(|| invalid("limits_path", "must be a string"))?,
+        );
         let seed = match object.get("seed") {
             None => 0,
             Some(seed) => seed
@@ -108,6 +117,7 @@ impl BacktestJob {
             starting_cash,
             costs,
             bars_dir,
+            limits_path,
             seed,
         })
     }
@@ -142,6 +152,7 @@ pub async fn run_backtest_job(
         return Err(EvalError::DirtyBuild);
     }
     let built = strategies::build(&job.strategy_params).map_err(strategy_error)?;
+    let limits = Limits::load(&job.limits_path)?;
 
     let symbols: Vec<&str> = job.symbols.iter().map(String::as_str).collect();
     let reader = BarReader::open(&job.bars_dir)?;
@@ -221,6 +232,7 @@ pub async fn run_backtest_job(
         costs: job.costs,
         data_snapshot_id: data_snapshot_id.clone(),
         seed: job.seed,
+        limits,
     };
     let run = run_backtest(built.strategy, &bars, &calendar, config).await?;
 

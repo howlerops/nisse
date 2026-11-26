@@ -126,6 +126,12 @@ fn trader_on_bar(c: &mut Criterion) {
             never_arrived_grace_nanos: 0,
             never_arrived_recheck_nanos: 0,
         },
+        limits: nisse_risk::Limits::load(std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../config/limits/limits.json"
+        )))
+        .unwrap(),
+        risk: nisse_risk::RiskState::default(),
     };
     let store = MemoryStore::new();
     let mut trader = Trader::new(

@@ -10,6 +10,7 @@ use nisse_core::{
         Bar, ClientOrderId, OrderSide, OrderType, Quantity, Symbol, TimeInForce, UnixNanos,
     },
 };
+use nisse_risk::{Limits, RiskGate, RiskState};
 use rust_decimal::Decimal;
 
 use crate::{
@@ -33,6 +34,10 @@ pub struct TraderConfig {
     /// Base seed; decision `n` (counting from 0) gets `seed + n`.
     pub seed: u64,
     pub sync: SyncOptions,
+    /// The risk limits every order is checked against.
+    pub limits: Limits,
+    /// The risk state restored from the store (`RiskState::default()` for a fresh account).
+    pub risk: RiskState,
 }
 
 /// What one rebalance did.
@@ -67,6 +72,8 @@ pub struct Trader<S, B, L, D, K, C> {
     /// One preallocated window per symbol in the universe.
     windows: BTreeMap<Symbol, SymbolWindow>,
     decisions_made: u64,
+    /// The risk gate: limits, drawdown mode, kill switch, day-trade count.
+    gate: RiskGate,
 }
 
 impl<S, B, L, D, K, C> Trader<S, B, L, D, K, C>
@@ -103,6 +110,7 @@ where
                 "the universe must be sorted by symbol with no duplicates".to_owned(),
             ));
         }
+        let gate = RiskGate::new(config.limits.clone(), config.risk.clone());
         let mut windows = BTreeMap::new();
         for &symbol in &config.symbols {
             windows.insert(
@@ -123,6 +131,7 @@ where
             state,
             windows,
             decisions_made: 0,
+            gate,
         })
     }
 
@@ -328,6 +337,12 @@ where
             Err(err) => return Err(err),
         }
         Ok(())
+    }
+
+    /// The risk gate, read-only.
+    #[must_use]
+    pub const fn risk(&self) -> &RiskGate {
+        &self.gate
     }
 
     #[must_use]

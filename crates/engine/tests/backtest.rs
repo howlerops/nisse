@@ -202,7 +202,17 @@ fn config(costs: CostModel) -> BacktestConfig {
         costs,
         data_snapshot_id: "snap-bt1".to_owned(),
         seed: 7,
+        limits: limits(),
     }
+}
+
+/// The reviewed limits file in the repository.
+fn limits() -> nisse_risk::Limits {
+    nisse_risk::Limits::load(std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../config/limits/limits.json"
+    )))
+    .unwrap()
 }
 
 fn free() -> CostModel {

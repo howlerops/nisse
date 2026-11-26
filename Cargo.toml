@@ -23,6 +23,7 @@ publish = false
 # Workspace crates
 nisse-core = { path = "crates/core" }
 nisse-engine = { path = "crates/engine" }
+nisse-risk = { path = "crates/risk" }
 nisse-store = { path = "crates/store" }
 nisse-bars = { path = "crates/bars" }
 nisse-alpaca-adapter = { path = "crates/alpaca-adapter" }
@@ -38,7 +39,7 @@ chrono-tz = "0.10"
 duckdb = { version = "1.20001", default-features = false, features = ["bundled", "parquet", "rust_decimal"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
-rust_decimal = { version = "1.43", features = ["db-tokio-postgres"] }
+rust_decimal = { version = "1.43", features = ["db-tokio-postgres", "maths"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 sha2 = "0.11"

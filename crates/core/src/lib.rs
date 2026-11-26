@@ -29,10 +29,10 @@ pub use order::{
     OrderIntent, OrderState, OrderUpdate, ReplaceRequest, SubmitError,
 };
 pub use record::{
-    Decision, DecisionLog, EvalScore, MarketSnapshot, OrderEvent, PositionEvent, RecordSink,
-    RestoredOrder, RiskCheck, StoreRecord, StrategyVersion, Trial,
+    Decision, DecisionLog, EvalScore, KillSwitchSource, MarketSnapshot, OrderEvent, PositionEvent,
+    RecordSink, RestoredOrder, RiskCheck, RiskEvent, StoreRecord, StrategyVersion, Trial,
 };
-pub use types::{Action, SubjectType, TrialKind};
+pub use types::{Action, RiskEventKind, SubjectType, TrialKind};
 
 /// The NautilusTrader types this workspace builds on. Import them from here so the pinned
 /// version is named in one place.

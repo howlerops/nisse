@@ -198,6 +198,10 @@ fn job(dir: &Path, strategy: Value) -> BacktestJob {
         starting_cash: dec("100000"),
         costs: CostModel::new(dec("2"), dec("0.0001")).unwrap(),
         bars_dir: dir.to_path_buf(),
+        limits_path: PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../config/limits/limits.json"
+        )),
         seed: 7,
     }
 }
@@ -521,6 +525,7 @@ fn example() -> Value {
         "starting_cash": "100000",
         "costs": {"slippage_bps": "2", "fee_per_share": "0.0001"},
         "bars_dir": "data/bars",
+        "limits_path": "config/limits/limits.json",
         "seed": 0
     })
 }
@@ -551,6 +556,7 @@ fn the_documented_example_parses_to_the_expected_job() {
     assert_eq!(job.starting_cash, dec("100000"));
     assert_eq!(job.costs, CostModel::new(dec("2"), dec("0.0001")).unwrap());
     assert_eq!(job.bars_dir, PathBuf::from("data/bars"));
+    assert_eq!(job.limits_path, PathBuf::from("config/limits/limits.json"));
     assert_eq!(job.seed, 0);
 }
 
@@ -591,6 +597,7 @@ fn a_missing_field_is_an_error_naming_it() {
         "starting_cash",
         "costs",
         "bars_dir",
+        "limits_path",
     ] {
         let text = error_text(BacktestJob::from_json(&without(example(), field)));
         assert!(text.contains(field), "{field}: {text}");

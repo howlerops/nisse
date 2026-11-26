@@ -6,6 +6,7 @@ use nisse_core::{
     Broker, Decision, Fill, ManualClock, MarketCalendar, StoreRecord, StrategyVersionId,
     nautilus::{Bar, Symbol, UnixNanos},
 };
+use nisse_risk::{Limits, RiskState};
 use rust_decimal::Decimal;
 
 use crate::{
@@ -22,6 +23,8 @@ pub struct BacktestConfig {
     pub costs: CostModel,
     pub data_snapshot_id: String,
     pub seed: u64,
+    /// The risk limits the run is gated by, as live trading is.
+    pub limits: Limits,
 }
 
 /// Everything a backtest produced.
@@ -80,6 +83,8 @@ pub async fn run_backtest<S: Strategy>(
                 never_arrived_grace_nanos: 0,
                 never_arrived_recheck_nanos: 0,
             },
+            limits: config.limits,
+            risk: RiskState::default(),
         },
         OrderBookState::default(),
     )?;
