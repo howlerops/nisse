@@ -2,7 +2,8 @@
 //! from cron, after the scoring job.
 //!
 //! Usage: `nisse-agent-report <gates.json> <research-config.json> <bars_dir> <out.json>`.
-//! The research config is read only for its `symbols` and `benchmark`. Reads `DATABASE_URL`
+//! The research config is parsed and validated by `ResearchConfig::parse`; only its `symbols`
+//! and `benchmark` are used. Reads `DATABASE_URL`
 //! (never printed). Writes the report pretty-printed to `<out.json>` through a temporary file
 //! in the same directory and a rename, so a reader never sees half a file. Exits 2 on bad
 //! arguments and 1 on any error.
@@ -13,7 +14,7 @@ use std::path::Path;
 use nisse_core::{Clock, SystemClock};
 use nisse_eval::agent_report::{ReportArgs, build_agent_report};
 use nisse_eval::gates::Gates;
-use serde_json::Value;
+use nisse_eval::proposal::ResearchConfig;
 
 const USAGE: &str = "usage: nisse-agent-report <gates.json> <research-config.json> <bars_dir> \
                      <out.json>";
@@ -38,12 +39,8 @@ async fn run(
     out_path: &str,
 ) -> anyhow::Result<()> {
     let gates = Gates::load(Path::new(gates_path))?;
-    let config: Value = serde_json::from_str(&std::fs::read_to_string(config_path)?)?;
-    let symbols = config_symbols(&config)?;
-    let benchmark = config
-        .get("benchmark")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("{config_path}: benchmark is missing or not a string"))?;
+    let config = ResearchConfig::parse(&std::fs::read_to_string(config_path)?)
+        .map_err(|err| anyhow::anyhow!("{config_path}: {err}"))?;
 
     // Deliberately not printed: the URL may contain a password.
     let url =
@@ -55,8 +52,8 @@ async fn run(
         &ReportArgs {
             gates: &gates,
             bars_dir: Path::new(bars_dir),
-            symbols: &symbols,
-            benchmark,
+            symbols: &config.symbols,
+            benchmark: &config.benchmark,
             now: SystemClock.now(),
         },
     )
@@ -64,22 +61,6 @@ async fn run(
     let text = serde_json::to_string_pretty(&report.to_json())?;
     write_atomically(Path::new(out_path), &text)?;
     Ok(())
-}
-
-/// The `symbols` of a research config: an array of strings.
-fn config_symbols(config: &Value) -> anyhow::Result<Vec<String>> {
-    let list = config
-        .get("symbols")
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow::anyhow!("research config: symbols is missing or not an array"))?;
-    list.iter()
-        .map(|symbol| {
-            symbol
-                .as_str()
-                .map(str::to_owned)
-                .ok_or_else(|| anyhow::anyhow!("research config: a symbol is not a string"))
-        })
-        .collect()
 }
 
 /// Writes `text` to `path` through a temporary file beside it, then renames it into place.

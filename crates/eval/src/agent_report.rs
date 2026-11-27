@@ -4,8 +4,19 @@
 //! Rules, each one a safety property with a test:
 //! - a decision is visible only through a `decision_holdout` row with `hidden = false`; a
 //!   decision with no row is hidden;
-//! - a score metric is given as `n`, `mean` and `median` only when `n >= MIN_GROUP`, otherwise
-//!   as `"suppressed"`;
+//! - a score metric is given as `n`, `mean` and `median` only when at least `MIN_GROUP`
+//!   decisions have it, otherwise as `"suppressed"`;
+//! - score aggregates are cohorts: for each version and metric the visible decisions are
+//!   ordered by decision id ascending and only the first `k * MIN_GROUP` are aggregated, where
+//!   `k = floor(count / MIN_GROUP)`. So `n` is always a multiple of `MIN_GROUP`, and the
+//!   figures change only when 30 more decisions have accrued. Why: the report is rewritten
+//!   every night, and with `n` and a full-precision mean per night, the difference between two
+//!   consecutive nights would be exactly the newest decision's score (for an outcome metric,
+//!   its outcome). A difference over a whole cohort is not one decision. `mean` and `median`
+//!   are rounded to [`SIG_DIGITS`] significant digits in the JSON so that no finer difference
+//!   is left to subtract;
+//! - the holdout gate is not shown (see [`HOLDOUT_GATE`]), because its pass or fail would give
+//!   feedback on the holdout, which is only looked at a few times on purpose;
 //! - a label queue entry says what was decided and how it was executed, and never carries a
 //!   forward return, a benchmark return, P&L or a `decision_quality_*` score;
 //! - decisions are dated by month; only the data checks use days.
@@ -40,8 +51,18 @@ pub const DATA_LOOKBACK_SESSIONS: usize = 20;
 /// A one-bar close-to-close move above this many percent is flagged.
 pub const LARGE_MOVE_PCT: u32 = 25;
 
+/// Significant digits `mean` and `median` are rounded to in the JSON.
+pub const SIG_DIGITS: u32 = 4;
+/// The gate that judges the holdout period, as its name in the gate report. It is left out of
+/// the per-version `gates` map. Matched by name because the gate report keeps the name in a
+/// private constant; a test fails if the gate report stops using this name.
+pub const HOLDOUT_GATE: &str = "holdout";
+
 /// The value given for a score metric with fewer than [`MIN_GROUP`] decisions.
 const SUPPRESSED: &str = "suppressed";
+/// The note that tells agents the holdout gate is left out of the report.
+const HOLDOUT_NOTE: &str = "The holdout gate is not shown to agents: its result would give \
+     feedback on the holdout period, which is limited to a few deliberate looks.";
 
 /// What the report is built from: the gate thresholds, the bar directory, the research
 /// config's symbols and benchmark, and the time the report is made at.
@@ -187,7 +208,11 @@ impl VersionReport {
 impl MetricSummary {
     fn to_json(self) -> Value {
         match self {
-            Self::Aggregate { n, mean, median } => json!({"n": n, "mean": mean, "median": median}),
+            Self::Aggregate { n, mean, median } => json!({
+                "n": n,
+                "mean": round_sig(mean, SIG_DIGITS),
+                "median": round_sig(median, SIG_DIGITS),
+            }),
             Self::Suppressed => json!(SUPPRESSED),
         }
     }
@@ -256,15 +281,16 @@ pub async fn build_agent_report<C: GenericClient>(
     let (data, regime) = read_data(args)?;
 
     let mut report_versions = Vec::with_capacity(versions.len());
-    let mut notes = Vec::new();
+    let mut notes = vec![HOLDOUT_NOTE.to_owned()];
     for version in versions {
         let by_action = counts.remove(&version.id).unwrap_or_default();
         let visible_decisions = by_action.values().sum();
         let metrics = scores.remove(&version.id).unwrap_or_default();
         let summaries = metrics
             .into_iter()
-            .map(|(metric, mut values)| {
-                let summary = match aggregate(&mut values) {
+            .map(|(metric, values)| {
+                // Values are in decision id order, as `read_decision_scores` delivers them.
+                let summary = match aggregate(&values) {
                     Some((n, mean, median)) => MetricSummary::Aggregate { n, mean, median },
                     None => MetricSummary::Suppressed,
                 };
@@ -302,24 +328,44 @@ pub async fn build_agent_report<C: GenericClient>(
     })
 }
 
-/// Summarises one metric's values: `(n, mean, median)`, or `None` when there are fewer than
-/// [`MIN_GROUP`]. Sorts `values` in place. The median of an even count is the mean of the two
-/// middle values.
+/// Summarises one metric's values given in decision id order: `(n, mean, median)` over the
+/// cohort, the first `k * MIN_GROUP` values where `k = floor(len / MIN_GROUP)`. `None` when
+/// `k` is zero, that is when there are fewer than [`MIN_GROUP`] values. The values past the
+/// cohort are not used at all. The median of an even count is the mean of the two middle
+/// values. Figures are full precision; rounding for the JSON is in [`MetricSummary`].
 #[must_use]
-pub fn aggregate(values: &mut [f64]) -> Option<(usize, f64, f64)> {
-    let n = values.len();
-    if n < MIN_GROUP {
+pub fn aggregate(values_in_decision_id_order: &[f64]) -> Option<(usize, f64, f64)> {
+    let k = values_in_decision_id_order.len() / MIN_GROUP;
+    if k == 0 {
         return None;
     }
-    values.sort_by(f64::total_cmp);
-    let mean = values.iter().sum::<f64>() / n as f64;
+    let n = k * MIN_GROUP;
+    let mut cohort = values_in_decision_id_order.get(..n)?.to_vec();
+    cohort.sort_by(f64::total_cmp);
+    let mean = cohort.iter().sum::<f64>() / n as f64;
     let middle = n / 2;
-    let median = if n % 2 == 1 {
-        *values.get(middle)?
-    } else {
-        (*values.get(middle - 1)? + *values.get(middle)?) / 2.0
-    };
+    let median = (*cohort.get(middle - 1)? + *cohort.get(middle)?) / 2.0;
     Some((n, mean, median))
+}
+
+/// `value` rounded to `digits` significant decimal digits. Zero, and any value that is not
+/// finite or whose scaling would overflow, is returned unchanged.
+#[must_use]
+pub fn round_sig(value: f64, digits: u32) -> f64 {
+    if value == 0.0 || !value.is_finite() {
+        return value;
+    }
+    // Position of the leading digit: 10^exponent <= |value| < 10^(exponent + 1).
+    let exponent = value.abs().log10().floor();
+    let Ok(scale_power) = i32::try_from(i64::from(digits) - 1 - exponent as i64) else {
+        return value;
+    };
+    let scale = 10f64.powi(scale_power);
+    let scaled = value * scale;
+    if !scale.is_finite() || !scaled.is_finite() || scale == 0.0 {
+        return value;
+    }
+    scaled.round() / scale
 }
 
 /// The data checks over `bars` for `symbols`. `bars` must be in time order, as
@@ -525,7 +571,8 @@ async fn read_action_counts<C: GenericClient>(
 }
 
 /// `(strategy_version_id, metric, value)` for every visible decision's newest score row of
-/// each metric (newest by `eval_score.id`, whatever its `eval_version`).
+/// each metric (newest by `eval_score.id`, whatever its `eval_version`). Rows come in decision
+/// id order within each version and metric, which [`aggregate`] relies on.
 async fn read_decision_scores<C: GenericClient>(
     client: &C,
 ) -> Result<Vec<(i64, String, f64)>, StoreError> {
@@ -535,13 +582,19 @@ async fn read_decision_scores<C: GenericClient>(
                  SELECT d.id, d.strategy_version_id \
                  FROM decision d \
                  JOIN decision_holdout h ON h.decision_id = d.id AND NOT h.hidden \
+             ), \
+             newest AS ( \
+                 SELECT DISTINCT ON (e.subject_id, e.metric) \
+                     e.subject_id, e.metric, e.value::float8 AS value \
+                 FROM eval_score e \
+                 JOIN visible v ON v.id = e.subject_id \
+                 WHERE e.subject_type = 'decision' \
+                 ORDER BY e.subject_id, e.metric, e.id DESC \
              ) \
-             SELECT DISTINCT ON (e.subject_id, e.metric) \
-                 v.strategy_version_id, e.metric, e.value::float8 AS value \
-             FROM eval_score e \
-             JOIN visible v ON v.id = e.subject_id \
-             WHERE e.subject_type = 'decision' \
-             ORDER BY e.subject_id, e.metric, e.id DESC",
+             SELECT v.strategy_version_id, n.metric, n.value \
+             FROM newest n \
+             JOIN visible v ON v.id = n.subject_id \
+             ORDER BY v.strategy_version_id, n.metric, n.subject_id",
             &[],
         )
         .await?;
@@ -653,8 +706,8 @@ fn group_scores(rows: Vec<(i64, String, f64)>) -> BTreeMap<i64, BTreeMap<String,
     grouped
 }
 
-/// Each gate of a version as its status text. The error is returned, not swallowed: the caller
-/// turns it into a note.
+/// Each gate of a version as its status text, except the holdout gate ([`HOLDOUT_GATE`]). The
+/// error is returned, not swallowed: the caller turns it into a note.
 async fn gate_statuses<C: GenericClient>(
     client: &C,
     version: i64,
@@ -664,6 +717,7 @@ async fn gate_statuses<C: GenericClient>(
     Ok(build_report(&inputs)
         .gates
         .iter()
+        .filter(|gate| gate.name != HOLDOUT_GATE)
         .map(|gate| (gate.name.to_owned(), gate.status))
         .collect())
 }

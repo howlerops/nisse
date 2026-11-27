@@ -1,6 +1,6 @@
 //! Acceptance tests for the agent report (`agent_report`): the pure judging helpers
-//! ([`aggregate`], [`data_checks`], the JSON shape) and [`build_agent_report`] against a real
-//! Postgres (`TEST_DATABASE_URL`) with bars written to and read back from Parquet.
+//! ([`aggregate`], [`round_sig`], [`data_checks`], the JSON shape) and [`build_agent_report`]
+//! against a real Postgres (`TEST_DATABASE_URL`) with bars written to and read back from Parquet.
 #![allow(clippy::unwrap_used, clippy::expect_used, reason = "integration test")]
 
 use std::{
@@ -10,6 +10,7 @@ use std::{
 
 use chrono::NaiveDate;
 use nisse_bars::write_bars;
+use nisse_core::StrategyVersionId;
 use nisse_core::nautilus::{
     AggregationSource, Bar, BarAggregation, BarSpecification, BarType, ClientOrderId, InstrumentId,
     OrderSide, OrderType, Price, PriceType, Quantity, Symbol, TimeInForce, UnixNanos, Venue,
@@ -17,10 +18,12 @@ use nisse_core::nautilus::{
 };
 use nisse_core::{DecisionId, OrderEvent, OrderIntent, OrderState};
 use nisse_eval::agent_report::{
-    AgentReport, DataChecks, Execution, LABEL_QUEUE_MAX, LabelEntry, MIN_GROUP, MetricSummary,
-    ReportArgs, VersionReport, aggregate, build_agent_report, data_checks,
+    AgentReport, DataChecks, Execution, HOLDOUT_GATE, LABEL_QUEUE_MAX, LabelEntry, MIN_GROUP,
+    MetricSummary, ReportArgs, VersionReport, aggregate, build_agent_report, data_checks,
+    round_sig,
 };
 use nisse_eval::execution_job::METRIC_SHORTFALL_BPS;
+use nisse_eval::gate_report::{ReportInputs, build_report};
 use nisse_eval::gates::Gates;
 use nisse_eval::outcome::Regime;
 use nisse_store::tables::order_event;
@@ -111,24 +114,23 @@ fn in_time_order(mut bars: Vec<Bar>) -> Vec<Bar> {
 
 #[test]
 fn aggregate_gives_nothing_below_min_group() {
-    let mut values: Vec<f64> = (0..MIN_GROUP - 1).map(|i| i as f64).collect();
-    assert_eq!(aggregate(&mut values), None);
-    assert_eq!(aggregate(&mut []), None);
+    let values: Vec<f64> = (0..MIN_GROUP - 1).map(|i| i as f64).collect();
+    assert_eq!(aggregate(&values), None);
+    assert_eq!(aggregate(&[]), None);
 }
 
 #[test]
 fn aggregate_gives_figures_at_exactly_min_group() {
-    let mut values: Vec<f64> = (1..=30).map(f64::from).collect();
+    let values: Vec<f64> = (1..=30).map(f64::from).collect();
     // Even count: the median is the mean of the two middle values, 15 and 16.
-    assert_eq!(aggregate(&mut values), Some((30, 15.5, 15.5)));
+    assert_eq!(aggregate(&values), Some((30, 15.5, 15.5)));
 }
 
 #[test]
-fn aggregate_median_of_odd_count_sorts_its_input() {
-    // 31 values in reverse order; the median of 1..=31 is 16.
-    let mut values: Vec<f64> = (1..=31).rev().map(f64::from).collect();
-    assert_eq!(aggregate(&mut values), Some((31, 16.0, 16.0)));
-    assert!(values.windows(2).all(|w| w[0] <= w[1]), "input is sorted");
+fn aggregate_takes_the_median_of_an_unsorted_cohort() {
+    // 30 values in reverse order: the median and the mean of 1..=30 are both 15.5.
+    let values: Vec<f64> = (1..=30).rev().map(f64::from).collect();
+    assert_eq!(aggregate(&values), Some((30, 15.5, 15.5)));
 }
 
 #[test]
@@ -136,7 +138,58 @@ fn aggregate_mean_and_median_differ_on_a_skewed_group() {
     // 29 zeros and one outlier of 10: the mean is 10 / 30, the median is 0.
     let mut values = vec![0.0_f64; 29];
     values.push(10.0);
-    assert_eq!(aggregate(&mut values), Some((30, 10.0 / 30.0, 0.0)));
+    assert_eq!(aggregate(&values), Some((30, 10.0 / 30.0, 0.0)));
+}
+
+#[test]
+fn aggregate_of_59_uses_only_the_first_cohort_in_order() {
+    // The first 30 are 1.0; the last 29 are extreme and must not be used.
+    let mut values = vec![1.0_f64; MIN_GROUP];
+    values.extend(std::iter::repeat_n(1.0e9, MIN_GROUP - 1));
+    assert_eq!(aggregate(&values), Some((30, 1.0, 1.0)));
+}
+
+#[test]
+fn aggregate_of_60_is_two_cohorts() {
+    // 0..=59: the mean is 29.5 and the median is the mean of 29 and 30.
+    let values: Vec<f64> = (0..60).map(f64::from).collect();
+    assert_eq!(aggregate(&values), Some((60, 29.5, 29.5)));
+}
+
+#[test]
+fn aggregate_cohort_is_the_prefix_not_a_selection() {
+    // 30 values 0..=29, then 30 and an extreme: only the prefix counts, so the mean is 14.5.
+    let mut values: Vec<f64> = (0..MIN_GROUP).map(|i| i as f64).collect();
+    values.push(30.0);
+    values.push(-1.0e9);
+    assert_eq!(aggregate(&values), Some((30, 14.5, 14.5)));
+}
+
+#[test]
+fn round_sig_keeps_four_significant_digits() {
+    assert_eq!(round_sig(0.0, 4), 0.0);
+    assert_eq!(round_sig(1234.5678, 4), 1235.0);
+    assert_eq!(round_sig(0.000_123_456, 4), 0.0001235);
+    assert_eq!(round_sig(1.0, 4), 1.0);
+    // Rounding can carry into a new leading digit: 0.99999 -> 1.0.
+    assert_eq!(round_sig(0.99999, 4), 1.0);
+    assert_eq!(round_sig(10.0 / 30.0, 4), 0.3333);
+}
+
+#[test]
+fn round_sig_is_symmetric_in_sign() {
+    assert_eq!(round_sig(-1234.5678, 4), -1235.0);
+    assert_eq!(round_sig(-0.000_123_456, 4), -0.0001235);
+    assert_eq!(round_sig(-0.0, 4), 0.0);
+}
+
+#[test]
+fn round_sig_leaves_non_finite_and_unscalable_values_alone() {
+    assert!(round_sig(f64::NAN, 4).is_nan());
+    assert_eq!(round_sig(f64::INFINITY, 4), f64::INFINITY);
+    assert_eq!(round_sig(f64::NEG_INFINITY, 4), f64::NEG_INFINITY);
+    // 10^313 is not finite, so the value is returned as it is.
+    assert_eq!(round_sig(1.0e-310, 4), 1.0e-310);
 }
 
 // ---- pure: JSON shape -----------------------------------------------------------------------
@@ -159,6 +212,23 @@ fn report_with(scores: Vec<(String, MetricSummary)>) -> AgentReport {
         label_queue: Vec::new(),
         notes: Vec::new(),
     }
+}
+
+#[test]
+fn aggregates_are_published_with_four_significant_digits() {
+    let value = report_with(vec![(
+        "sharp".to_owned(),
+        MetricSummary::Aggregate {
+            n: 30,
+            mean: 10.0 / 30.0,
+            median: 1234.5678,
+        },
+    )])
+    .to_json();
+    assert_eq!(
+        value["versions"][0]["scores"]["sharp"],
+        json!({"n": 30, "mean": 0.3333, "median": 1235.0})
+    );
 }
 
 #[test]
@@ -412,6 +482,28 @@ fn data_checks_window_starts_at_the_oldest_session_when_there_are_few() {
     assert_eq!(checks.zero_volume.len(), 1);
     assert_eq!(checks.zero_volume[0].date, "2026-01-01");
     assert!(checks.missing_on_last_session.is_empty());
+}
+
+#[test]
+fn the_holdout_gate_is_in_the_gate_report_so_the_report_can_leave_it_out() {
+    // If the gate report renames its holdout gate, the name this module filters on is stale and
+    // the holdout result would reach agents: this fails instead.
+    let inputs = ReportInputs {
+        version: StrategyVersionId(1),
+        gates: gates(),
+        lifetime_trials: 0,
+        holdout_looks: 0,
+        trials: Vec::new(),
+        replay: (0, 0),
+        risk_breaches: 0,
+        sent_orders: 0,
+        live: None,
+    };
+    let names: Vec<&str> = build_report(&inputs).gates.iter().map(|g| g.name).collect();
+    assert!(
+        names.contains(&HOLDOUT_GATE),
+        "gate report names {names:?} do not contain {HOLDOUT_GATE:?}"
+    );
 }
 
 // ---- store: build_agent_report --------------------------------------------------------------
@@ -780,6 +872,149 @@ async fn a_bar_path_that_is_not_a_directory_is_an_error() {
     std::fs::write(&file, b"x").unwrap();
 
     assert!(run_report(&client, &file, &[]).await.is_err());
+
+    drop(client);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_cohort_leaves_out_the_thirty_first_decision() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let v = version(&client, 1).await;
+    let dir = TempDir::new("cohort");
+
+    // Decisions 0..=29 score 0..=29; the 31st scores an extreme value.
+    for i in 0..MIN_GROUP as u32 {
+        let id = decision(&client, v, "enter", "2026-01-05T21:00:00Z", json!({})).await;
+        holdout(&client, id, false).await;
+        shortfall(&client, id, f64::from(i), "score-v1").await;
+    }
+    let id = decision(&client, v, "enter", "2026-01-05T21:00:00Z", json!({})).await;
+    holdout(&client, id, false).await;
+    shortfall(&client, id, 1.0e9, "score-v1").await;
+
+    let report = run_report(&client, dir.path(), &[]).await.unwrap();
+    assert_eq!(
+        version_of(&report, v).scores.get(METRIC_SHORTFALL_BPS),
+        Some(&MetricSummary::Aggregate {
+            n: MIN_GROUP,
+            mean: 14.5,
+            median: 14.5,
+        }),
+        "the 31st decision is outside the first cohort"
+    );
+
+    drop(client);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn adding_one_decision_leaves_the_published_scores_byte_identical() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let v = version(&client, 1).await;
+    let dir = TempDir::new("difference");
+
+    for i in 0..MIN_GROUP as u32 {
+        let id = decision(&client, v, "enter", "2026-01-05T21:00:00Z", json!({})).await;
+        holdout(&client, id, false).await;
+        shortfall(&client, id, f64::from(i) * 0.37 + 1.0, "score-v1").await;
+    }
+    let before = run_report(&client, dir.path(), &[])
+        .await
+        .unwrap()
+        .to_json();
+
+    // Tomorrow's report differs from today's by one decision with an extreme outcome.
+    let id = decision(&client, v, "enter", "2026-01-05T21:00:00Z", json!({})).await;
+    holdout(&client, id, false).await;
+    shortfall(&client, id, 1.0e9, "score-v1").await;
+    let after = run_report(&client, dir.path(), &[])
+        .await
+        .unwrap()
+        .to_json();
+
+    assert_eq!(
+        after["versions"][0]["visible_decisions"],
+        json!(MIN_GROUP + 1)
+    );
+    assert_eq!(
+        before["versions"][0]["scores"].to_string(),
+        after["versions"][0]["scores"].to_string()
+    );
+    assert_eq!(
+        after["versions"][0]["scores"][METRIC_SHORTFALL_BPS]["n"],
+        json!(MIN_GROUP)
+    );
+
+    drop(client);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_cohort_is_chosen_by_decision_id_not_by_when_the_score_was_written() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let v = version(&client, 1).await;
+    let dir = TempDir::new("order");
+
+    let mut ids = Vec::new();
+    for _ in 0..=MIN_GROUP {
+        let id = decision(&client, v, "enter", "2026-01-05T21:00:00Z", json!({})).await;
+        holdout(&client, id, false).await;
+        ids.push(id);
+    }
+    // Scores are written newest decision first, so eval_score ids run against decision ids.
+    for (i, id) in ids.iter().enumerate().rev() {
+        shortfall(&client, *id, i as f64, "score-v1").await;
+    }
+
+    let report = run_report(&client, dir.path(), &[]).await.unwrap();
+    assert_eq!(
+        version_of(&report, v).scores.get(METRIC_SHORTFALL_BPS),
+        Some(&MetricSummary::Aggregate {
+            n: MIN_GROUP,
+            mean: 14.5,
+            median: 14.5,
+        }),
+        "the cohort is decisions 0..=29 in decision id order"
+    );
+
+    drop(client);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_gates_map_leaves_out_the_holdout_gate_and_the_notes_say_so() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let v = version(&client, 1).await;
+    let dir = TempDir::new("gates");
+
+    let report = run_report(&client, dir.path(), &[]).await.unwrap();
+    let gates = &version_of(&report, v).gates;
+    assert!(
+        gates.contains_key("trial_budget"),
+        "the other gates are still shown"
+    );
+    assert!(
+        !gates.contains_key(HOLDOUT_GATE),
+        "the holdout gate is not shown"
+    );
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|note| note.contains("holdout gate is not shown to agents")),
+        "notes: {:?}",
+        report.notes
+    );
+    assert!(
+        report.to_json()["notes"]
+            .to_string()
+            .contains("holdout gate is not shown")
+    );
 
     drop(client);
     db.drop_db().await.unwrap();
