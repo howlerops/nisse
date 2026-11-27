@@ -79,11 +79,22 @@ one of them.
    logged as an error and the tick ends there (exit code 1): nothing is decided.
 3. Observe the account equity (drawdown state).
 4. If the market is open now (the calendar says so; a weekday holiday is not a session) and
-   the mode stepped down, or the risk scale is zero and something is still held
+   a resize is owed (below), or the risk scale is zero and something is still held
    (`needs_flatten`): rebalance. With the market closed a tick never decides; the next
    session-close or the next open tick does.
 5. Flush the store queue; write a heartbeat. A tick that failed writes no heartbeat, so a
    tick that keeps failing trips the dead-man check.
+
+### An owed resize
+
+A drawdown step-down must be followed by a rebalance even if the process dies between seeing
+it and acting on it, or the market is closed when it is seen. So the step-down is itself a
+step: `engine_step` run key `resize`, step `pending`, recorded `started` right after the
+equity observation reports it and `done` after the next completed rebalance. While it is
+`started`, a rebalance is due: at the next tick with the market open, or at the next
+session-close. (The two writes, the mode change and the `started` row, are not one
+transaction; a crash exactly between them loses the resize until the month end. The window
+is one statement wide.)
 
 A decision made by a tick uses the previous session's closing bars. After about noon those
 are older than the 20 hours outcome scoring allows for a base bar (Phase 5), so such a
@@ -105,7 +116,7 @@ then `done` (with a detail) or `failed` (with the error text):
 2. `restore` (as above, now including the session's bars). Not a recorded step.
 3. `reconcile`, as in `tick` step 2.
 4. `observe`.
-5. `rebalance`: when the session is the last of its month, or the mode stepped down, or
+5. `rebalance`: when the session is the last of its month, or a resize is owed, or
    `needs_flatten`. If `engine_step` already has `rebalance` `done` for this run key, it is
    skipped, so a re-run of the command after a completed rebalance sends nothing. A re-run
    after a crash in the middle of a rebalance runs it again: orders already sent count as
