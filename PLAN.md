@@ -157,6 +157,8 @@ Promote on statistical evidence across the whole trial history, never on paper o
 - Risk limits live outside the agent-writable repo in production; `config/limits/limits.json` is the reviewed default, and the code refuses a file looser than its fixed ceilings.
 - A human merges every PR.
 
+Built in Phase 7 ([`docs/phases/phase-7.md`](docs/phases/phase-7.md)): research lives under `research/` in this repository until the public-or-private question is decided; the signature is a shared-key MAC (HMAC-SHA256) until a public-key scheme, which needs a new dependency, is approved; hosted CI checks a proposal's shape and budget, while the backtest and gates run where the bar files and the store are (`scripts/evaluate-proposal.sh`).
+
 ## Risk controls and capital ramp
 
 ### Controls

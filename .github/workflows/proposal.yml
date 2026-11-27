@@ -1,0 +1,183 @@
+# Checks a pull request against the research rules (docs/phases/phase-7.md, "Proposal check").
+#
+# This workflow runs on `pull_request_target`, so the workflow file and the checker both come
+# from the BASE branch: a pull request cannot edit its own judge. In exchange it must never
+# execute anything from the pull request. The pull request is fetched as data under head/,
+# the result of merging it into the base is written under merged/ and only read, and the
+# checker is built from base/. Do not add a step that builds, installs or runs anything
+# from head/ or merged/.
+#
+# A pull request from a fork, or from a branch named research/..., is an agent pull request:
+# it may change research files and nothing else, and it fails if it changes anything else or
+# nothing at all. Any other pull request is a person's own: it is checked only if it touches
+# research/, and then for the config rules and the change budget, not for what else it changes.
+#
+# Actions are pinned by commit SHA. Changes under .github/ are a sensitive path (see CLAUDE.md).
+name: Research proposal
+
+on:
+  pull_request_target:
+    # Only pull requests into main are judged, by main's own copy of this file and of the
+    # checker. `edited` covers a pull request whose base branch is changed after it is opened.
+    branches: [main]
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: proposal-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  proposal:
+    name: research proposal
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    env:
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      # Compared as strings in the shell; never interpolated into a command.
+      HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+      BASE_REPO: ${{ github.repository }}
+      HEAD_REF: ${{ github.event.pull_request.head.ref }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - name: "Check out the base (trusted, the checker is built from it)"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The tip of main as it is now, not as it was when the pull request was opened:
+          # re-running this job re-judges the pull request against today's main.
+          ref: refs/heads/main
+          path: base
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: "Check out the pull request (untrusted, data only, never executed)"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/head
+          path: head
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Build the merge result and list what it changes
+        id: changes
+        shell: bash
+        run: |
+          BASE_SHA="$(git -C base rev-parse HEAD)"
+          echo "Judging against main at $BASE_SHA"
+          # What is judged is what merging would do to the base, not how the pull request's
+          # branch differs from some ancestor: a branch built on old history can undo newer
+          # commits without that showing in a diff from a merge base.
+          test "$(git -C head rev-parse HEAD)" = "$HEAD_SHA" || {
+            echo "::error::The pull request moved while this run was starting; a newer run will judge it."
+            exit 1
+          }
+          # The pull request's commits are fetched into the base clone from the local head
+          # clone, so no credential is needed and nothing from head/ is run.
+          git -C base fetch --quiet --no-tags "$PWD/head" "$HEAD_SHA"
+          # Exit 0 and the merged tree's id on the first line when the merge is clean.
+          if ! merged="$(git -C base merge-tree --write-tree "$BASE_SHA" "$HEAD_SHA")"; then
+            echo "::error::The pull request does not merge cleanly into the base; nothing was judged."
+            exit 1
+          fi
+          tree="$(head -n 1 <<<"$merged")"
+          git -C base cat-file -e "$tree^{tree}"
+          # -z: NUL-separated and unquoted, so an unusual file name cannot hide a path.
+          # --raw gives each entry's file mode; --no-renames shows a rename as a delete and an add.
+          git -C base -c core.quotePath=false diff -z --raw --no-renames --no-abbrev "$BASE_SHA" "$tree" > raw.bin
+
+          agent=false
+          if [[ "$HEAD_REPO" != "$BASE_REPO" || "$HEAD_REF" == research/* ]]; then
+            agent=true
+          fi
+
+          # Split the raw records into the name-status stream the checker reads. For an agent
+          # pull request every entry it leaves behind must be an ordinary file (mode 100644):
+          # no symbolic link, no executable, no submodule.
+          research=false
+          bad_mode=false
+          : > changes.bin
+          while IFS= read -r -d '' meta && IFS= read -r -d '' path; do
+            read -r _old_mode new_mode _old_sha _new_sha status <<<"${meta#:}"
+            printf '%s\0%s\0' "$status" "$path" >> changes.bin
+            if [[ "$path" == research || "$path" == research/* ]]; then
+              research=true
+            fi
+            if [[ "$agent" == true && "$status" != D && "$new_mode" != 100644 ]]; then
+              bad_mode=true
+              printf 'not an ordinary file (mode %s): %q\n' "$new_mode" "$path"
+            fi
+            # File names are untrusted text: %q prints them shell-quoted on one line, so a
+            # name cannot start a line of its own in this log.
+            printf '%s %q\n' "$status" "$path"
+          done < raw.bin
+          if [[ "$bad_mode" == true ]]; then
+            echo "::error::An agent pull request may add or change ordinary files only."
+            exit 1
+          fi
+
+          # The merge result as plain files, for the checker to read (never to run). Written
+          # with checkout-index from a scratch index, not `git archive`: an archive obeys
+          # export-ignore attributes in the tree, which would let a tree hide files from
+          # its own judge. For the same reason no attribute from the tree is applied while
+          # writing (--attr-source names an empty tree): otherwise the tree's .gitattributes
+          # could rewrite files (ident, eol) or invoke a configured filter such as LFS on them.
+          mkdir merged
+          empty_tree="$(git -C base mktree < /dev/null)"
+          export GIT_LFS_SKIP_SMUDGE=1 GIT_ATTR_NOSYSTEM=1
+          GIT_INDEX_FILE="$PWD/merged.index" git -C base read-tree "$tree"
+          GIT_INDEX_FILE="$PWD/merged.index" git -C base --attr-source="$empty_tree" \
+            checkout-index --all --prefix="$PWD/merged/"
+
+          echo "agent=$agent" >> "$GITHUB_OUTPUT"
+          if [[ "$agent" == true || "$research" == true ]]; then
+            echo "check=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "check=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Not a research pull request (same repository, branch not research/..., nothing under research/ changed). Nothing was checked: this is not a statement about what the pull request changes."
+          fi
+
+      - name: Is there a checker at the base?
+        id: checker
+        if: steps.changes.outputs.check == 'true'
+        run: |
+          if [[ -f base/crates/eval/src/bin/nisse-proposal-check.rs ]]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::The base branch has no proposal checker, so this pull request cannot be checked."
+            exit 1
+          fi
+
+      - name: Install pinned toolchain
+        if: steps.checker.outputs.present == 'true'
+        working-directory: base
+        run: rustup toolchain install
+
+      # The dependency sources only. No build output is restored: this job trusts nothing it
+      # did not compile itself from the base.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: steps.checker.outputs.present == 'true'
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: proposal-registry-${{ runner.os }}-${{ hashFiles('base/Cargo.lock') }}
+
+      - name: Check the proposal
+        if: steps.checker.outputs.present == 'true'
+        working-directory: base
+        env:
+          AGENT: ${{ steps.changes.outputs.agent }}
+        run: |
+          cargo build --locked -p nisse-eval --bin nisse-proposal-check
+          flags=()
+          if [[ "$AGENT" == true ]]; then
+            flags+=(--agent)
+          fi
+          target/debug/nisse-proposal-check --base . --head ../merged "${flags[@]}" < ../changes.bin

@@ -27,7 +27,7 @@ impl Hash32 {
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
 /// The value of one hex digit (either case), or `None` if the byte is not a hex digit.
-const fn hex_value(b: u8) -> Option<u8> {
+pub(crate) const fn hex_value(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
         b'a'..=b'f' => Some(b - b'a' + 10),

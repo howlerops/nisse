@@ -8,6 +8,7 @@
 
 pub mod commands;
 pub mod config;
+pub mod deployment;
 mod error;
 pub mod ingest;
 pub mod market;

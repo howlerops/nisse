@@ -1,5 +1,5 @@
 # Phase 0 gate: fmt, clippy -D warnings, tests, and migrations on a fresh Postgres.
-# Actions are pinned by commit SHA. Changes under .github/ need CODEOWNERS review.
+# Actions are pinned by commit SHA. Changes under .github/ are a sensitive path (see CLAUDE.md).
 name: CI
 
 on:

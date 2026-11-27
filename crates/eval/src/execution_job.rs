@@ -29,7 +29,7 @@ pub const EVAL_VERSION: &str = "score-v1";
 
 /// The marker of the execution scores: written for every scored decision.
 const METRIC_MISSED_FILL_RATIO: &str = "missed_fill_ratio";
-const METRIC_SHORTFALL_BPS: &str = "shortfall_bps";
+pub const METRIC_SHORTFALL_BPS: &str = "shortfall_bps";
 const METRIC_FEES_BPS: &str = "fees_bps";
 /// The marker of the exit scores: written for every entry decision that has been scored.
 const METRIC_REALIZED_R: &str = "realized_r";

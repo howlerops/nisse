@@ -16,4 +16,11 @@ pub enum CoreError {
     /// A stored features value was not an object of decimal strings.
     #[error("invalid features: {0}")]
     InvalidFeatures(String),
+    /// A signing key or a signed manifest is malformed (not what was signed is a different
+    /// error: [`Self::BadSignature`]).
+    #[error("invalid signing input: {0}")]
+    InvalidSigning(String),
+    /// A manifest's MAC does not match its contents under the key given.
+    #[error("the manifest's signature does not verify")]
+    BadSignature,
 }

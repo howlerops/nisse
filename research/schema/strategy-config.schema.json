@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/howlerops/nisse/research/schema/strategy-config.schema.json",
+  "title": "nisse research strategy config",
+  "description": "The format of research/configs/<name>.json. This file documents the format; the check CI runs is nisse-proposal-check (crates/eval/src/proposal.rs), which also validates `strategy` with the engine's own parser.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "family", "created", "parent", "strategy", "symbols", "benchmark", "rationale", "expected_effect"],
+  "properties": {
+    "name": {"type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$", "maxLength": 48, "description": "Equal to the file name without .json."},
+    "family": {"type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$", "maxLength": 32, "description": "The strategy line; the change budget is per family."},
+    "created": {"type": "string", "format": "date", "description": "YYYY-MM-DD."},
+    "parent": {"type": ["string", "null"], "description": "The name of the config this changes, or null for the first of a family."},
+    "strategy": {"type": "object", "required": ["strategy"], "properties": {"strategy": {"type": "string"}}, "description": "Strategy parameters, as nisse_engine::strategies::build takes them."},
+    "symbols": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "pattern": "^[A-Z0-9.]{1,12}$"}},
+    "benchmark": {"type": "string", "pattern": "^[A-Z0-9.]{1,12}$"},
+    "rationale": {"type": "string", "pattern": "^research/notes/[a-z0-9-]+\\.md$", "description": "research/notes/<name>.md, with the three required headings."},
+    "expected_effect": {"type": "string", "minLength": 20, "maxLength": 600}
+  }
+}

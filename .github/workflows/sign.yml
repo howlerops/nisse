@@ -1,0 +1,69 @@
+# Signs the research configs on main. Started by hand only (never by a push and never by a
+# pull request), and only on main. The key is the secret NISSE_SIGNING_KEY of the environment
+# "signing". In the repository settings that environment must (1) be restricted to the main
+# branch and (2) have a required reviewer, so that every run waits for a person: this job
+# builds and runs the code on main with the key in its environment, and whoever approves the
+# run is vouching for what is on main at that moment.
+#
+# The signer refuses a config that breaks the change budget against the other configs on
+# main, so two proposals merged close together are not both signed.
+#
+# The manifests are printed to the job summary. Copy the one you want to
+# research/signed/<name>.manifest.json on the engine host (docs/runbooks/research-agents.md).
+# Actions are pinned by commit SHA. Changes under .github/ are a sensitive path (see CLAUDE.md).
+name: Sign research configs
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sign
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  sign:
+    name: sign
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    environment: signing
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+
+      # No cache: the binary that will hold the key is compiled here, from this commit.
+      # Built before the key is in the environment of any step.
+      - name: Build the signer
+        run: cargo build --locked -p nisse-eval --bin nisse-sign
+
+      - name: Sign every config on main
+        env:
+          NISSE_SIGNING_KEY: ${{ secrets.NISSE_SIGNING_KEY }}
+        run: |
+          if [[ -z "$NISSE_SIGNING_KEY" ]]; then
+            echo "::error::The secret NISSE_SIGNING_KEY is not set in the 'signing' environment."
+            exit 1
+          fi
+          shopt -s nullglob
+          status=0
+          for config in research/configs/*.json; do
+            # One config that is refused does not stop the others from being signed.
+            if manifest="$(target/debug/nisse-sign "$config")"; then
+              printf '### %s\n```json\n%s\n```\n' "$config" "$manifest" >> "$GITHUB_STEP_SUMMARY"
+            else
+              printf '### %s\nNOT signed (see the job log).\n' "$config" >> "$GITHUB_STEP_SUMMARY"
+              status=1
+            fi
+          done
+          exit "$status"

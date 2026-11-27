@@ -13,8 +13,11 @@
 //! - `DATABASE_URL`: the Postgres store. Read by every command.
 //! - `APCA_API_KEY_ID` and `APCA_API_SECRET_KEY`: the Alpaca paper keys. Read by `session-close`,
 //!   `tick` and `kill` only; `status` and `release-kill` need neither.
+//! - `NISSE_SIGNING_KEY`: the signing key as hex. Read by `session-close` and `tick` only, and
+//!   only when the config requires a signature (`signature.required`).
 //!
-//! Exit codes: 0 done or nothing to do; 1 failed (re-run); 2 bad arguments or config; 3 another
+//! Exit codes: 0 done or nothing to do; 1 failed (re-run); 2 bad arguments or config, or a
+//! deployment that is not signed when its config requires it (nothing is traded); 3 another
 //! engine holds the lock. A `kill` that could not confirm the engine is idle exits 1.
 
 use std::process::ExitCode;
@@ -25,6 +28,7 @@ use nisse_app::{
     AppError,
     commands::{self, Command, USAGE},
     config::EngineConfig,
+    deployment::{Deployment, ENV_SIGNING_KEY, verify_deployment},
     market::AlpacaMarket,
     restore::wait_for_engine_lock,
     session::{session_close, tick},
@@ -61,6 +65,18 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // Trading commands refuse a deployment that its config requires to be signed, before any
+    // client or store connection is made.
+    if matches!(command, Command::Tick { .. } | Command::SessionClose { .. }) {
+        let key = std::env::var(ENV_SIGNING_KEY).ok();
+        match verify_deployment(&config, key.as_deref()) {
+            Ok(deployment) => println!("{}", describe_deployment(&deployment)),
+            Err(err) => {
+                eprintln!("nisse-engine: {err}");
+                return ExitCode::from(2);
+            }
+        }
+    }
     match execute(&command, &config).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(RunError::App(AppError::Busy)) => {
@@ -71,6 +87,20 @@ async fn main() -> ExitCode {
             eprintln!("nisse-engine: {err}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// The line printed before a trading command runs, saying what was checked.
+fn describe_deployment(deployment: &Deployment) -> String {
+    match deployment {
+        Deployment::Signed {
+            name,
+            git_sha,
+            deployment_hash,
+        } => format!("deployment: signed {name} at {git_sha} ({deployment_hash})"),
+        Deployment::Unsigned { deployment_hash } => format!(
+            "deployment: UNSIGNED ({deployment_hash}); set \"required\": true once a key exists"
+        ),
     }
 }
 

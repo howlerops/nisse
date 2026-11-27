@@ -17,6 +17,7 @@ use nisse_store::{Store, StoreWriter, tables::engine_step::StepStatus};
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
 
+use crate::deployment::verify_from_env;
 use crate::ingest::{IngestOutcome, ingest_session};
 use crate::market::Market;
 use crate::restore::{EngineTrader, Restored, restore, take_engine_lock};
@@ -99,6 +100,8 @@ pub async fn tick<M: Market, B: Broker, C: Clock>(
     broker: B,
     clock: C,
 ) -> Result<TickOutcome, AppError> {
+    // Before anything else: a deployment that must be signed and is not trades nothing.
+    verify_from_env(config)?;
     let now = clock.now();
     take_engine_lock(store).await?;
     let Restored { mut trader, .. } = restore(config, store, sink.clone(), broker, clock).await?;
@@ -166,6 +169,8 @@ pub async fn session_close<M: Market, B: Broker, C: Clock>(
     broker: B,
     clock: C,
 ) -> Result<SessionCloseOutcome, AppError> {
+    // Before anything else: a deployment that must be signed and is not trades nothing.
+    verify_from_env(config)?;
     let now = clock.now();
     take_engine_lock(store).await?;
 

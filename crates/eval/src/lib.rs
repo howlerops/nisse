@@ -3,6 +3,7 @@
 //!
 //! Every evaluation run registers a trial in `trial_registry`.
 
+pub mod agent_report;
 pub mod backtest_job;
 pub mod deadman;
 mod error;
@@ -11,8 +12,10 @@ pub mod execution_job;
 pub mod gate_report;
 pub mod gates;
 pub mod outcome;
+pub mod proposal;
 pub mod replay;
 pub mod score_job;
+pub mod signing_job;
 pub mod stats;
 
 pub use error::EvalError;
