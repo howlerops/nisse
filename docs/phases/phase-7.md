@@ -46,9 +46,14 @@ instructions require it and the reviewer reads for it.
 
 ## Proposal check (`nisse-proposal-check`)
 
-Run by the "Research proposal" workflow, with the changed paths (`git diff -z
---name-status`, NUL-separated so that no file name can disguise a path) on standard input,
-the base checkout and the head checkout as directories.
+Run by the "Research proposal" workflow, for pull requests into `main` only. The workflow
+first computes **the result of merging the pull request into the base** (`git merge-tree`;
+a conflict fails) and judges that: the changed paths are the difference between the base and
+the merged tree, NUL-separated so that no file name can disguise a path, and the checker
+reads the merged tree. (A branch's own diff from a merge base can hide that the branch
+undoes newer commits.) For an agent pull request the workflow also requires every added or
+changed entry to be an ordinary file (mode 100644): no symbolic link, executable or
+submodule anywhere.
 
 A pull request from a fork, or from a branch named `research/...`, is an **agent pull
 request** (`--agent`): it must change research files and nothing else, and all the rules
@@ -57,21 +62,25 @@ change code beside research files, and reorganise them), but if it touches `rese
 is held to rules 3 to 5, so the change budget applies to people too. If it touches nothing
 under `research/`, nothing is checked and the workflow says so.
 
-1. Every changed path is a plain path (letters, digits, `.`, `_`, `-`, `/`; no `..`) under
+1. Every changed path is a plain path (letters, digits, `.`, `_`, `-`, `/`; no component
+   starting with a dot, so no `..` and no hidden files) under
    `research/configs/`, `research/notes/` or `research/labels/`. (An agent PR that also edits
    code, CI, limits, `research/agents/` or `research/signed/` fails here.)
 2. Nothing under `research/` is deleted, renamed or copied.
 3. At most one file under `research/configs/` is added or modified.
 4. Every config in the head checkout is a regular file (not a symbolic link), parses and
    validates, and its note is a regular file with the three headings.
-5. For the added or modified config: `created` is not in the future and not before the
+5. For the added or modified config: `created` is not in the future, not more than 7 days
+   old (the budget is counted in these dates, so a proposal carries the date it is made),
+   and not before the
    newest `created` at the base, among configs of its family or of its strategy kind, plus
    30 days; a `parent` names a config that exists at the base in the same family; a modified
    config keeps its `name` and `family`.
 
 Two proposals opened on the same day can each pass against the same base. So the signer
-checks the budget again over the configs on `main` and refuses a config that is within 30
-days of another of its family or kind.
+checks the budget again over the configs on `main` and refuses a config dated fewer than
+30 days after another of its family or kind (the later of a pair; the earlier one stays
+signable).
 
 Exit 0 pass, 1 fail (each failure on its own line), 2 bad arguments.
 
@@ -94,7 +103,10 @@ The engine config gains `"signature": {"manifest": "<path>", "required": true|fa
 Before `tick` or `session-close` does anything, the engine computes the deployment hash of
 its own config and
 
-(The check is made by `tick` and `session-close` themselves, not only by the binary.)
+(The check is made by `tick` and `session-close` themselves, not only by the binary. A
+refusal stops the command before it reconciles: see the runbook for what that means for
+positions already held, and whether an unsigned engine should still reconcile and reduce is
+the owner's call.)
 
 - with `required: true`: the manifest must exist, its MAC must verify, its hash must equal
   the engine's, and its stage must be `paper`; otherwise the command exits 2 and nothing
@@ -127,8 +139,9 @@ only:
 Known limit of the cohort rule: a cohort is the oldest 30, 60, ... visible decisions *that
 have the score*. If a score for an older decision arrives late, or a decision is re-scored
 by a new evaluation version, a published figure can move without 30 new decisions, and the
-change then reflects fewer than 30 values. Scores are written oldest first and figures are
-rounded, which blunts this; freezing a cohort once published would close it and needs a
+change then reflects fewer than 30 values. This is likeliest for scores that exist only
+once a position is closed, which arrive in closing order, not decision order. Rounding
+blunts it but does not remove it; freezing a cohort once published would close it and needs a
 place to keep what was published (a new table: the owner's call).
 
 Decisions hidden by the holdout are never counted or listed. No date is finer than a month

@@ -8,7 +8,14 @@
 # (`holdout_start` in the gates file). A look at the holdout is a separate, deliberate
 # `nisse-backtest --holdout`.
 #
-# Usage: DATABASE_URL=... scripts/evaluate-proposal.sh research/configs/<name>.json
+# This script builds and runs this checkout's code beside the store, so the checkout must be
+# code you trust: it refuses to run unless the tracked files are unchanged and HEAD is part
+# of origin/main. NEVER check a proposal's branch out on this host. Take only its one JSON
+# file, to a path outside the checkout:
+#   git fetch origin pull/<N>/head
+#   git show FETCH_HEAD:research/configs/<name>.json > /tmp/<name>.json
+#
+# Usage: DATABASE_URL=... scripts/evaluate-proposal.sh /tmp/<name>.json
 # Optional environment: START (default 2015-01-01), STARTING_CASH (100000),
 #   SLIPPAGE_BPS (2), FEE_PER_SHARE (0.0001), BARS_DIR (data/bars),
 #   GATES (config/eval/gates.json), LIMITS (config/limits/limits.json).
@@ -18,12 +25,22 @@ set -euo pipefail
 
 : "${DATABASE_URL:?set DATABASE_URL}"
 if (( $# != 1 )); then
-  echo "usage: scripts/evaluate-proposal.sh research/configs/<name>.json" >&2
+  echo "usage: scripts/evaluate-proposal.sh <path to one config .json>" >&2
   exit 2
 fi
-config="$1"
+[[ -r "$1" ]] || { echo "evaluate-proposal: cannot read $1" >&2; exit 2; }
+config="$(realpath "$1")"
 cd "$(dirname "$0")/.."
-[[ -r "$config" ]] || { echo "evaluate-proposal: cannot read $config" >&2; exit 2; }
+
+# The code that is about to run next to the store must be main's, unmodified.
+if ! git diff --quiet HEAD --; then
+  echo "evaluate-proposal: this checkout has modified tracked files; run from a clean checkout of main" >&2
+  exit 2
+fi
+if ! git merge-base --is-ancestor HEAD origin/main 2>/dev/null; then
+  echo "evaluate-proposal: HEAD is not part of origin/main; never evaluate from a proposal's branch" >&2
+  exit 2
+fi
 command -v jq >/dev/null || { echo "evaluate-proposal: jq is not installed" >&2; exit 2; }
 
 gates="${GATES:-config/eval/gates.json}"

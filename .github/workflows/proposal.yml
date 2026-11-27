@@ -2,9 +2,10 @@
 #
 # This workflow runs on `pull_request_target`, so the workflow file and the checker both come
 # from the BASE branch: a pull request cannot edit its own judge. In exchange it must never
-# execute anything from the pull request. The pull request's tree is checked out as data
-# under head/ and only read; the checker is built from base/. Do not add a step that builds,
-# installs or runs anything from head/.
+# execute anything from the pull request. The pull request is fetched as data under head/,
+# the result of merging it into the base is written under merged/ and only read, and the
+# checker is built from base/. Do not add a step that builds, installs or runs anything
+# from head/ or merged/.
 #
 # A pull request from a fork, or from a branch named research/..., is an agent pull request:
 # it may change research files and nothing else, and it fails if it changes anything else or
@@ -16,7 +17,10 @@ name: Research proposal
 
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened]
+    # Only pull requests into main are judged, by main's own copy of this file and of the
+    # checker. `edited` covers a pull request whose base branch is changed after it is opened.
+    branches: [main]
+    types: [opened, synchronize, reopened, edited]
 
 permissions:
   contents: read
@@ -59,24 +63,65 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: List the changed paths
+      - name: Build the merge result and list what it changes
         id: changes
         run: |
+          # What is judged is what merging would do to the base, not how the pull request's
+          # branch differs from some ancestor: a branch built on old history can undo newer
+          # commits without that showing in a diff from a merge base.
+          test "$(git -C head rev-parse HEAD)" = "$HEAD_SHA" || {
+            echo "::error::The pull request moved while this run was starting; a newer run will judge it."
+            exit 1
+          }
           # The pull request's commits are fetched into the base clone from the local head
           # clone, so no credential is needed and nothing from head/ is run.
           git -C base fetch --quiet --no-tags "$PWD/head" "$HEAD_SHA"
+          # Exit 0 and the merged tree's id on the first line when the merge is clean.
+          if ! merged="$(git -C base merge-tree --write-tree "$BASE_SHA" "$HEAD_SHA")"; then
+            echo "::error::The pull request does not merge cleanly into the base; nothing was judged."
+            exit 1
+          fi
+          tree="$(head -n 1 <<<"$merged")"
+          git -C base cat-file -e "$tree^{tree}"
           # -z: NUL-separated and unquoted, so an unusual file name cannot hide a path.
-          git -C base -c core.quotePath=false diff -z --name-status "$BASE_SHA...$HEAD_SHA" > changes.bin
-          tr '\0' '\n' < changes.bin
+          # --raw gives each entry's file mode; --no-renames shows a rename as a delete and an add.
+          git -C base -c core.quotePath=false diff -z --raw --no-renames --no-abbrev "$BASE_SHA" "$tree" > raw.bin
 
           agent=false
           if [[ "$HEAD_REPO" != "$BASE_REPO" || "$HEAD_REF" == research/* ]]; then
             agent=true
           fi
+
+          # Split the raw records into the name-status stream the checker reads. For an agent
+          # pull request every entry it leaves behind must be an ordinary file (mode 100644):
+          # no symbolic link, no executable, no submodule.
           research=false
-          if tr '\0' '\n' < changes.bin | grep -qE '^research(/|$)'; then
-            research=true
+          bad_mode=false
+          : > changes.bin
+          while IFS= read -r -d '' meta && IFS= read -r -d '' path; do
+            read -r _old_mode new_mode _old_sha _new_sha status <<<"${meta#:}"
+            printf '%s\0%s\0' "$status" "$path" >> changes.bin
+            if [[ "$path" == research || "$path" == research/* ]]; then
+              research=true
+            fi
+            if [[ "$agent" == true && "$status" != D && "$new_mode" != 100644 ]]; then
+              bad_mode=true
+              printf 'not an ordinary file (mode %s): ' "$new_mode"
+              printf '%s' "$path" | cat -v
+              echo
+            fi
+          done < raw.bin
+          # File names are untrusted text: shown with control characters made visible.
+          tr '\0' '\n' < changes.bin | cat -v
+          if [[ "$bad_mode" == true ]]; then
+            echo "::error::An agent pull request may add or change ordinary files only."
+            exit 1
           fi
+
+          # The merge result as plain files, for the checker to read (never to run).
+          mkdir merged
+          git -C base archive "$tree" | tar -x -C merged
+
           echo "agent=$agent" >> "$GITHUB_OUTPUT"
           if [[ "$agent" == true || "$research" == true ]]; then
             echo "check=true" >> "$GITHUB_OUTPUT"
@@ -123,4 +168,4 @@ jobs:
           if [[ "$AGENT" == true ]]; then
             flags+=(--agent)
           fi
-          target/debug/nisse-proposal-check --base . --head ../head "${flags[@]}" < ../changes.bin
+          target/debug/nisse-proposal-check --base . --head ../merged "${flags[@]}" < ../changes.bin

@@ -26,6 +26,8 @@ pub const LABELS_DIR: &str = "research/labels";
 pub const RESEARCH_DIR: &str = "research";
 /// Days that must pass between two configs of one family, or of one strategy kind.
 pub const CHANGE_BUDGET_DAYS: i64 = 30;
+/// How old a new or changed config's `created` date may be when it is proposed.
+pub const CREATED_MAX_AGE_DAYS: i64 = 7;
 /// The headings every note must have, in this order, each with text under it.
 pub const NOTE_HEADINGS: [&str; 3] = [
     "## Economic rationale",
@@ -381,7 +383,9 @@ pub fn is_plain_path(path: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/'))
         && path
             .split('/')
-            .all(|component| !component.is_empty() && component != "." && component != "..")
+            // No component starts with a dot: that rules out `.`, `..` and hidden files such
+            // as `.gitattributes`, which could change how a pull request is displayed.
+            .all(|component| !component.is_empty() && !component.starts_with('.'))
 }
 
 /// The metadata of `relative` under `root`, found with `symlink_metadata` on every component
@@ -408,7 +412,7 @@ fn below(root: &Path, relative: &str) -> std::io::Result<fs::Metadata> {
 /// or a file reached through one. Every error message names the path.
 pub fn read_regular(root: &Path, relative: &str) -> Result<String, String> {
     if !is_plain_path(relative) {
-        return Err(format!("{relative} is not a plain path"));
+        return Err(format!("{relative:?} is not a plain path"));
     }
     let meta = below(root, relative)
         .map_err(|e| format!("{relative} is missing or not a regular file: {e}"))?;
@@ -448,7 +452,10 @@ fn json_files(root: &Path, dir: &str, failures: &mut Vec<String>) -> Result<Vec<
         if entry.file_type().is_ok_and(|kind| kind.is_file()) {
             names.push(name);
         } else {
-            failures.push(format!("{dir}/{name} is not a regular file"));
+            failures.push(format!(
+                "{:?} is not a regular file",
+                format!("{dir}/{name}")
+            ));
         }
     }
     names.sort();
@@ -645,6 +652,14 @@ fn check_budget_and_parent(
             config.created
         ));
     }
+    // The budget is counted in `created` dates, so a proposal must carry (nearly) today's:
+    // otherwise three proposals back-dated a month apart could all be merged in one day.
+    if (today - config.created).num_days() > CREATED_MAX_AGE_DAYS {
+        failures.push(format!(
+            "{path:?}: created {} is more than {CREATED_MAX_AGE_DAYS} days before today ({today}); a proposal is dated when it is made",
+            config.created
+        ));
+    }
 
     // The base's configs. A base config that does not parse is reported here, by name.
     let base_names = match json_files(base, CONFIG_DIR, failures) {
@@ -737,8 +752,8 @@ fn check_budget_and_parent(
 
 /// The change budget of one config, re-checked against the configs in `root` (a checkout) when
 /// it is signed: one message for every other config that shares its family or its strategy kind
-/// and whose `created` date is less than [`CHANGE_BUDGET_DAYS`] days away from its own, in either
-/// direction. Empty means the budget is clear. Symbolic links and configs that do not parse are
+/// and whose `created` date is fewer than [`CHANGE_BUDGET_DAYS`] days before its own (or the
+/// same day): the later of a pair is the one in the wrong. Empty means the budget is clear. Symbolic links and configs that do not parse are
 /// errors, and so is a `name` that no config in `root` has.
 pub fn budget_conflicts(root: &Path, name: &str) -> Result<Vec<String>, EvalError> {
     let mut failures = Vec::new();
@@ -760,16 +775,18 @@ pub fn budget_conflicts(root: &Path, name: &str) -> Result<Vec<String>, EvalErro
     for other in configs.iter().filter(|config| config.name != name) {
         let same_family = other.family == target.family;
         let same_kind = strategy_kind(other) == kind;
-        let apart = (other.created - target.created).num_days().abs();
-        if (same_family || same_kind) && apart < CHANGE_BUDGET_DAYS {
+        // Only the later of a pair is in the wrong: the earlier one was within its budget
+        // when it was made and must stay signable. Two with the same date both are.
+        let after_other = (target.created - other.created).num_days();
+        if (same_family || same_kind) && (0..CHANGE_BUDGET_DAYS).contains(&after_other) {
             let shared = match (same_family, same_kind) {
                 (true, true) => "family and strategy kind",
                 (true, false) => "family",
                 _ => "strategy kind",
             };
             messages.push(format!(
-                "{:?} (created {}) is less than {CHANGE_BUDGET_DAYS} days from {name:?} (created {}) and shares its {shared}",
-                other.name, other.created, target.created
+                "{name:?} (created {1}) is less than {CHANGE_BUDGET_DAYS} days after {0:?} (created {2}) and shares its {shared}",
+                other.name, target.created, other.created
             ));
         }
     }

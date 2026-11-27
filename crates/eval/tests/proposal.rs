@@ -25,9 +25,10 @@ fn date(year: i32, month: u32, day: u32) -> NaiveDate {
     NaiveDate::from_ymd_opt(year, month, day).unwrap()
 }
 
-/// A date `days` after 2026-01-01.
+/// A date `days` after 2026-10-25, so that `day(30)` and `day(31)` are within the week before
+/// [`today`] (a proposal's `created` may be at most seven days old).
 fn day(days: i64) -> NaiveDate {
-    date(2026, 1, 1) + chrono::TimeDelta::days(days)
+    date(2026, 10, 25) + chrono::TimeDelta::days(days)
 }
 
 const VALID_NOTE: &str = "# note\n\n## Economic rationale\n\nA reason that is written here.\n\n\
@@ -927,7 +928,8 @@ fn a_config_that_is_a_symlink_fails() {
     assert!(
         failures
             .iter()
-            .any(|f| f.contains("research/configs/trend-v1.json is not a regular file")),
+            .any(|f| f.contains("research/configs/trend-v1.json")
+                && f.contains("is not a regular file")),
         "{failures:?}"
     );
 }
@@ -978,10 +980,9 @@ fn budget_conflicts_names_a_same_family_config_10_days_away() {
     let later = budget_conflicts(tree.path(), "trend-b").unwrap();
     assert_eq!(later.len(), 1, "{later:?}");
     assert!(later[0].contains("trend-a"), "{later:?}");
-    // In the other direction too.
+    // The earlier one was within its budget when it was made: it stays signable.
     let earlier = budget_conflicts(tree.path(), "trend-a").unwrap();
-    assert_eq!(earlier.len(), 1, "{earlier:?}");
-    assert!(earlier[0].contains("trend-b"), "{earlier:?}");
+    assert_eq!(earlier, Vec::<String>::new());
 }
 
 #[test]
@@ -1055,6 +1056,55 @@ fn a_persons_pull_request_may_change_code_beside_a_config_but_keeps_the_budget()
     let failures = run_person(&added_config("trend-v2"), &base, &head);
     assert!(
         failures.iter().any(|f| f.contains("less than 30 days")),
+        "{failures:?}"
+    );
+}
+
+#[test]
+fn a_back_dated_proposal_fails() {
+    // The newest config is long ago; a proposal dated a month after it, but not today, would
+    // let several be merged in one day.
+    let first = config("trend-a", "trend", date(2026, 6, 1), Value::Null);
+    let (base, head) = trees(std::slice::from_ref(&first));
+    head.put(&config(
+        "trend-b",
+        "trend",
+        date(2026, 7, 1),
+        json!("trend-a"),
+    ));
+    let failures = run(&added_config("trend-b"), &base, &head);
+    assert!(
+        failures.iter().any(|f| f.contains("days before today")),
+        "{failures:?}"
+    );
+
+    // Dated within the week: fine.
+    let (base, head) = trees(std::slice::from_ref(&first));
+    head.put(&config(
+        "trend-b",
+        "trend",
+        date(2026, 11, 20),
+        json!("trend-a"),
+    ));
+    assert_eq!(
+        run(&added_config("trend-b"), &base, &head),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn hidden_files_are_not_plain_paths() {
+    for bad in [
+        "research/notes/.gitattributes",
+        ".github/x",
+        "research/.hidden/a.md",
+    ] {
+        assert!(!is_plain_path(bad), "{bad:?}");
+    }
+    let (base, head) = trees(&[]);
+    let failures = run(&[added("research/notes/.gitattributes")], &base, &head);
+    assert!(
+        failures.iter().any(|f| f.contains("is not a plain path")),
         "{failures:?}"
     );
 }

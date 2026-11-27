@@ -70,17 +70,31 @@ Treat it as untrusted input. Before merging:
   30-day budget. For any other pull request that touches nothing under `research/` the
   workflow checks nothing and says so: a green result there says nothing about what the
   pull request changes. That workflow's file comes from `main`, not from the pull request,
-  so a pull request cannot weaken it; look at the "Files changed" tab all the same.
+  so a pull request cannot weaken it. It judges the result of merging the pull request into
+  `main`, not the branch's own diff, so a branch built on old history cannot quietly undo
+  newer commits. It runs only for pull requests into `main`.
 - Read the note. Was the rationale written before any result? Is it a reason, or a
   description of a backtest?
-- Run `scripts/evaluate-proposal.sh research/configs/<name>.json` where the data is. It
-  registers a trial; the count never resets. Read the gate report.
+- Evaluate it where the data is, **without checking the pull request out there**. The host
+  must only ever build and run `main`. Take the one JSON file and nothing else:
+  `git fetch origin pull/<N>/head`, then
+  `git show FETCH_HEAD:research/configs/<name>.json > /tmp/<name>.json`, then
+  `scripts/evaluate-proposal.sh /tmp/<name>.json` from a clean checkout of `main` (the
+  script refuses anything else). It registers a trial; the count never resets. Read the
+  gate report.
 - A person merges. Paper or recent live results are never a reason to merge.
 
 ## Turning it off
 
 Disable the three scheduled tasks and revoke the token. The engine keeps running on the last
 signed config.
+
+Once `"required": true` is set, a missing or invalid manifest stops `tick` and
+`session-close` before they do anything: exit code 2, and nothing is reconciled either, so
+orders resting at the broker stay there and fills go unrecorded until it is fixed. Treat exit
+code 2 in `log/tick.log` as an alert. Before you rotate the key or replace a manifest, engage
+the kill switch (`deploy/engine.sh kill --by <name>`), make the change, check with
+`deploy/engine.sh tick`, then release.
 
 A manifest does not expire, and the engine checks only that it signs the deployment the
 engine's config describes. To retire a signed config, remove its manifest from the host (and
