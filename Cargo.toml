@@ -9,6 +9,7 @@ members = [
     "crates/eval",
     "crates/bars",
     "crates/app",
+    "crates/ui-data",
 ]
 
 [workspace.package]
@@ -28,6 +29,7 @@ nisse-risk = { path = "crates/risk" }
 nisse-store = { path = "crates/store" }
 nisse-bars = { path = "crates/bars" }
 nisse-app = { path = "crates/app" }
+nisse-ui-data = { path = "crates/ui-data" }
 nisse-alpaca-adapter = { path = "crates/alpaca-adapter" }
 
 # NautilusTrader (LGPL-3.0-only). Exact pin, recorded in PLAN.md; all nautilus-* crates
