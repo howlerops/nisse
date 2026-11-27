@@ -246,6 +246,17 @@ pub trait DecisionLog: Send + Sync {
     ) -> impl Future<Output = Result<DecisionId, Self::Error>> + Send;
 }
 
+impl<D: DecisionLog + ?Sized> DecisionLog for &D {
+    type Error = D::Error;
+
+    fn record_decision(
+        &self,
+        decision: &Decision,
+    ) -> impl Future<Output = Result<DecisionId, Self::Error>> + Send {
+        (**self).record_decision(decision)
+    }
+}
+
 /// Where everything else is written, off the decision path: a bounded queue to a writer
 /// task. `emit` waits when the queue is full (back-pressure) and fails only when the store is
 /// gone, in which case the engine must stop trading.
@@ -258,6 +269,18 @@ pub trait RecordSink: Send + Sync {
     /// next must not outrun the record of why: the risk checks before an order goes out, a
     /// kill switch, a drawdown mode change.
     fn flush(&self) -> impl Future<Output = Result<(), Self::Error>> + Send;
+}
+
+impl<K: RecordSink + ?Sized> RecordSink for &K {
+    type Error = K::Error;
+
+    fn emit(&self, record: StoreRecord) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        (**self).emit(record)
+    }
+
+    fn flush(&self) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        (**self).flush()
+    }
 }
 
 /// Where the kill switch is read from. A caller that gets an error must treat the switch as

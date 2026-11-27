@@ -90,36 +90,8 @@ impl RecordSink for MemoryStore {
     }
 }
 
-// The engine holds one store and hands it out three times; references implement the traits
-// so that needs no `Arc`.
-impl DecisionLog for &MemoryStore {
-    type Error = MemoryStoreError;
-
-    async fn record_decision(&self, decision: &Decision) -> Result<DecisionId, MemoryStoreError> {
-        (**self).record_decision(decision).await
-    }
-}
-
-impl IntentLog for &MemoryStore {
-    type Error = MemoryStoreError;
-
-    async fn record_intent(&self, intent: &OrderIntent) -> Result<(), MemoryStoreError> {
-        (**self).record_intent(intent).await
-    }
-}
-
-impl RecordSink for &MemoryStore {
-    type Error = MemoryStoreError;
-
-    async fn emit(&self, record: StoreRecord) -> Result<(), MemoryStoreError> {
-        (**self).emit(record).await
-    }
-
-    async fn flush(&self) -> Result<(), MemoryStoreError> {
-        (**self).flush().await
-    }
-}
-
+// The engine holds one store and hands it out three times as `&MemoryStore`: `nisse_core`
+// implements the three traits for references, so that needs no `Arc`.
 #[cfg(test)]
 mod tests {
     use nisse_core::{
