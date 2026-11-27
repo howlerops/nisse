@@ -10,12 +10,14 @@ must be changed deliberately, the order of work, and the decisions that are open
 
 ## Where the system stands (2026-11-27)
 
-Every earlier phase's code is merged. None of their real-world exit criteria has been met,
-because each needs credentials, data or time that only the owner has:
+Every earlier phase's code is merged. Phase 0's criterion (CI green, migrations apply) is
+met. The others each have a real-world part that is not, because it needs credentials, data
+or time that only the owner has:
 
 | Phase | Built and tested | Not yet done |
 |---|---|---|
 | 1 Adapter | Against a mock server | The paper round-trip tests (`docs/runbooks/paper-tests.md`) |
+| 2 Engine core | Replay on synthetic decisions | The nightly replay over real decisions: nothing has run on a host |
 | 3 Strategy and backtest | On synthetic bars | A backtest on real data: no bars have been downloaded |
 | 4 Risk gate | Fault injection on synthetic data | The out-of-band kill rehearsal at Alpaca |
 | 5 Evals | On synthetic data | Gate reports on real trials; the holdout has never been looked at |
@@ -29,17 +31,22 @@ promote one.
 
 ## What the code refuses today
 
-These are deliberate, each tested, and each must be changed by a reviewed pull request that
-says why, not worked around:
+These are deliberate, and each must be changed by a reviewed pull request that says why,
+not worked around:
 
 - The engine config parser accepts `"environment": "paper"` and nothing else
   (`crates/app/src/config.rs`).
 - The engine binary and the kill commands build only Alpaca's paper endpoints
   (`AlpacaConfig::paper`).
-- The signer signs, and the engine accepts, only the stage `paper`
-  (`nisse_core::signing::STAGE_PAPER`).
-- There is no way to place an order except through the risk gate, and no LLM anywhere in
-  the order path.
+- The signer signs only the stage `paper` (`nisse_core::signing::STAGE_PAPER`). The engine
+  checks the stage only when `signature.required` is true; `config/engine/paper.json` has
+  it false today, so the paper engine checks no signature at all.
+- The only place that sends an order is the trader, after the risk gate's check
+  (`crates/engine/src/trader.rs`). This is by convention: the gateway's submit functions
+  are public, and nothing would stop a new binary calling them directly. A change that
+  adds live should close that (make them crate-private or add a test that fails on a
+  second caller).
+- There is no LLM or HTTP client outside the broker adapter.
 
 ## Order of work for going live
 
@@ -47,9 +54,16 @@ says why, not worked around:
    the plumbing is clean; the gate report on real trials is the evidence about the strategy.
 2. **Decide the account**: taxable or IRA (check with a tax professional; PLAN.md notes
    short-term gains and wash-sale windows on one side, and that an IRA avoids both).
-3. **The promotion decision.** `nisse-gate-report` must show every gate passing for the
-   champion's strategy version, including the one deliberate look at the holdout. If it
-   does not, there is no live phase yet.
+3. **The promotion decision.** `nisse-gate-report` must show every gate except `tracking`
+   passing for the champion's strategy version, including the one deliberate look at the
+   holdout. If it does not, there is no live phase yet. The tracking gate cannot pass
+   before live: the report loads no live returns today (`live: None` in
+   `crates/eval/src/gate_report.rs`), so it reports `not_evaluated` and the report exits 3,
+   not 0. Two pieces of unbuilt work follow, both needed before step 5:
+   - load live returns into the tracking gate, so steps 4 and 7 can be checked by the
+     report and not by hand;
+   - state the pre-live rule exactly ("every gate passes except `tracking`, which is
+     `not_evaluated`") so the `live` signer checks that, and not a loosened exit code.
 4. **Pre-declare the tracking band** before the first live order: the backtest replayed
    over the same period, and the band live results must stay inside
    (`tracking_error_max` and `tracking_gap_max` in `config/eval/gates.json`, both 0.05
@@ -61,7 +75,11 @@ says why, not worked around:
      live unsigned;
    - limits for the live account in a file outside the repository;
    - the same kill switch, watcher and dead-man check as paper, rehearsed on paper first.
-   A human merges it. It is not a change an agent proposes.
+   - a `live` row in `trial_registry` for the live run: only the backtest job registers
+     trials today, and the paper engine registers none.
+   Proposed rule, stricter than CLAUDE.md's rule for build-phase pull requests and not yet
+   written there: the owner merges this one, not Claude, and it is not a change an agent
+   proposes. With no branch protection, that rule is a convention until the owner adds it.
 6. **Fund with a small amount**; swing holding periods only; live credentials on the engine
    host and nowhere else.
 7. **Monthly review** against the band; zero risk breaches; size doubles no faster than
@@ -72,27 +90,32 @@ says why, not worked around:
 The issue asks for "challengers in shadow (decisions logged, no orders)". Two ways to do it,
 with a real trade-off, so it is the owner's call before anything is built:
 
-- **A. Replay.** Each evening, run the challenger through the backtest engine over the bar
-  file up to today and store the last session's decisions under the challenger's strategy
-  version. It reuses the path the backtest and live already share and needs no second
-  broker. But CLAUDE.md says every backtest or evaluation run registers a trial and the
-  count never resets: a nightly replay of one unchanged config would either add a trial a
-  day (wrecking the deflated Sharpe, which counts trials) or need a rule that a re-run of
-  an already-registered config over an extended period is the *same* trial. That rule
-  would be a change to how trials are counted.
+- **A. A nightly backtest.** Each evening, run the challenger through the backtest job
+  over the bar file up to today and store the last session's decisions. It needs no second
+  broker. As the job stands it is refused: an ordinary run whose bars reach
+  `holdout_start` (2023-01-01, which may not move later) fails with `HoldoutTouched`, and
+  a holdout run is capped at `holdout_max_looks` (10) across all versions, so ten nights
+  would use up the holdout for every strategy. It would also add a `backtest` trial a day
+  against a `trial_budget` of 100. Making it work means a new kind of run with its own
+  rules for both, which is a change to how the holdout and trials are protected.
 - **B. A second engine with a simulated broker.** Run `nisse-engine` for the challenger
-  with the simulated broker in place of Alpaca, persisting its simulated positions. No
-  trial question, and its decisions are made at the same moment as the champion's; but it
-  is a second set of state to restore and reconcile, and a simulated fill model that
-  drifts from the champion's real fills.
+  with the simulated broker in place of Alpaca, persisting its simulated positions. Its
+  decisions are made at the same moment as the champion's and it never reads the holdout
+  through the backtest job. The costs: a second set of state to restore and reconcile; a
+  simulated fill model that drifts from the champion's real fills; its simulated orders
+  and fills must be stored apart from, or clearly marked against, the champion's real
+  `order_event` rows (the issue says "no orders"); and it has a trial question too.
+  `trial_registry.kind` already has `shadow`, and every row of every kind counts toward
+  the lifetime budget, so the choice is one `shadow` trial per challenger version when its
+  shadow run starts, or one per session. None is not allowed by CLAUDE.md.
 
-Recommendation: B, because it leaves the trial count alone, which the promotion gates
-depend on.
+Recommendation: B, registering one `shadow` trial per challenger version when its shadow
+run starts. A's obstacles are the holdout and the budget themselves; B's are bookkeeping.
 
 ## The owner's
 
-Everything in "Order of work", and the shadow decision. Nothing in this repository will
-start trading real money without a pull request that a person wrote the reasons for and
-merged.
+Everything in "Order of work", the shadow decision, and whether to adopt the merge rule
+proposed in step 5. Nothing in this repository can trade real money today; changing that
+takes the pull request described in step 5.
 
 Nothing here is investment advice.
