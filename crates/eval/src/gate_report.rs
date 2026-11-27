@@ -22,6 +22,9 @@ use crate::stats::{cv, dsr, moments, pbo, tracking};
 /// The `eval_version` of the scores a report writes.
 pub const EVAL_VERSION: &str = "gate-v1";
 
+/// The fewest holdout sessions a holdout run may be judged on.
+const MIN_HOLDOUT_SESSIONS: usize = 20;
+
 /// The verdict on one gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateStatus {
@@ -77,12 +80,27 @@ pub struct TrialSeries {
     pub requested_end: u64,
     /// The stored summary, passed through to the report.
     pub summary: Value,
+    /// Whether the build that produced the run had uncommitted changes. `None` when not
+    /// recorded.
+    pub dirty_build: Option<bool>,
+    /// The holdout boundary the run was made under, as `YYYY-MM-DD`.
+    pub holdout_start: Option<String>,
+    /// The last bar's time, in nanoseconds.
+    pub data_end: Option<u64>,
+    /// How many of the returns are holdout sessions (the tail of the series).
+    pub holdout_sessions: Option<u64>,
+    /// How the risk gate left the run at its end: `normal`, `halved` or `flat`.
+    pub final_drawdown_mode: Option<String>,
+    /// The cost model of the run, as stored (`Null` when absent).
+    pub costs: Value,
+    /// The symbols of the run, as stored (`Null` when absent).
+    pub symbols: Value,
 }
 
 impl TrialSeries {
     /// Reads a stored trial. A result without a field (older rows) gives `returns: None`, an
-    /// empty snapshot id and zeros: such a trial can still be counted but not used in
-    /// statistics.
+    /// empty snapshot id, zeros and `None`s: such a trial can still be counted but is never
+    /// used in statistics (see [`TrialSeries::usable`]).
     #[must_use]
     pub fn from_stored(trial: &TrialWithResult) -> Self {
         let result = &trial.result;
@@ -105,8 +123,58 @@ impl TrialSeries {
                 .and_then(Value::as_u64)
                 .unwrap_or(0),
             summary: result.get("summary").cloned().unwrap_or(Value::Null),
+            dirty_build: result.get("dirty_build").and_then(Value::as_bool),
+            holdout_start: result
+                .get("holdout_start")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            data_end: result.get("data_end").and_then(Value::as_u64),
+            holdout_sessions: result.get("holdout_sessions").and_then(Value::as_u64),
+            final_drawdown_mode: result
+                .get("final_drawdown_mode")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            costs: result.get("costs").cloned().unwrap_or(Value::Null),
+            symbols: result.get("symbols").cloned().unwrap_or(Value::Null),
         }
     }
+
+    /// Whether the trial may be used in statistics, or the fixed reason it may not. A holdout
+    /// run needs only a recorded end; an ordinary run must end before the holdout boundary.
+    pub fn usable(&self, gates: &Gates) -> Result<(), &'static str> {
+        const DATA_END: &str = "its data reaches into the holdout, or its end is not recorded";
+        if self.returns.is_none() {
+            return Err("no complete return series");
+        }
+        if self.dirty_build != Some(false) {
+            return Err("dirty build, or the build state is not recorded");
+        }
+        let boundary = gates.holdout_start.format("%Y-%m-%d").to_string();
+        if self.holdout_start.as_deref() != Some(boundary.as_str()) {
+            return Err("run under a different holdout boundary, or none recorded");
+        }
+        if self.holdout {
+            return if self.data_end.is_some() {
+                Ok(())
+            } else {
+                Err(DATA_END)
+            };
+        }
+        match (self.data_end, boundary_nanos(gates)) {
+            (Some(end), Some(start)) if end < start => Ok(()),
+            _ => Err(DATA_END),
+        }
+    }
+}
+
+/// The holdout boundary, 00:00:00 UTC on `holdout_start`, in nanoseconds.
+fn boundary_nanos(gates: &Gates) -> Option<u64> {
+    let nanos = gates
+        .holdout_start
+        .and_hms_opt(0, 0, 0)?
+        .and_utc()
+        .timestamp_nanos_opt()?;
+    u64::try_from(nanos).ok()
 }
 
 /// The returns array when the result says it is complete and every element is a number.
@@ -136,6 +204,9 @@ pub struct ReportInputs {
     /// `(failed, scored)` from `replay_failures`.
     pub replay: (u64, u64),
     pub risk_breaches: u64,
+    /// Orders of this version sent beyond the intent. Zero means the risk gate has nothing to
+    /// judge.
+    pub sent_orders: u64,
     /// Live and backtest daily returns over the same sessions, when live trading exists.
     pub live: Option<(Vec<f64>, Vec<f64>)>,
 }
@@ -198,9 +269,10 @@ fn finite(value: Option<f64>) -> Value {
 /// `gates.bootstrap_seed`.
 ///
 /// The candidate is the newest (highest trial id) non-holdout trial of `inputs.version`,
-/// whether or not it has returns. The PBO matrix is the candidate's returns for its own
-/// version plus, for every other version, its newest non-holdout trial with returns over the
-/// candidate's snapshot, range and length; series are in ascending strategy version id.
+/// whether or not it has returns or is usable. The statistical gates use it only when it is
+/// usable. The PBO matrix is the candidate's returns for its own version plus, for every other
+/// version, its newest usable non-holdout trial with returns over the candidate's snapshot,
+/// range and length; series are in ascending strategy version id.
 #[must_use]
 pub fn build_report(inputs: &ReportInputs) -> GateReport {
     let candidate = candidate(inputs);
@@ -210,7 +282,7 @@ pub fn build_report(inputs: &ReportInputs) -> GateReport {
         pbo_gate(inputs, candidate),
         holdout_gate(inputs),
         replay_gate(inputs.replay),
-        risk_gate(inputs.risk_breaches),
+        risk_gate(inputs.risk_breaches, inputs.sent_orders),
         tracking_gate(inputs),
     ];
     GateReport {
@@ -236,6 +308,7 @@ pub async fn load_inputs<C: GenericClient>(
         .collect();
     let (failed, scored) = scoring::replay_failures(client, version).await?;
     let breaches = scoring::risk_breaches(client, version).await?;
+    let sent = scoring::sent_orders(client, version).await?;
     Ok(ReportInputs {
         version,
         gates,
@@ -244,6 +317,7 @@ pub async fn load_inputs<C: GenericClient>(
         trials,
         replay: (count(failed)?, count(scored)?),
         risk_breaches: count(breaches)?,
+        sent_orders: count(sent)?,
         live: None,
     })
 }
@@ -284,12 +358,21 @@ pub async fn store_report<C: GenericClient>(
     Ok(())
 }
 
-/// The newest non-holdout trial of the version, whether or not it has returns.
+/// The newest non-holdout trial of the version, whether or not it has returns or is usable.
 fn candidate(inputs: &ReportInputs) -> Option<&TrialSeries> {
     inputs
         .trials
         .iter()
         .filter(|t| t.strategy_version_id == inputs.version && !t.holdout)
+        .max_by_key(|t| t.trial_id)
+}
+
+/// The newest holdout run of the version, whether or not it is usable.
+fn newest_holdout(inputs: &ReportInputs) -> Option<&TrialSeries> {
+    inputs
+        .trials
+        .iter()
+        .filter(|t| t.holdout && t.strategy_version_id == inputs.version)
         .max_by_key(|t| t.trial_id)
 }
 
@@ -329,6 +412,34 @@ fn undecided(
     }
 }
 
+/// A statistical gate's note when its candidate trial cannot be used.
+fn cannot_use(reason: &str) -> String {
+    format!("the candidate trial cannot be used: {reason}")
+}
+
+/// The candidate's returns, when the candidate is usable; otherwise the note saying why not.
+fn usable_returns<'a>(candidate: &'a TrialSeries, gates: &Gates) -> Result<&'a [f64], String> {
+    candidate.usable(gates).map_err(cannot_use)?;
+    candidate
+        .returns
+        .as_deref()
+        .ok_or_else(|| cannot_use("no complete return series"))
+}
+
+/// The last `holdout_sessions` returns of a holdout run. `None` when the run has no returns, no
+/// recorded session count, fewer than [`MIN_HOLDOUT_SESSIONS`], or more than it has returns.
+fn holdout_tail(run: &TrialSeries) -> Option<&[f64]> {
+    let returns = run.returns.as_deref()?;
+    let sessions = usize::try_from(run.holdout_sessions?).ok()?;
+    if sessions < MIN_HOLDOUT_SESSIONS {
+        return None;
+    }
+    returns
+        .len()
+        .checked_sub(sessions)
+        .and_then(|start| returns.get(start..))
+}
+
 fn trial_budget(inputs: &ReportInputs) -> GateResult {
     let value = inputs.lifetime_trials as f64;
     let threshold = f64::from(inputs.gates.trial_budget);
@@ -355,23 +466,60 @@ fn deflated_sharpe(inputs: &ReportInputs, candidate: Option<&TrialSeries>) -> Ga
             "no backtest trial of this version has a stored result yet",
         );
     };
-    let Some(returns) = candidate.returns.as_deref() else {
-        return undecided(
-            NAME,
-            None,
-            threshold,
-            "the candidate trial has no stored returns (an older result)",
-        );
+    let returns = match usable_returns(candidate, &inputs.gates) {
+        Ok(returns) => returns,
+        Err(note) => return undecided(NAME, None, threshold, &note),
     };
-    let trial_sharpes: Vec<f64> = inputs
-        .trials
-        .iter()
-        .filter(|t| !t.holdout)
-        .filter_map(|t| t.returns.as_deref())
-        .filter_map(moments::sharpe)
-        .collect();
+
+    // One Sharpe per (version, snapshot, range) from usable ordinary runs: the newest of each.
+    let mut newest: BTreeMap<(i64, &str, u64, u64), (i64, f64)> = BTreeMap::new();
+    for trial in &inputs.trials {
+        if trial.holdout || trial.usable(&inputs.gates).is_err() {
+            continue;
+        }
+        let Some(sharpe) = trial.returns.as_deref().and_then(moments::sharpe) else {
+            continue;
+        };
+        let key = (
+            trial.strategy_version_id.0,
+            trial.data_snapshot_id.as_str(),
+            trial.requested_start,
+            trial.requested_end,
+        );
+        let entry = newest.entry(key).or_insert((trial.trial_id, sharpe));
+        if trial.trial_id > entry.0 {
+            *entry = (trial.trial_id, sharpe);
+        }
+    }
+    let mut by_trial: Vec<(i64, f64)> = newest.into_values().collect();
+    by_trial.sort_by_key(|(trial_id, _)| *trial_id);
+    let sharpes: Vec<f64> = by_trial.into_iter().map(|(_, sharpe)| sharpe).collect();
+
+    let lifetime = inputs.lifetime_trials;
+    if lifetime >= 2 {
+        let usable = u64::try_from(sharpes.len()).unwrap_or(u64::MAX);
+        if usable.saturating_mul(2) < lifetime {
+            return undecided(
+                NAME,
+                None,
+                threshold,
+                &format!(
+                    "fewer than half the lifetime trials have a usable Sharpe: {usable} of {lifetime}"
+                ),
+            );
+        }
+        if moments::variance(&sharpes).is_none_or(|v| v <= 0.0) {
+            return undecided(
+                NAME,
+                None,
+                threshold,
+                "the trial Sharpes do not vary, so there is nothing to deflate with",
+            );
+        }
+    }
+
     let minimum = inputs.gates.deflated_sharpe_min;
-    match dsr::deflated_sharpe(returns, &trial_sharpes, inputs.lifetime_trials) {
+    match dsr::deflated_sharpe(returns, &sharpes, lifetime) {
         None => undecided(
             NAME,
             None,
@@ -390,7 +538,7 @@ fn deflated_sharpe(inputs: &ReportInputs, candidate: Option<&TrialSeries>) -> Ga
 }
 
 /// The candidate's returns (for its own version) and, for every other version, its newest
-/// non-holdout trial with returns over the same snapshot, range and length, in ascending
+/// usable non-holdout trial with returns over the same snapshot, range and length, in ascending
 /// strategy version id.
 fn pbo_matrix<'a>(
     inputs: &'a ReportInputs,
@@ -399,7 +547,7 @@ fn pbo_matrix<'a>(
 ) -> Vec<&'a [f64]> {
     let mut newest: BTreeMap<StrategyVersionId, (i64, &'a [f64])> = BTreeMap::new();
     for trial in &inputs.trials {
-        if trial.holdout {
+        if trial.holdout || trial.usable(&inputs.gates).is_err() {
             continue;
         }
         let Some(series) = trial.returns.as_deref() else {
@@ -424,17 +572,29 @@ fn pbo_matrix<'a>(
 
 fn pbo_gate(inputs: &ReportInputs, candidate: Option<&TrialSeries>) -> GateResult {
     const NAME: &str = "pbo";
-    const NEED: &str = "needs at least two configurations over the same data";
     let threshold = Some(inputs.gates.pbo_max);
     let Some(candidate) = candidate else {
-        return undecided(NAME, None, threshold, NEED);
+        return undecided(
+            NAME,
+            None,
+            threshold,
+            "no backtest trial of this version has a stored result yet",
+        );
     };
-    let Some(returns) = candidate.returns.as_deref() else {
-        return undecided(NAME, None, threshold, NEED);
+    let returns = match usable_returns(candidate, &inputs.gates) {
+        Ok(returns) => returns,
+        Err(note) => return undecided(NAME, None, threshold, &note),
     };
     let matrix = pbo_matrix(inputs, candidate, returns);
-    if matrix.len() < 2 {
-        return undecided(NAME, None, threshold, NEED);
+    let minimum = inputs.gates.pbo_min_configs;
+    let found = matrix.len();
+    if found < usize::try_from(minimum).unwrap_or(usize::MAX) {
+        return undecided(
+            NAME,
+            None,
+            threshold,
+            &format!("needs at least {minimum} configurations over the same data, found {found}"),
+        );
     }
     let maximum = inputs.gates.pbo_max;
     match pbo::pbo(&matrix) {
@@ -449,45 +609,88 @@ fn pbo_gate(inputs: &ReportInputs, candidate: Option<&TrialSeries>) -> GateResul
             value <= maximum,
             Some(value),
             threshold,
-            format!(
-                "PBO {value:.4} against a maximum of {maximum} over {} configurations",
-                matrix.len()
-            ),
+            format!("PBO {value:.4} against a maximum of {maximum} over {found} configurations"),
         ),
     }
 }
 
 fn holdout_gate(inputs: &ReportInputs) -> GateResult {
     const NAME: &str = "holdout";
-    let threshold = f64::from(inputs.gates.holdout_max_looks);
+    let gates = &inputs.gates;
+    let max_looks = f64::from(gates.holdout_max_looks);
     let looks = inputs.holdout_looks as f64;
-    if looks > threshold {
+    if looks > max_looks {
         return judged(
             NAME,
             false,
             Some(looks),
-            Some(threshold),
-            format!("{looks} holdout runs exceed the {threshold} allowed; the holdout is retired"),
+            Some(max_looks),
+            format!("{looks} holdout runs exceed the {max_looks} allowed; the holdout is retired"),
         );
     }
-    let has_run = inputs
-        .trials
-        .iter()
-        .any(|t| t.holdout && t.strategy_version_id == inputs.version);
-    if !has_run {
+    let Some(run) = newest_holdout(inputs) else {
+        return undecided(NAME, None, None, "no holdout run for this version yet");
+    };
+    if let Err(reason) = run.usable(gates) {
         return undecided(
             NAME,
-            Some(looks),
+            None,
+            None,
+            &format!("the holdout run cannot be used: {reason}"),
+        );
+    }
+    let Some(tail) = holdout_tail(run) else {
+        return undecided(NAME, None, None, "fewer than 20 holdout sessions");
+    };
+    let ppy = gates.periods_per_year;
+    let Some(candidate) = candidate(inputs) else {
+        return undecided(
+            NAME,
+            None,
+            None,
+            "no backtest trial of this version has a stored result yet",
+        );
+    };
+    let candidate_returns = match usable_returns(candidate, gates) {
+        Ok(returns) => returns,
+        Err(note) => return undecided(NAME, None, None, &note),
+    };
+    let Some(candidate_sharpe) = moments::sharpe(candidate_returns) else {
+        return undecided(
+            NAME,
+            None,
+            None,
+            "the candidate's Sharpe ratio is undefined",
+        );
+    };
+    let threshold =
+        ((1.0 - gates.sharpe_haircut) * moments::annualise(candidate_sharpe, ppy)).max(0.0);
+    let Some(value) = moments::sharpe(tail).map(|s| moments::annualise(s, ppy)) else {
+        return undecided(
+            NAME,
+            None,
             Some(threshold),
-            "no holdout run for this version yet",
+            "the holdout sessions have no Sharpe ratio",
+        );
+    };
+    if run.final_drawdown_mode.as_deref() == Some("flat") {
+        return judged(
+            NAME,
+            false,
+            Some(value),
+            Some(threshold),
+            "the holdout run ended flat after a drawdown".to_owned(),
         );
     }
     judged(
         NAME,
-        true,
-        Some(looks),
+        value >= threshold,
+        Some(value),
         Some(threshold),
-        format!("{looks} holdout runs against {threshold} allowed; this version has one"),
+        format!(
+            "holdout Sharpe {value:.4} over the last {} sessions against a haircut Sharpe of {threshold:.4}",
+            tail.len()
+        ),
     )
 }
 
@@ -510,9 +713,13 @@ fn replay_gate((failed, scored): (u64, u64)) -> GateResult {
     )
 }
 
-fn risk_gate(breaches: u64) -> GateResult {
+fn risk_gate(breaches: u64, sent: u64) -> GateResult {
+    const NAME: &str = "risk_breaches";
+    if sent == 0 {
+        return undecided(NAME, None, Some(0.0), "this version has sent no order");
+    }
     judged(
-        "risk_breaches",
+        NAME,
         breaches == 0,
         Some(breaches as f64),
         Some(0.0),
@@ -617,5 +824,42 @@ fn info(inputs: &ReportInputs, candidate: Option<&TrialSeries>) -> Value {
         "lifetime_trials": inputs.lifetime_trials,
         "trial_budget": gates.trial_budget,
         "candidate_trial_id": candidate.map(|t| t.trial_id),
+        "candidate_run": candidate_run(inputs, candidate),
+        "holdout_run": holdout_run(inputs),
+    })
+}
+
+/// How the candidate was run, and whether its statistics may be used. Null without a candidate.
+fn candidate_run(inputs: &ReportInputs, candidate: Option<&TrialSeries>) -> Value {
+    candidate.map_or(Value::Null, |t| {
+        let reason = t.usable(&inputs.gates).err();
+        json!({
+            "dirty_build": t.dirty_build,
+            "costs": t.costs,
+            "symbols": t.symbols,
+            "requested_start": t.requested_start,
+            "requested_end": t.requested_end,
+            "data_end": t.data_end,
+            "holdout_start": t.holdout_start,
+            "usable": reason.is_none(),
+            "not_usable_reason": reason,
+        })
+    })
+}
+
+/// The newest holdout run of the version: its annualised Sharpe over the holdout sessions (the
+/// figure the holdout gate judges). Null without a holdout run.
+fn holdout_run(inputs: &ReportInputs) -> Value {
+    let ppy = inputs.gates.periods_per_year;
+    newest_holdout(inputs).map_or(Value::Null, |run| {
+        let sharpe = holdout_tail(run)
+            .and_then(moments::sharpe)
+            .map(|s| moments::annualise(s, ppy));
+        json!({
+            "trial_id": run.trial_id,
+            "holdout_sessions": run.holdout_sessions,
+            "final_drawdown_mode": run.final_drawdown_mode,
+            "sharpe": finite(sharpe),
+        })
     })
 }
