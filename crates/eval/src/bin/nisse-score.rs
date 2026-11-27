@@ -50,8 +50,8 @@ async fn main() -> anyhow::Result<()> {
     );
     let outcomes = score_outcomes(&client, &bars, &gates, now).await?;
     println!(
-        "outcomes: {} written, {} quality scores, {} waiting",
-        outcomes.written, outcomes.quality_scores, outcomes.waiting
+        "outcomes: {} written, {} quality scores, {} waiting, {} unscored (base bar too old)",
+        outcomes.written, outcomes.quality_scores, outcomes.waiting, outcomes.base_too_old
     );
     let execution = score_execution(&client, now).await?;
     println!(
