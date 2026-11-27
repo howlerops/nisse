@@ -63,18 +63,30 @@ impl Regime {
     }
 }
 
-/// Whether a decision at `decision_ts` can never be scored from these bars because its base bar
-/// (the last symbol bar at or before it) is [`MAX_BASE_AGE_NANOS`] or more older than the
-/// decision. `false` when there is no bar at or before the decision yet (it may still arrive) or
-/// the base bar is recent enough. "Never" means never with the bars as they are: a later-arriving
-/// bar for the decision's own session would make the base bar recent again.
-#[must_use]
-pub fn base_too_old(symbol_bars: &[BarPoint], decision_ts: UnixNanos) -> bool {
+/// Whether the decision's base bar (the last symbol bar at or before `decision_ts`) is
+/// [`MAX_BASE_AGE_NANOS`] or more older than the decision. `false` when there is no such bar.
+fn base_age_exceeds_limit(symbol_bars: &[BarPoint], decision_ts: UnixNanos) -> bool {
     let Some(base) = index_at_or_before(symbol_bars, decision_ts).and_then(|t| symbol_bars.get(t))
     else {
         return false;
     };
     decision_ts.as_u64().saturating_sub(base.ts.as_u64()) >= MAX_BASE_AGE_NANOS
+}
+
+/// Whether a decision at `decision_ts` can never be scored from these bars: its base bar is
+/// [`MAX_BASE_AGE_NANOS`] or more older than the decision (see `outcome`), and a later bar exists,
+/// either for the symbol or for the benchmark. A later bar means the decision's own session should
+/// already be in the file, so waiting will not fix it. Before any later bar exists, the decision
+/// is simply waiting, so this is `false` then, and also `false` when no bar at or before the
+/// decision exists yet, or the base bar is recent enough.
+#[must_use]
+pub fn base_too_old(
+    symbol_bars: &[BarPoint],
+    benchmark_bars: &[BarPoint],
+    decision_ts: UnixNanos,
+) -> bool {
+    base_age_exceeds_limit(symbol_bars, decision_ts)
+        && (has_bar_after(symbol_bars, decision_ts) || has_bar_after(benchmark_bars, decision_ts))
 }
 
 /// The outcome of a decision made at `decision_ts` over `horizon` sessions. The base bar is the
@@ -102,7 +114,7 @@ pub fn outcome(
     if horizon == 0 {
         return None;
     }
-    if base_too_old(symbol_bars, decision_ts) {
+    if base_age_exceeds_limit(symbol_bars, decision_ts) {
         return None;
     }
     let t = index_at_or_before(symbol_bars, decision_ts)?;
@@ -211,6 +223,11 @@ pub fn regime(benchmark_bars: &[BarPoint], ts: UnixNanos) -> Regime {
 /// Index of the last bar with `ts <= at`, or `None` when every bar is later.
 fn index_at_or_before(bars: &[BarPoint], at: UnixNanos) -> Option<usize> {
     bars.partition_point(|bar| bar.ts <= at).checked_sub(1)
+}
+
+/// Whether `bars` (sorted by `ts`) has a bar strictly after `at`: the newest bar is the last one.
+fn has_bar_after(bars: &[BarPoint], at: UnixNanos) -> bool {
+    bars.last().is_some_and(|bar| bar.ts > at)
 }
 
 /// Index of the bar whose `ts` equals `at` exactly, or `None` when there is none.
@@ -494,30 +511,70 @@ mod tests {
     #[test]
     fn base_too_old_follows_the_age_limit() {
         let sym = symbol();
+        let bench = bench();
         let minute = 60_000_000_000;
 
-        // No bar at or before the decision: it may still arrive, so not "too old".
-        assert!(!base_too_old(&[], at(0, 0)));
+        // No bar at or before the decision: it may still arrive, so not "too old", even though
+        // later bars exist.
+        assert!(!base_too_old(&[], &bench, at(0, 0)));
         let late_start = series_from(1, &SYMBOL_CLOSES);
-        assert!(!base_too_old(&late_start, at(0, 12)));
+        assert!(!base_too_old(&late_start, &bench, at(0, 12)));
 
         // Age zero, and 19 hours 59 minutes: recent enough.
-        assert!(!base_too_old(&sym, at(0, 0)));
+        assert!(!base_too_old(&sym, &bench, at(0, 0)));
         assert!(!base_too_old(
             &sym,
+            &bench,
             UnixNanos::from(19 * HOUR_NANOS + 59 * minute)
         ));
 
-        // Exactly 20 hours after the day 0 bar, which is then the newest bar.
+        // Exactly 20 hours after the day 0 bar, with later bars in both series: too old.
+        assert!(base_too_old(&sym, &bench, UnixNanos::from(20 * HOUR_NANOS)));
+
+        // 64 hours after the day 0 bar, the symbol's only bar, with later benchmark bars: too old.
         let day_zero_only = series(&SYMBOL_CLOSES[..1]);
-        assert!(base_too_old(
-            &day_zero_only,
-            UnixNanos::from(20 * HOUR_NANOS)
-        ));
-        // 64 hours after the day 0 bar, with no later bar: too old.
-        assert!(base_too_old(&day_zero_only, at(2, 16)));
+        assert!(base_too_old(&day_zero_only, &bench, at(2, 16)));
         // The full series has a day 2 bar, so at day 2 16:00 the base is 16 hours old.
-        assert!(!base_too_old(&sym, at(2, 16)));
+        assert!(!base_too_old(&sym, &bench, at(2, 16)));
+    }
+
+    #[test]
+    fn a_newest_base_bar_in_both_series_is_waiting_not_too_old() {
+        // Both series end at day 0: the decision at day 0 20:00 or day 1 00:00 has the day 0 bar
+        // as its base, 20 and 24 hours old, and no bar after it exists yet.
+        let sym = series(&SYMBOL_CLOSES[..1]);
+        let bench = series(&BENCH_CLOSES[..1]);
+        assert!(!base_too_old(&sym, &bench, at(0, 20)));
+        assert!(!base_too_old(&sym, &bench, at(1, 0)));
+        assert!(outcome(&sym, &bench, at(1, 0), 1).is_none());
+    }
+
+    #[test]
+    fn a_later_benchmark_bar_makes_an_old_base_too_old() {
+        // The symbol ends at day 0; the benchmark has day 1, so the decision at day 1 00:00 is
+        // stale with respect to its own session.
+        let sym = series(&SYMBOL_CLOSES[..1]);
+        let bench = bench();
+        assert!(base_too_old(&sym, &bench, at(1, 0)));
+        assert!(base_too_old(&sym, &bench, at(0, 20)));
+        assert!(outcome(&sym, &bench, at(1, 0), 1).is_none());
+    }
+
+    #[test]
+    fn a_later_symbol_bar_makes_an_old_base_too_old() {
+        // The symbol skips day 1 and has day 2; the benchmark ends at day 0.
+        let sym = vec![flat_bar(0, 100.0), flat_bar(2, 101.0)];
+        let bench = series(&BENCH_CLOSES[..1]);
+        assert!(base_too_old(&sym, &bench, at(1, 0)));
+        assert!(outcome(&sym, &bench, at(1, 0), 1).is_none());
+    }
+
+    #[test]
+    fn a_recent_base_bar_with_later_bars_is_not_too_old() {
+        let sym = symbol();
+        let bench = bench();
+        assert!(!base_too_old(&sym, &bench, at(0, 12)));
+        assert!(!base_too_old(&sym, &bench, at(0, 0)));
     }
 
     #[test]
@@ -527,13 +584,32 @@ mod tests {
 
         // Otherwise scorable (horizon 1 has its end bar): too old, so None.
         let too_old = at(0, 20);
-        assert!(base_too_old(&sym, too_old));
+        assert!(base_too_old(&sym, &bench, too_old));
         assert!(outcome(&sym, &bench, too_old, 1).is_none());
 
         // Otherwise scorable and recent: Some, and not too old.
         let recent = UnixNanos::from(19 * HOUR_NANOS + 59 * 60_000_000_000);
-        assert!(!base_too_old(&sym, recent));
+        assert!(!base_too_old(&sym, &bench, recent));
         assert!(outcome(&sym, &bench, recent, 1).is_some());
+    }
+
+    #[test]
+    fn outcome_is_none_when_the_base_is_old_with_or_without_later_bars() {
+        let sym = symbol();
+        let bench = bench();
+
+        // Old base, later bars in both series: None (and too old).
+        assert!(outcome(&sym, &bench, at(0, 20), 1).is_none());
+        // Old base, newest in both series: None (and waiting, not too old).
+        let sym_end = series(&SYMBOL_CLOSES[..1]);
+        let bench_end = series(&BENCH_CLOSES[..1]);
+        assert!(outcome(&sym_end, &bench_end, at(1, 0), 1).is_none());
+        assert!(!base_too_old(&sym_end, &bench_end, at(1, 0)));
+        // Old base, later benchmark bar only: None.
+        assert!(outcome(&sym_end, &bench, at(1, 0), 1).is_none());
+        // Old base, later symbol bar only: None.
+        let sym_gap = vec![flat_bar(0, 100.0), flat_bar(2, 101.0)];
+        assert!(outcome(&sym_gap, &bench_end, at(1, 0), 1).is_none());
     }
 
     #[test]
