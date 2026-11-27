@@ -57,6 +57,19 @@ fn runtime() -> tokio::runtime::Runtime {
         .unwrap()
 }
 
+/// A scratch store in which the engine wrote a heartbeat a few seconds ago.
+fn store_with_a_live_engine(rt: &tokio::runtime::Runtime) -> ScratchDb {
+    let db = rt.block_on(ScratchDb::create());
+    let client = rt.block_on(db.client()).unwrap();
+    rt.block_on(client.execute(
+        "INSERT INTO heartbeat (source, event_ts) \
+         VALUES ('engine', clock_timestamp() - interval '5 seconds')",
+        &[],
+    ))
+    .unwrap();
+    db
+}
+
 /// `url` with the session's role set to `nisse_ui`, as a phone's login would act.
 fn as_ui_role(url: &str) -> String {
     let separator = if url.contains('?') { '&' } else { '?' };
@@ -72,11 +85,11 @@ fn without_a_connection_the_app_says_so() {
 #[test]
 fn the_status_screen_shows_what_the_store_says() {
     let rt = runtime();
-    let db = rt.block_on(ScratchDb::create());
+    let db = store_with_a_live_engine(&rt);
     let app = start(Some(&as_ui_role(&db.url)), "Kill switch: off");
     assert!(app.shows("Drawdown mode: normal"));
-    assert!(app.shows("Heartbeat: never"));
     assert!(app.shows("Rebalance owed: no"));
+    assert!(!app.shows("Heartbeat: never"));
     drop(app);
     rt.block_on(db.drop_db()).unwrap();
 }
@@ -95,7 +108,7 @@ fn an_unreachable_store_is_cannot_confirm_never_a_state() {
 #[test]
 fn the_kill_switch_is_engaged_from_the_app_and_read_back() {
     let rt = runtime();
-    let db = rt.block_on(ScratchDb::create());
+    let db = store_with_a_live_engine(&rt);
     let mut app = start(Some(&as_ui_role(&db.url)), "Kill switch: off");
 
     app.press("Kill").unwrap();
@@ -109,11 +122,7 @@ fn the_kill_switch_is_engaged_from_the_app_and_read_back() {
     // The store agrees, and the row says who and from where.
     let client = rt.block_on(db.client()).unwrap();
     let status = rt
-        .block_on(nisse_ui_data::status(
-            &client,
-            "engine",
-            nisse_core::nautilus::UnixNanos::from(0_u64),
-        ))
+        .block_on(nisse_ui_data::status(&client, "engine"))
         .unwrap();
     assert!(status.kill_switch);
     let row = rt
@@ -153,7 +162,7 @@ fn a_kill_that_cannot_reach_the_store_is_not_confirmed() {
 #[test]
 fn positions_and_gates_show_what_is_stored() {
     let rt = runtime();
-    let db = rt.block_on(ScratchDb::create());
+    let db = store_with_a_live_engine(&rt);
     let client = rt.block_on(db.client()).unwrap();
     let position = |symbol: &str, qty: &str, cost: &str, secs: u64| PositionEvent {
         symbol: Symbol::new_checked(symbol).unwrap(),
@@ -212,7 +221,7 @@ fn settings_saves_and_forgets_the_connection() {
 #[test]
 fn the_kill_button_needs_a_name_and_a_second_press() {
     let rt = runtime();
-    let db = rt.block_on(ScratchDb::create());
+    let db = store_with_a_live_engine(&rt);
     let mut app = start(Some(&as_ui_role(&db.url)), "Kill switch: off");
     app.press("Kill").unwrap();
     app.wait_for("Engage kill switch").unwrap();
@@ -238,6 +247,73 @@ fn the_kill_button_needs_a_name_and_a_second_press() {
         .get(0);
     assert_eq!(rows, 0);
 
+    drop(app);
+    drop(client);
+    rt.block_on(db.drop_db()).unwrap();
+}
+
+#[test]
+fn off_is_not_shown_as_good_news_when_the_engine_has_no_heartbeat() {
+    let rt = runtime();
+    let db = rt.block_on(ScratchDb::create());
+    let app = start(
+        Some(&as_ui_role(&db.url)),
+        "Kill switch: off (engine not confirmed alive)",
+    );
+    assert!(app.shows("Heartbeat: never"));
+    assert!(!app.shows("Kill switch: off"));
+    drop(app);
+    rt.block_on(db.drop_db()).unwrap();
+}
+
+#[test]
+fn a_heartbeat_in_the_future_is_cannot_confirm() {
+    // Some clock is wrong: the engine's liveness cannot be judged, so no state is shown.
+    let rt = runtime();
+    let db = rt.block_on(ScratchDb::create());
+    let client = rt.block_on(db.client()).unwrap();
+    rt.block_on(client.execute(
+        "INSERT INTO heartbeat (source, event_ts) \
+         VALUES ('engine', clock_timestamp() + interval '20 minutes')",
+        &[],
+    ))
+    .unwrap();
+    let app = start(
+        Some(&as_ui_role(&db.url)),
+        "Cannot confirm the engine's state.",
+    );
+    assert!(!app.shows("Kill switch: off"));
+    drop(app);
+    drop(client);
+    rt.block_on(db.drop_db()).unwrap();
+}
+
+#[test]
+fn a_store_that_goes_away_after_a_good_read_stops_being_shown() {
+    let rt = runtime();
+    let db = store_with_a_live_engine(&rt);
+    let mut app = start(Some(&as_ui_role(&db.url)), "Kill switch: off");
+    // The store disappears. The next refresh fails, and the old "off" must not stay up.
+    rt.block_on(db.drop_db()).unwrap();
+    app.press("Refresh").unwrap();
+    app.wait_for("Cannot confirm the engine's state.").unwrap();
+    assert!(!app.shows("Kill switch: off"));
+}
+
+#[test]
+fn the_activity_screen_lists_the_engine_steps() {
+    let rt = runtime();
+    let db = store_with_a_live_engine(&rt);
+    let client = rt.block_on(db.client()).unwrap();
+    rt.block_on(client.execute(
+        "INSERT INTO engine_step (run_key, step, status, detail, event_ts) \
+         VALUES ('kill', 'cancel', 'done', '{\"open_orders\": 3}', clock_timestamp())",
+        &[],
+    ))
+    .unwrap();
+    let mut app = start(Some(&as_ui_role(&db.url)), "Kill switch: off");
+    app.press("Activity").unwrap();
+    app.wait_for("kill  cancel: done").unwrap();
     drop(app);
     drop(client);
     rt.block_on(db.drop_db()).unwrap();

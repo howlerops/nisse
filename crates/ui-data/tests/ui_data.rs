@@ -17,7 +17,7 @@ use nisse_store::{
     tables::{
         decision,
         engine_step::{self, StepStatus},
-        eval_score, heartbeat, order_event, position_event, risk_event, strategy_version,
+        eval_score, order_event, position_event, risk_event, strategy_version,
     },
     testing::ScratchDb,
 };
@@ -139,7 +139,7 @@ fn gate_score(subject_id: i64, metric: &str, value: f64, ts: u64) -> EvalScore {
 async fn status_of_an_empty_store() {
     let db = ScratchDb::create().await;
     let client = db.client().await.unwrap();
-    let got = status(&client, SOURCE, at(T0)).await.unwrap();
+    let got = status(&client, SOURCE).await.unwrap();
     assert_eq!(
         got,
         nisse_ui_data::Status {
@@ -158,7 +158,6 @@ async fn status_of_an_empty_store() {
 async fn status_reflects_what_is_stored() {
     let db = ScratchDb::create().await;
     let client = db.client().await.unwrap();
-    let now = T0 + 100 * SECOND;
     risk_event::insert_many(
         &client,
         &[
@@ -177,7 +176,13 @@ async fn status_reflects_what_is_stored() {
     )
     .await
     .unwrap();
-    heartbeat::insert(&client, SOURCE, at(T0 + 10 * SECOND))
+    // Ninety seconds ago by the database's own clock, which is the clock the age is taken on.
+    client
+        .execute(
+            "INSERT INTO heartbeat (source, event_ts) \
+             VALUES ($1, clock_timestamp() - interval '90 seconds')",
+            &[&SOURCE],
+        )
         .await
         .unwrap();
     engine_step::insert(
@@ -191,22 +196,40 @@ async fn status_reflects_what_is_stored() {
     .await
     .unwrap();
 
-    let got = status(&client, SOURCE, at(now)).await.unwrap();
+    let got = status(&client, SOURCE).await.unwrap();
     assert!(!got.kill_switch);
     assert_eq!(got.drawdown_mode, "halved");
     assert_eq!(got.equity_peak, Some(dec("101250.75")));
-    assert_eq!(got.last_heartbeat, Some(at(T0 + 10 * SECOND)));
-    assert_eq!(got.heartbeat_age_seconds, Some(90));
+    assert!(got.last_heartbeat.is_some());
+    let age = got.heartbeat_age_seconds.unwrap();
+    assert!((90..=95).contains(&age), "{age}");
     assert!(got.rebalance_owed);
     assert_eq!(got.limits_hash.as_deref(), Some("ab12cd34"));
 
-    // A heartbeat in the future is the newest; its age is zero, not negative.
-    heartbeat::insert(&client, SOURCE, at(now + 5 * SECOND))
+    // A heartbeat a second or two ahead of the database is rounding: age zero.
+    client
+        .execute(
+            "INSERT INTO heartbeat (source, event_ts) \
+             VALUES ($1, clock_timestamp() + interval '2 seconds')",
+            &[&SOURCE],
+        )
         .await
         .unwrap();
-    let got = status(&client, SOURCE, at(now)).await.unwrap();
+    let got = status(&client, SOURCE).await.unwrap();
     assert_eq!(got.heartbeat_age_seconds, Some(0));
-    assert_eq!(got.last_heartbeat, Some(at(now + 5 * SECOND)));
+
+    // One well in the future means a clock is wrong: the liveness cannot be judged, and that
+    // is an error, never "just now".
+    client
+        .execute(
+            "INSERT INTO heartbeat (source, event_ts) \
+             VALUES ($1, clock_timestamp() + interval '20 minutes')",
+            &[&SOURCE],
+        )
+        .await
+        .unwrap();
+    let err = status(&client, SOURCE).await.unwrap_err();
+    assert!(matches!(err, UiError::Invalid(_)), "{err:?}");
 }
 
 #[tokio::test]
@@ -233,12 +256,7 @@ async fn a_resized_step_that_is_done_owes_nothing() {
     )
     .await
     .unwrap();
-    assert!(
-        !status(&client, SOURCE, at(T0))
-            .await
-            .unwrap()
-            .rebalance_owed
-    );
+    assert!(!status(&client, SOURCE).await.unwrap().rebalance_owed);
 }
 
 #[tokio::test]
@@ -255,7 +273,7 @@ async fn status_fails_on_an_unreadable_risk_event() {
     )
     .await
     .unwrap();
-    let err = status(&client, SOURCE, at(T0)).await.unwrap_err();
+    let err = status(&client, SOURCE).await.unwrap_err();
     assert!(matches!(err, UiError::Risk(_)), "got {err:?}");
 }
 
@@ -453,7 +471,7 @@ async fn engage_kill_writes_and_confirms() {
     let ui = ui_client(&db).await;
 
     let id = engage_kill(&ui, "  ana ").await.unwrap();
-    let got = status(&ui, SOURCE, at(T0)).await.unwrap();
+    let got = status(&ui, SOURCE).await.unwrap();
     assert!(got.kill_switch);
 
     let detail: Value = owner
@@ -500,7 +518,7 @@ async fn the_ui_role_cannot_write_anything_else() {
     assert_eq!(count, 0);
 
     // The read functions all work under the role.
-    status(&ui, SOURCE, at(T0)).await.unwrap();
+    status(&ui, SOURCE).await.unwrap();
     positions(&ui).await.unwrap();
     open_orders(&ui).await.unwrap();
     versions(&ui).await.unwrap();
@@ -540,7 +558,7 @@ async fn a_release_after_a_ui_kill_is_seen() {
     let ui = ui_client(&db).await;
 
     engage_kill(&ui, "ana").await.unwrap();
-    assert!(status(&ui, SOURCE, at(T0)).await.unwrap().kill_switch);
+    assert!(status(&ui, SOURCE).await.unwrap().kill_switch);
 
     risk_event::insert_many(
         &owner,
@@ -552,7 +570,7 @@ async fn a_release_after_a_ui_kill_is_seen() {
     )
     .await
     .unwrap();
-    assert!(!status(&ui, SOURCE, at(T0)).await.unwrap().kill_switch);
+    assert!(!status(&ui, SOURCE).await.unwrap().kill_switch);
 }
 
 // ---- constants ---------------------------------------------------------------------------

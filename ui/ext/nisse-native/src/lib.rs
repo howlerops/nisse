@@ -7,15 +7,15 @@
 //! passed in by the app on every call (it is kept in the app's storage); it is never logged
 //! and never put in an error message.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use nisse_core::nautilus::UnixNanos;
 use nisse_ui_data as data;
 use nsh_core::prelude::*;
 
 /// How long one call may take, connection included, before it is reported as unreachable.
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
-/// The heartbeat source the engine writes (`"source"` in the engine config).
+/// The heartbeat source the engine writes: `"source"` in `config/engine/paper.json`. If that
+/// is ever changed, change this with it, or the Status screen will say "never".
 const HEARTBEAT_SOURCE: &str = "engine";
 /// How many engine steps the Steps list asks for.
 const STEP_LIMIT: u32 = 50;
@@ -35,7 +35,8 @@ pub struct StatusView {
     pub drawdown_mode: String,
     /// The equity high-water mark as decimal text, or null before the first observation.
     pub equity_peak: Option<String>,
-    /// Seconds since the engine's newest heartbeat, or null when it has never written one.
+    /// Seconds since the engine's newest heartbeat by the database's clock (not this
+    /// device's), or null when it has never written one.
     pub heartbeat_age_seconds: Option<f64>,
     /// A rebalance is owed (a resize or an incomplete rebalance is pending).
     pub rebalance_owed: bool,
@@ -103,7 +104,7 @@ impl Nisse {
     /// caller must then show "cannot confirm", never the last state it had.
     pub async fn status(url: String) -> Result<StatusView, String> {
         run(url, |client| async move {
-            let status = data::status(&client, HEARTBEAT_SOURCE, now()).await?;
+            let status = data::status(&client, HEARTBEAT_SOURCE).await?;
             Ok(StatusView {
                 kill_switch: status.kill_switch,
                 drawdown_mode: status.drawdown_mode,
@@ -209,16 +210,6 @@ impl Nisse {
         })
         .await
     }
-}
-
-/// The current time. The wall clock is read only here, at the edge of the app.
-fn now() -> UnixNanos {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| {
-            u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
-        });
-    UnixNanos::from(nanos)
 }
 
 /// Connects to the store at `url`, runs `work` on the connection, and returns its result, all

@@ -15,6 +15,8 @@ import { Nisse } from "nisse-native";
 const URL_KEY = "nisse.database_url";
 /** How often the open screen re-reads the store, in milliseconds. */
 const REFRESH_MS = 30_000;
+/** A read older than this is no longer shown as the state: two missed refreshes. */
+const STALE_MS = 75_000;
 /** A heartbeat older than this (seconds) is shown as late. The engine ticks every two minutes. */
 const HEARTBEAT_LATE_SECONDS = 300;
 /** The repository whose open pull requests the Proposals screen lists. */
@@ -28,11 +30,12 @@ const MUTED = "#475467";
 const PAPER = "#ffffff";
 const WASH = "#f2f4f7";
 
-type Tab = "status" | "positions" | "gates" | "proposals" | "kill" | "settings";
+type Tab = "status" | "positions" | "gates" | "activity" | "proposals" | "kill" | "settings";
 const TABS: { id: Tab; title: string }[] = [
   { id: "status", title: "Status" },
   { id: "positions", title: "Positions" },
   { id: "gates", title: "Gates" },
+  { id: "activity", title: "Activity" },
   { id: "proposals", title: "Proposals" },
   { id: "kill", title: "Kill" },
   { id: "settings", title: "Settings" },
@@ -116,14 +119,39 @@ function keepFresh(read: () => void) {
 }
 
 function StatusScreen(props: { url: () => string | null }) {
-  const status = resource(props.url, (url) => Nisse.status(url));
+  // When the state on show was read, by this device's clock, and the time now. The state is
+  // shown only while that read is recent: a screen left open, or an app brought back from the
+  // background, must not go on showing an old "off".
+  const readAt = signal<number | null>(null);
+  const clock = signal(Date.now());
+  const tick = setInterval(() => clock.set(Date.now()), 1000);
+  cleanup(() => clearInterval(tick));
+
+  const status = resource(props.url, async (url) => {
+    const read = await Nisse.status(url);
+    readAt.set(Date.now());
+    return read;
+  });
   keepFresh(status.refetch);
-  const fresh = () => status.state() === "ready" || status.state() === "refreshing";
+
+  const age = () => (readAt() === null ? null : clock() - (readAt() ?? 0));
+  const stale = () => (age() ?? 0) > STALE_MS;
+  const shown = () => !status.error() && !stale() && readAt() !== null && status();
+  const heartbeatAge = () => status()?.heartbeatAgeSeconds;
+  const alive = () => {
+    const seconds = heartbeatAge();
+    return seconds !== null && seconds !== undefined && seconds <= HEARTBEAT_LATE_SECONDS;
+  };
   const heartbeat = () => {
-    const age = status()?.heartbeatAgeSeconds;
-    if (age === null || age === undefined) return { text: "Heartbeat: never", color: AMBER };
-    const late = age > HEARTBEAT_LATE_SECONDS;
-    return { text: `Heartbeat: ${Math.round(age)} s ago${late ? " (late)" : ""}`, color: late ? AMBER : INK };
+    const seconds = heartbeatAge();
+    if (seconds === null || seconds === undefined) return "Heartbeat: never";
+    return `Heartbeat: ${Math.round(seconds)} s before this read${alive() ? "" : " (late)"}`;
+  };
+  // "off" is only good news when the engine is known to be alive.
+  const switchLine = () => {
+    if (status()?.killSwitch) return { text: "Kill switch: ENGAGED", color: RED };
+    if (alive()) return { text: "Kill switch: off", color: GREEN };
+    return { text: "Kill switch: off (engine not confirmed alive)", color: AMBER };
   };
   return (
     <View style={{ gap: 16 }}>
@@ -133,18 +161,23 @@ function StatusScreen(props: { url: () => string | null }) {
       <If when={status.error()}>
         <CannotConfirm what="the engine's state" error={status.error()} />
       </If>
-      <If when={fresh() && status()}>
+      <If when={!status.error() && stale()}>
+        <CannotConfirm
+          what="the engine's state"
+          error={`The last read is ${Math.round((age() ?? 0) / 1000)} s old and has not been refreshed.`}
+        />
+      </If>
+      <If when={shown()}>
         <Card title="ENGINE">
-          <Line color={status()?.killSwitch ? RED : GREEN} strong>
-            {status()?.killSwitch ? "Kill switch: ENGAGED" : "Kill switch: off"}
-          </Line>
+          <Line color={switchLine().color} strong>{switchLine().text}</Line>
           <Line>{`Drawdown mode: ${status()?.drawdownMode ?? ""}`}</Line>
           <Line>{`Equity peak: ${status()?.equityPeak ?? "none yet"}`}</Line>
-          <Line color={heartbeat().color}>{heartbeat().text}</Line>
+          <Line color={alive() ? INK : AMBER}>{heartbeat()}</Line>
           <Line color={status()?.rebalanceOwed ? AMBER : INK}>
             {status()?.rebalanceOwed ? "Rebalance owed: yes" : "Rebalance owed: no"}
           </Line>
           <Line color={MUTED}>{`Limits: ${status()?.limitsHash ?? "none recorded"}`}</Line>
+          <Line color={MUTED}>{`Read ${Math.max(0, Math.round((age() ?? 0) / 1000))} s ago`}</Line>
         </Card>
       </If>
       <Button title="Refresh" onPress={() => status.refetch()} />
@@ -228,6 +261,35 @@ function GatesScreen(props: { url: () => string | null }) {
   );
 }
 
+function ActivityScreen(props: { url: () => string | null }) {
+  const steps = resource(props.url, (url) => Nisse.steps(url));
+  keepFresh(steps.refetch);
+  const tone = (status: string) => (status === "failed" ? RED : status === "started" ? AMBER : INK);
+  return (
+    <View style={{ gap: 16 }}>
+      <If when={!props.url()}>
+        <NotConnected />
+      </If>
+      <If when={steps.error()}>
+        <CannotConfirm what="what the engine last did" error={steps.error()} />
+      </If>
+      <If when={!steps.error() && steps()}>
+        <Card title="ENGINE STEPS, NEWEST FIRST">
+          <If when={(steps() ?? []).length === 0}>
+            <Line color={MUTED}>None yet.</Line>
+          </If>
+          <Each of={steps() ?? []}>
+            {(step) => (
+              <Line color={tone(step().status)}>{`${step().runKey}  ${step().step}: ${step().status}`}</Line>
+            )}
+          </Each>
+        </Card>
+      </If>
+      <Line color={MUTED}>A cancel made because of the kill switch shows as "kill  cancel: done".</Line>
+    </View>
+  );
+}
+
 function ProposalsScreen() {
   const pulls = resource(async ({ signal }) => {
     const response = await fetch(PULLS_URL, { signal, headers: { Accept: "application/vnd.github+json" } });
@@ -279,8 +341,9 @@ function KillScreen(props: { url: () => string | null }) {
       result.set({
         ok: true,
         text:
-          `Read back from the store (row ${row}). No new orders will be sent. ` +
-          "Open orders are cancelled by the engine's next run, within two minutes in market hours.",
+          `Read back from the store (row ${row}). The engine stops sending orders from its next check, ` +
+          "and its watcher cancels open orders within about a minute, at any hour. " +
+          "Look at Activity for \"kill  cancel: done\", and at Positions for open orders.",
       });
     } catch (error) {
       result.set({ ok: false, text: `NOT CONFIRMED: ${String(error)}` });
@@ -436,6 +499,9 @@ function App() {
         </If>
         <If when={tab() === "gates"}>
           <GatesScreen url={connection} />
+        </If>
+        <If when={tab() === "activity"}>
+          <ActivityScreen url={connection} />
         </If>
         <If when={tab() === "proposals"}>
           <ProposalsScreen />

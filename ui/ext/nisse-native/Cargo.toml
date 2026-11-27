@@ -17,7 +17,6 @@ license = "MIT"
 [dependencies]
 nsh-core = "0.7.2"
 nsh-base = "0.7.2"
-nisse-core = { path = "../../../crates/core" }
 nisse-ui-data = { path = "../../../crates/ui-data" }
 nisse-store = { path = "../../../crates/store" }
 tokio = { version = "1", features = ["rt", "time"] }
@@ -29,5 +28,6 @@ tokio-postgres = "0.7"
 nsh-engine = "0.7.2"
 nsh-testing = { version = "0.7.2", features = ["bundle"] }
 nisse-store = { path = "../../../crates/store", features = ["test-support"] }
+nisse-core = { path = "../../../crates/core" }
 nisse-ui-data = { path = "../../../crates/ui-data" }
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }

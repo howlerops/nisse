@@ -30,8 +30,6 @@ pub const RESIZE_STEP: &str = "pending";
 const MAX_BY_CHARS: usize = 64;
 /// The most rows `recent_steps` returns, whatever the caller asks for.
 const MAX_STEPS: u32 = 200;
-const NANOS_PER_SECOND: u64 = 1_000_000_000;
-
 /// Anything the data layer can fail with.
 #[derive(Debug, thiserror::Error)]
 pub enum UiError {
@@ -56,8 +54,7 @@ pub struct Status {
     pub drawdown_mode: String,
     pub equity_peak: Option<Decimal>,
     pub last_heartbeat: Option<UnixNanos>,
-    /// Seconds between the newest heartbeat and `now`; `None` with no heartbeat. Zero when the
-    /// heartbeat is in the future.
+    /// Seconds since the newest heartbeat, by the database's clock; `None` with no heartbeat.
     pub heartbeat_age_seconds: Option<u64>,
     pub rebalance_owed: bool,
     pub limits_hash: Option<String>,
@@ -65,17 +62,10 @@ pub struct Status {
 
 /// The risk state, the newest heartbeat of `source`, whether a rebalance is owed, and the
 /// newest limits hash, as the Status screen shows them.
-pub async fn status<C: GenericClient>(
-    client: &C,
-    source: &str,
-    now: UnixNanos,
-) -> Result<Status, UiError> {
+pub async fn status<C: GenericClient>(client: &C, source: &str) -> Result<Status, UiError> {
     let risk = RiskState::restore(&risk_event::load_all(client).await?)?;
     let last_heartbeat = heartbeat::latest(client, source).await?;
-    let heartbeat_age_seconds = last_heartbeat.map(|hb| {
-        // `saturating_sub` gives zero for a heartbeat in the future.
-        now.as_u64().saturating_sub(hb.as_u64()) / NANOS_PER_SECOND
-    });
+    let heartbeat_age_seconds = heartbeat_age(client, source).await?;
     let rebalance_owed = matches!(
         engine_step::latest(client, RESIZE_RUN_KEY, RESIZE_STEP).await?,
         Some((StepStatus::Started, _))
@@ -89,6 +79,37 @@ pub async fn status<C: GenericClient>(
         rebalance_owed,
         limits_hash: risk_event::latest_limits_hash(client).await?,
     })
+}
+
+/// A heartbeat this far in the database's future is put down to rounding; further is an error.
+const FUTURE_TOLERANCE_SECONDS: f64 = 5.0;
+
+/// How old the newest heartbeat of `source` is, in whole seconds, by the DATABASE's clock:
+/// the engine's host stamps heartbeats and the database is beside it, while the caller's own
+/// clock (a phone's) may be wrong, and a slow phone clock would make a dead engine look
+/// alive. `None` with no heartbeat. A heartbeat more than a few seconds in the database's
+/// future is an error, not "just now": some clock is wrong and the age cannot be trusted.
+async fn heartbeat_age<C: GenericClient>(client: &C, source: &str) -> Result<Option<u64>, UiError> {
+    let row = client
+        .query_opt(
+            "SELECT extract(epoch FROM (clock_timestamp() - event_ts))::float8 AS age \
+             FROM heartbeat WHERE source = $1 ORDER BY event_ts DESC LIMIT 1",
+            &[&source],
+        )
+        .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let age: f64 = row.try_get("age")?;
+    if !age.is_finite() || age < -FUTURE_TOLERANCE_SECONDS {
+        return Err(UiError::Invalid(format!(
+            "the newest heartbeat is {:.0} s in the future by the database's clock; \
+             the engine's liveness cannot be judged",
+            -age
+        )));
+    }
+    // Finite and at least -5: flooring a non-negative f64 of this size into u64 is exact.
+    Ok(Some(age.max(0.0).floor() as u64))
 }
 
 /// Newest row per symbol, flat ones left out, sorted by symbol.
