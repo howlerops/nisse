@@ -506,6 +506,9 @@ pub fn describe_tick(outcome: &TickOutcome) -> String {
         },
     ];
     parts.extend(mode_change_text(outcome.mode_change));
+    if outcome.kill_cancelled {
+        parts.push("open orders cancelled (kill switch)".to_owned());
+    }
     format!("tick: {}", parts.join("; "))
 }
 
@@ -672,6 +675,7 @@ mod tests {
             mode_change: None,
             market_open: true,
             rebalance: None,
+            kill_cancelled: false,
         };
         assert_eq!(
             describe_tick(&open),
@@ -683,6 +687,7 @@ mod tests {
             mode_change: None,
             market_open: false,
             rebalance: None,
+            kill_cancelled: false,
         };
         assert_eq!(
             describe_tick(&one_closed),
@@ -699,6 +704,7 @@ mod tests {
                 orders_failed: 1,
                 orders_blocked: 0,
             }),
+            kill_cancelled: false,
         };
         assert_eq!(
             describe_tick(&rebalanced),
