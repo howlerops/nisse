@@ -37,8 +37,9 @@ const GATE_RULES: i64 = nisse_risk::rule::ALL.len() as i64;
 /// The fewest holdout sessions a holdout run may be judged on.
 pub const MIN_HOLDOUT_SESSIONS: u64 = 60;
 
-/// The fewest active sessions (after the flat warm-up) the holdout baseline may have. A short
-/// baseline has a noisy Sharpe ratio, so a threshold drawn from it would be arbitrary.
+/// The fewest sessions with a non-zero return the holdout baseline may have. A short baseline has
+/// a noisy Sharpe ratio, so a threshold drawn from it would be arbitrary. The flat warm-up is not
+/// counted.
 pub const MIN_BASELINE_SESSIONS: usize = 252;
 
 /// The verdict on one gate.
@@ -111,6 +112,14 @@ pub struct TrialSeries {
     pub costs: Value,
     /// The symbols of the run, as stored (`Null` when absent).
     pub symbols: Value,
+    /// The hash of the risk limits file the run used. `None` when not recorded.
+    pub limits_hash: Option<String>,
+    /// The starting cash of the run, as a decimal string. `None` when not recorded.
+    pub starting_cash: Option<String>,
+    /// The seed of the run. `None` when not recorded.
+    pub seed: Option<u64>,
+    /// The bar file the run read. `None` when not recorded (or no file was named).
+    pub bars_file: Option<String>,
 }
 
 impl TrialSeries {
@@ -152,6 +161,10 @@ impl TrialSeries {
                 .map(str::to_owned),
             costs: result.get("costs").cloned().unwrap_or(Value::Null),
             symbols: result.get("symbols").cloned().unwrap_or(Value::Null),
+            limits_hash: stored_text(result, "limits_hash"),
+            starting_cash: stored_text(result, "starting_cash"),
+            seed: result.get("seed").and_then(Value::as_u64),
+            bars_file: stored_text(result, "bars_file"),
         }
     }
 
@@ -184,6 +197,11 @@ impl TrialSeries {
             _ => Err(DATA_END),
         }
     }
+}
+
+/// A stored string field, or `None` when absent or not a string.
+fn stored_text(result: &Value, key: &str) -> Option<String> {
+    result.get(key).and_then(Value::as_str).map(str::to_owned)
 }
 
 /// The returns array when the result says it is complete and every element is a number.
@@ -379,9 +397,27 @@ fn candidate(inputs: &ReportInputs) -> Option<&TrialSeries> {
 /// Whether two runs were made with the same inputs: both have a cost model and a symbol list,
 /// the cost objects have the same keys and numerically equal decimal values (`"2"` and `"2.0"`
 /// are equal; a value that is not a decimal string is not), and the symbol arrays hold the same
-/// set of strings (order and duplicates ignored; a non-string element is not).
+/// set of strings (order and duplicates ignored; a non-string element is not). The result also
+/// depends on the risk limits, the starting cash and the seed, so those must be recorded and
+/// equal on both sides; a missing value is never equal.
 fn same_inputs(a: &TrialSeries, b: &TrialSeries) -> bool {
-    same_costs(&a.costs, &b.costs) && same_symbols(&a.symbols, &b.symbols)
+    same_costs(&a.costs, &b.costs)
+        && same_symbols(&a.symbols, &b.symbols)
+        && same_present(&a.limits_hash, &b.limits_hash)
+        && same_starting_cash(a.starting_cash.as_deref(), b.starting_cash.as_deref())
+        && same_present(&a.seed, &b.seed)
+}
+
+/// Both present and equal.
+fn same_present<T: PartialEq>(a: &Option<T>, b: &Option<T>) -> bool {
+    matches!((a, b), (Some(x), Some(y)) if x == y)
+}
+
+/// Both decimal strings and numerically equal (`"100000"` and `"100000.0"`); a value that is not
+/// a decimal is not equal to anything.
+fn same_starting_cash(a: Option<&str>, b: Option<&str>) -> bool {
+    let parse = |text: Option<&str>| text.and_then(|s| Decimal::from_str(s).ok());
+    matches!((parse(a), parse(b)), (Some(x), Some(y)) if x == y)
 }
 
 fn same_costs(a: &Value, b: &Value) -> bool {
@@ -419,8 +455,8 @@ fn judged_holdout_run(inputs: &ReportInputs) -> Option<&TrialSeries> {
 }
 
 /// The holdout baseline of `run`: the newest usable ordinary run of the version registered before
-/// `run`, with the same costs and symbols as `run`. It depends only on what existed when the look
-/// was made, so nothing registered later can change it.
+/// `run`, with the same inputs as `run` and the same bar file. It depends only on what existed
+/// when the look was made, so nothing registered later can change it.
 fn holdout_baseline<'a>(inputs: &'a ReportInputs, run: &TrialSeries) -> Option<&'a TrialSeries> {
     inputs
         .trials
@@ -431,14 +467,16 @@ fn holdout_baseline<'a>(inputs: &'a ReportInputs, run: &TrialSeries) -> Option<&
                 && t.trial_id < run.trial_id
                 && t.usable(&inputs.gates).is_ok()
                 && same_inputs(t, run)
+                && same_present(&t.bars_file, &run.bars_file)
         })
         .max_by_key(|t| t.trial_id)
 }
 
-/// Whether two runs cover the same experiment: the same data snapshot and requested range,
-/// with the same inputs (costs and symbols).
+/// Whether two runs cover the same experiment: the same non-empty data snapshot and requested
+/// range, with the same inputs (see [`same_inputs`]).
 fn same_experiment(a: &TrialSeries, b: &TrialSeries) -> bool {
-    a.data_snapshot_id == b.data_snapshot_id
+    !a.data_snapshot_id.is_empty()
+        && a.data_snapshot_id == b.data_snapshot_id
         && a.requested_start == b.requested_start
         && a.requested_end == b.requested_end
         && same_inputs(a, b)
@@ -792,18 +830,28 @@ fn holdout_gate(inputs: &ReportInputs) -> GateResult {
             "the holdout look tested another experiment than the candidate (the last ordinary run before the look)",
         );
     }
-    // (j): a short baseline has a noisy Sharpe ratio, so it cannot set a threshold.
-    let active_sessions = baseline
+    // (j1): a baseline that ended flat after a drawdown has nothing to set a threshold.
+    if baseline.final_drawdown_mode.as_deref() == Some("flat") {
+        return undecided(
+            NAME,
+            None,
+            None,
+            "the holdout baseline ended flat after a drawdown",
+        );
+    }
+    // (j2): a short baseline has a noisy Sharpe ratio, so it cannot set a threshold. Only
+    // sessions with a non-zero return count: a run that idles through zeros is not a long run.
+    let non_zero_sessions = baseline
         .returns
         .as_deref()
-        .map_or(0, |returns| active_returns(returns).len());
-    if active_sessions < MIN_BASELINE_SESSIONS {
+        .map_or(0, |returns| returns.iter().filter(|r| **r != 0.0).count());
+    if non_zero_sessions < MIN_BASELINE_SESSIONS {
         return undecided(
             NAME,
             None,
             None,
             &format!(
-                "the holdout baseline has fewer than {MIN_BASELINE_SESSIONS} sessions after its warm-up"
+                "the holdout baseline has fewer than {MIN_BASELINE_SESSIONS} sessions with a non-zero return"
             ),
         );
     }
@@ -999,6 +1047,10 @@ fn candidate_run(inputs: &ReportInputs, candidate: Option<&TrialSeries>) -> Valu
             "dirty_build": t.dirty_build,
             "costs": t.costs,
             "symbols": t.symbols,
+            "limits_hash": t.limits_hash,
+            "starting_cash": t.starting_cash,
+            "seed": t.seed,
+            "bars_file": t.bars_file,
             "requested_start": t.requested_start,
             "requested_end": t.requested_end,
             "data_end": t.data_end,
@@ -1027,6 +1079,8 @@ fn holdout_run(inputs: &ReportInputs, baseline: Option<&TrialSeries>) -> Value {
             "sharpe": finite(sharpe),
             "costs": run.costs,
             "symbols": run.symbols,
+            "limits_hash": run.limits_hash,
+            "bars_file": run.bars_file,
             "baseline_trial_id": baseline.map(|t| t.trial_id),
             "holdout_runs_for_version": holdout_runs_for_version(inputs),
         })

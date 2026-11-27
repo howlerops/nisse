@@ -74,9 +74,9 @@ fn costs_b() -> Value {
 }
 
 /// A usable backtest trial over the snapshot "snap" and the range 0..1000: a clean build, the
-/// file's holdout boundary, costs A and symbols SPY, an ordinary run ending the day before the
-/// boundary (or a holdout run with its end recorded). A holdout run's sessions are all of its
-/// returns.
+/// file's holdout boundary, costs A and symbols SPY, the limits "aaa", starting cash 100000, seed
+/// 7 and bar file "bars.parquet", an ordinary run ending the day before the boundary (or a holdout
+/// run with its end recorded). A holdout run's sessions are all of its returns.
 fn series(trial_id: i64, version: i64, holdout: bool, returns: Vec<f64>) -> TrialSeries {
     let sessions = returns.len() as u64;
     TrialSeries {
@@ -99,6 +99,10 @@ fn series(trial_id: i64, version: i64, holdout: bool, returns: Vec<f64>) -> Tria
         final_drawdown_mode: Some("normal".to_owned()),
         costs: costs_a(),
         symbols: json!(["SPY"]),
+        limits_hash: Some("aaa".to_owned()),
+        starting_cash: Some("100000".to_owned()),
+        seed: Some(7),
+        bars_file: Some("bars.parquet".to_owned()),
     }
 }
 
@@ -536,7 +540,7 @@ fn a_healthy_case_is_evaluated_on_the_deduplicated_sharpes() {
 
 #[test]
 fn pbo_with_a_dominated_alternative_passes_at_zero() {
-    let cand = drift(500, 0.01, 0.010);
+    let cand = drift(500, 0.011, 0.010);
     let alts = alternatives(9);
     let report = build_report(&inputs(1, configurations(&cand, &alts), 10));
     let gate = find(&report, "pbo");
@@ -548,7 +552,7 @@ fn pbo_with_a_dominated_alternative_passes_at_zero() {
 
 #[test]
 fn pbo_needs_at_least_ten_configurations() {
-    let cand = drift(500, 0.01, 0.010);
+    let cand = drift(500, 0.011, 0.010);
     let alts = alternatives(9);
 
     let nine = build_report(&inputs(1, configurations(&cand, &alts[..8]), 9));
@@ -577,7 +581,7 @@ fn pbo_of_identical_series_is_one_and_fails() {
 
 #[test]
 fn pbo_leaves_out_trials_over_other_data_or_another_length() {
-    let cand = drift(500, 0.01, 0.010);
+    let cand = drift(500, 0.011, 0.010);
     let alts = alternatives(9);
     let alt = alts[0].clone();
     let other_snapshot = TrialSeries {
@@ -626,7 +630,7 @@ fn pbo_leaves_out_trials_over_other_data_or_another_length() {
 
 #[test]
 fn pbo_counts_only_the_newest_trial_of_each_other_version() {
-    let cand = drift(500, 0.01, 0.010);
+    let cand = drift(500, 0.011, 0.010);
     let alts = alternatives(9);
     // Version 2 has a dominated alternative (trial 1) and, newer, a copy of the candidate
     // (trial 20). Only the newer one is in the matrix.
@@ -729,7 +733,7 @@ fn holdout_gate_follows_the_looks_and_the_version_s_own_holdout_run() {
 
 #[test]
 fn holdout_branches_are_judged_in_order() {
-    let cand = drift(500, 0.01, 0.010);
+    let cand = drift(500, 0.011, 0.010);
     let base = vec![series(1, 1, false, cand.clone())];
     let haircut = (1.0 - gates().sharpe_haircut) * annualised_sharpe(&cand);
     let good = || holdout_trial(2, 1, cand.clone(), Some(60));
@@ -824,11 +828,11 @@ fn holdout_branches_are_judged_in_order() {
 
 #[test]
 fn the_holdout_is_judged_on_its_last_sessions_only() {
-    let cand = drift(500, 0.01, 0.010);
+    let cand = drift(500, 0.011, 0.010);
     // The whole run is weak (about 0.1 a session against a candidate of 1.0); its last 60
     // sessions are as strong as the candidate.
     let mut returns = drift(440, 0.0, 0.010);
-    returns.extend(drift(60, 0.01, 0.010));
+    returns.extend(drift(60, 0.011, 0.010));
     let trials = vec![
         series(1, 1, false, cand),
         holdout_trial(2, 1, returns.clone(), Some(60)),
@@ -840,7 +844,7 @@ fn the_holdout_is_judged_on_its_last_sessions_only() {
 
 #[test]
 fn the_first_matching_look_is_judged_and_a_later_one_cannot_rescue_it() {
-    let cand = drift(500, 0.01, 0.010);
+    let cand = drift(500, 0.011, 0.010);
     let weak = drift(500, 0.0, 0.010);
     let base = series(1, 1, false, cand.clone());
     let first_a = holdout_trial(2, 1, weak.clone(), Some(60));
@@ -863,7 +867,7 @@ fn the_first_matching_look_is_judged_and_a_later_one_cannot_rescue_it() {
 
 #[test]
 fn a_first_look_under_other_symbols_is_judged_and_a_later_matching_one_cannot_rescue_it() {
-    let cand = drift(500, 0.01, 0.010);
+    let cand = drift(500, 0.011, 0.010);
     let base = series(1, 1, false, cand.clone());
     let other_symbols = TrialSeries {
         symbols: json!(["QQQ"]),
@@ -890,7 +894,7 @@ fn a_first_look_under_other_symbols_is_judged_and_a_later_matching_one_cannot_re
 
 #[test]
 fn a_candidate_registered_after_the_holdout_look_is_not_disturbed_by_it() {
-    let cand = drift(500, 0.01, 0.010);
+    let cand = drift(500, 0.011, 0.010);
     // The look (trial 1) comes before the candidate (trial 2), which has the same inputs. The
     // holdout's baseline must be registered before the look, so there is none here.
     let trials = vec![
@@ -904,7 +908,7 @@ fn a_candidate_registered_after_the_holdout_look_is_not_disturbed_by_it() {
 
 #[test]
 fn a_flat_holdout_run_with_zero_returns_fails() {
-    let cand = drift(500, 0.01, 0.010);
+    let cand = drift(500, 0.011, 0.010);
     let base = series(1, 1, false, cand);
     for sessions in [Some(60), None] {
         let flat = TrialSeries {
@@ -919,7 +923,7 @@ fn a_flat_holdout_run_with_zero_returns_fails() {
 
 #[test]
 fn the_holdout_needs_sixty_sessions_exactly() {
-    let cand = drift(500, 0.01, 0.010);
+    let cand = drift(500, 0.011, 0.010);
     let base = series(1, 1, false, cand.clone());
     let run = |sessions| {
         holdout_gate_of(
@@ -937,7 +941,7 @@ fn the_holdout_needs_sixty_sessions_exactly() {
 #[test]
 fn the_threshold_ignores_the_flat_warm_up() {
     let ppy = gates().periods_per_year;
-    let strong = drift(300, 0.01, 0.010);
+    let strong = drift(300, 0.011, 0.010);
     // Two hundred and fifty flat sessions before the first trade, then the strong returns.
     let mut warm = vec![0.0; 250];
     warm.extend_from_slice(&strong);
@@ -975,9 +979,9 @@ fn the_threshold_ignores_the_flat_warm_up() {
 
 #[test]
 fn a_baseline_with_no_active_return_is_not_evaluated() {
-    // All flat: no active session at all, so it is too short before its Sharpe is even asked.
+    // All flat: no non-zero return at all, so it is too short before its Sharpe is even asked.
     let base = series(1, 1, false, vec![0.0; 500]);
-    let holdout = holdout_trial(2, 1, drift(500, 0.01, 0.010), Some(60));
+    let holdout = holdout_trial(2, 1, drift(500, 0.011, 0.010), Some(60));
     let gate = holdout_gate_of(vec![base, holdout], 0);
     assert_eq!(gate.status, GateStatus::NotEvaluated);
     assert_eq!(gate.note, SHORT_BASELINE);
@@ -986,15 +990,15 @@ fn a_baseline_with_no_active_return_is_not_evaluated() {
 #[test]
 fn info_reports_the_active_sharpe_and_the_judged_holdout_run() {
     let ppy = gates().periods_per_year;
-    let strong = drift(300, 0.01, 0.010);
+    let strong = drift(300, 0.011, 0.010);
     let mut warm = vec![0.0; 250];
     warm.extend_from_slice(&strong);
     let trials = vec![
         series(1, 1, false, warm.clone()),
-        holdout_trial(2, 1, drift(60, 0.01, 0.010), Some(60)),
+        holdout_trial(2, 1, drift(60, 0.011, 0.010), Some(60)),
         TrialSeries {
             costs: costs_b(),
-            ..holdout_trial(3, 1, drift(60, 0.01, 0.010), Some(60))
+            ..holdout_trial(3, 1, drift(60, 0.011, 0.010), Some(60))
         },
     ];
     let report = build_report(&inputs(1, trials, 3));
@@ -1039,7 +1043,9 @@ const DIFFERENT_INPUTS: &str =
 const NO_BASELINE: &str =
     "no usable ordinary run before the first holdout look has its costs and symbols";
 const OTHER_EXPERIMENT: &str = "the holdout look tested another experiment than the candidate (the last ordinary run before the look)";
-const SHORT_BASELINE: &str = "the holdout baseline has fewer than 252 sessions after its warm-up";
+const SHORT_BASELINE: &str =
+    "the holdout baseline has fewer than 252 sessions with a non-zero return";
+const FLAT_BASELINE: &str = "the holdout baseline ended flat after a drawdown";
 const UNDEFINED_BASELINE: &str = "the holdout baseline's active Sharpe ratio is undefined";
 const NOT_POSITIVE: &str =
     "the holdout baseline's Sharpe is not positive, so there is nothing for the holdout to hold up";
@@ -1048,7 +1054,7 @@ const NOT_POSITIVE: &str =
 /// "2" and symbols SPY and QQQ; then trial 3 ordinary and trial 4 holdout (a strong look) under
 /// `costs_3_4` and `symbols_3_4`.
 fn bypass_trials(costs_3_4: Value, symbols_3_4: Value) -> Vec<TrialSeries> {
-    let cand = drift(500, 0.01, 0.010);
+    let cand = drift(500, 0.011, 0.010);
     let weak = drift(500, 0.0, 0.010);
     let first = |trial: TrialSeries| TrialSeries {
         costs: json!({"slippage_bps": "2"}),
@@ -1102,7 +1108,7 @@ fn a_rerun_with_genuinely_other_costs_is_not_evaluated_and_never_passes() {
 
 #[test]
 fn an_identical_ordinary_rerun_after_a_passed_holdout_does_not_disturb_it() {
-    let cand = drift(500, 0.01, 0.010);
+    let cand = drift(500, 0.011, 0.010);
     let trials = vec![
         series(5, 1, false, cand.clone()),
         holdout_trial(6, 1, cand.clone(), Some(60)),
@@ -1120,7 +1126,7 @@ fn an_identical_ordinary_rerun_after_a_passed_holdout_does_not_disturb_it() {
 
 #[test]
 fn the_baseline_is_the_newest_matching_ordinary_run_before_the_look() {
-    let strong = drift(500, 0.01, 0.010);
+    let strong = drift(500, 0.011, 0.010);
     // Trial 1 (weak, negative) would set a zero threshold; trial 2 (strong) must set it.
     let trials = vec![
         series(1, 1, false, drift(500, -0.001, 0.010)),
@@ -1138,7 +1144,7 @@ fn the_baseline_is_the_newest_matching_ordinary_run_before_the_look() {
 
 #[test]
 fn no_usable_ordinary_run_before_the_first_look_leaves_the_holdout_not_evaluated() {
-    let cand = drift(500, 0.01, 0.010);
+    let cand = drift(500, 0.011, 0.010);
     // The only earlier ordinary run is a dirty build.
     let dirty = TrialSeries {
         dirty_build: Some(true),
@@ -1167,7 +1173,7 @@ fn no_usable_ordinary_run_before_the_first_look_leaves_the_holdout_not_evaluated
 fn a_barely_positive_holdout_cannot_pass_against_a_losing_shorter_run() {
     // Trial 1: ordinary, full range, strong. Trial 2: ordinary, shorter range, losing. Trial 3:
     // the first holdout look, barely positive. Trial 4: an ordinary re-run of trial 1.
-    let cand = drift(500, 0.01, 0.010);
+    let cand = drift(500, 0.011, 0.010);
     let shorter = TrialSeries {
         requested_start: 100,
         requested_end: 600,
@@ -1196,7 +1202,7 @@ fn a_barely_positive_holdout_cannot_pass_against_a_losing_shorter_run() {
 
 #[test]
 fn strong_then_weak_over_one_range_judges_the_weak_run_everywhere() {
-    let strong = drift(500, 0.01, 0.010);
+    let strong = drift(500, 0.011, 0.010);
     let weak = drift(500, 0.002, 0.010);
     let trials = vec![
         series(1, 1, false, strong),
@@ -1223,8 +1229,8 @@ fn strong_then_weak_over_one_range_judges_the_weak_run_everywhere() {
 
 #[test]
 fn a_baseline_over_another_snapshot_or_range_is_not_the_candidates() {
-    let cand = drift(500, 0.01, 0.010);
-    let holdout = || holdout_trial(2, 1, drift(60, 0.01, 0.010), Some(60));
+    let cand = drift(500, 0.011, 0.010);
+    let holdout = || holdout_trial(2, 1, drift(60, 0.011, 0.010), Some(60));
     // Strong, but over another snapshot; the candidate is registered after the look.
     let other_snapshot = TrialSeries {
         data_snapshot_id: "other".to_owned(),
@@ -1266,7 +1272,7 @@ fn a_baseline_over_another_snapshot_or_range_is_not_the_candidates() {
 
 #[test]
 fn a_candidate_after_the_look_is_judged_on_an_earlier_identical_copy_only() {
-    let cand = drift(500, 0.01, 0.010);
+    let cand = drift(500, 0.011, 0.010);
     let holdout = holdout_trial(2, 1, cand.clone(), Some(60));
 
     // An identical earlier copy, registered before the look, is the baseline.
@@ -1294,8 +1300,8 @@ fn a_candidate_after_the_look_is_judged_on_an_earlier_identical_copy_only() {
 
 #[test]
 fn a_baseline_that_is_not_positive_is_never_a_pass() {
-    let holdout = holdout_trial(2, 1, drift(60, 0.01, 0.010), Some(60));
-    for returns in [drift(500, -0.01, 0.010), drift(500, 0.0, 0.010)] {
+    let holdout = holdout_trial(2, 1, drift(60, 0.011, 0.010), Some(60));
+    for returns in [drift(500, -0.011, 0.010), drift(500, 0.0, 0.010)] {
         let trials = vec![series(1, 1, false, returns), holdout.clone()];
         let gate = holdout_gate_of(trials, 0);
         assert_eq!(gate.status, GateStatus::NotEvaluated, "{}", gate.note);
@@ -1313,7 +1319,7 @@ fn gate_with_inputs(
     run_costs: Value,
     run_symbols: Value,
 ) -> GateResult {
-    let cand = drift(500, 0.01, 0.010);
+    let cand = drift(500, 0.011, 0.010);
     let base = TrialSeries {
         costs: cand_costs,
         symbols: cand_symbols,
@@ -1404,7 +1410,7 @@ fn same_inputs_compares_costs_as_decimals_and_symbols_as_a_set() {
 
 #[test]
 fn the_holdout_checks_run_in_the_documented_order() {
-    let cand = drift(500, 0.01, 0.010);
+    let cand = drift(500, 0.011, 0.010);
     let ord = |id: i64, returns: Vec<f64>| series(id, 1, false, returns);
     let hold =
         |id: i64, returns: Vec<f64>, sessions: Option<u64>| holdout_trial(id, 1, returns, sessions);
@@ -1476,14 +1482,21 @@ fn the_holdout_checks_run_in_the_documented_order() {
     // experiment is checked first.
     let other_range = TrialSeries {
         requested_end: 900,
-        ..ord(1, drift(251, 0.01, 0.010))
+        ..ord(1, drift(251, 0.011, 0.010))
     };
     let trials = vec![other_range, hold(2, cand.clone(), ok), ord(3, cand.clone())];
     let gate = holdout_gate_of(trials, 0);
     assert_eq!(gate.note, OTHER_EXPERIMENT);
 
-    // (j): 251 active sessions, the candidate being the baseline itself.
-    let trials = vec![ord(1, drift(251, 0.01, 0.010)), hold(2, cand.clone(), ok)];
+    // (j1) before (j2): a flat baseline, which also has too few non-zero sessions.
+    let mut flat_short = ord(1, drift(251, 0.011, 0.010));
+    flat_short.final_drawdown_mode = Some("flat".to_owned());
+    let gate = holdout_gate_of(vec![flat_short, hold(2, cand.clone(), ok)], 0);
+    assert_eq!(gate.status, GateStatus::NotEvaluated);
+    assert_eq!(gate.note, FLAT_BASELINE);
+
+    // (j2): 251 non-zero sessions, the candidate being the baseline itself.
+    let trials = vec![ord(1, drift(251, 0.011, 0.010)), hold(2, cand.clone(), ok)];
     let gate = holdout_gate_of(trials, 0);
     assert_eq!(gate.status, GateStatus::NotEvaluated);
     assert_eq!(gate.note, SHORT_BASELINE);
@@ -1494,7 +1507,7 @@ fn the_holdout_checks_run_in_the_documented_order() {
     assert_eq!(gate.note, UNDEFINED_BASELINE);
 
     // (l): the baseline's Sharpe is negative, so the threshold would be zero.
-    let trials = vec![ord(1, drift(500, -0.01, 0.010)), hold(2, cand.clone(), ok)];
+    let trials = vec![ord(1, drift(500, -0.011, 0.010)), hold(2, cand.clone(), ok)];
     let gate = holdout_gate_of(trials, 0);
     assert_eq!(gate.status, GateStatus::NotEvaluated);
     assert_eq!(gate.note, NOT_POSITIVE);
@@ -1518,7 +1531,7 @@ fn the_holdout_checks_run_in_the_documented_order() {
 /// The baseline is trial 2 whatever comes later.
 #[test]
 fn the_look_is_judged_against_its_own_baseline_whatever_is_registered_later() {
-    let strong = drift(500, 0.01, 0.010);
+    let strong = drift(500, 0.011, 0.010);
     let weak = drift(300, 0.002, 0.010);
     let range_b = |trial: TrialSeries| TrialSeries {
         requested_start: 100,
@@ -1579,10 +1592,10 @@ fn the_look_is_judged_against_its_own_baseline_whatever_is_registered_later() {
 /// does not change the judged look or its baseline.
 #[test]
 fn a_look_made_right_after_its_run_passes_and_an_identical_rerun_does_not_disturb_it() {
-    let cand = drift(500, 0.01, 0.010);
+    let cand = drift(500, 0.011, 0.010);
     let base = series(1, 1, false, cand.clone());
     // Tail Sharpe 1.0 against a threshold of 0.5.
-    let look = holdout_trial(2, 1, drift(60, 0.01, 0.010), Some(60));
+    let look = holdout_trial(2, 1, drift(60, 0.011, 0.010), Some(60));
 
     let mut i = inputs(1, vec![base.clone(), look.clone()], 2);
     i.holdout_looks = 1;
@@ -1603,33 +1616,33 @@ fn a_look_made_right_after_its_run_passes_and_an_identical_rerun_does_not_distur
 /// The baseline needs `MIN_BASELINE_SESSIONS` active sessions; the flat warm-up does not count.
 #[test]
 fn a_baseline_needs_252_active_sessions_and_the_warm_up_does_not_count() {
-    let look = || holdout_trial(2, 1, drift(60, 0.01, 0.010), Some(60));
+    let look = || holdout_trial(2, 1, drift(60, 0.011, 0.010), Some(60));
     let judged_with = |returns: Vec<f64>| {
         let trials = vec![series(1, 1, false, returns), look()];
         holdout_gate_of(trials, 0)
     };
 
-    let gate = judged_with(drift(251, 0.01, 0.010));
+    let gate = judged_with(drift(251, 0.011, 0.010));
     assert_eq!(gate.status, GateStatus::NotEvaluated);
     assert_eq!(gate.note, SHORT_BASELINE);
 
-    // 501 returns, but only 251 after the flat warm-up.
+    // 501 returns, but only 251 with a non-zero return: the flat warm-up does not count.
     let mut warm = vec![0.0; 250];
-    warm.extend(drift(251, 0.01, 0.010));
+    warm.extend(drift(251, 0.011, 0.010));
     let gate = judged_with(warm);
     assert_eq!(gate.status, GateStatus::NotEvaluated);
     assert_eq!(gate.note, SHORT_BASELINE);
 
-    let gate = judged_with(drift(252, 0.01, 0.010));
+    let gate = judged_with(drift(252, 0.011, 0.010));
     assert_eq!(gate.status, GateStatus::Pass, "{}", gate.note);
     assert_eq!(
         gate.threshold,
-        Some(0.5 * annualised_sharpe(&drift(252, 0.01, 0.010)))
+        Some(0.5 * annualised_sharpe(&drift(252, 0.011, 0.010)))
     );
 
     // The same with a flat warm-up in front: 252 active sessions after 250 flat ones.
     let mut warm = vec![0.0; 250];
-    warm.extend(drift(252, 0.01, 0.010));
+    warm.extend(drift(252, 0.011, 0.010));
     assert_eq!(judged_with(warm).status, GateStatus::Pass);
 }
 
@@ -1657,7 +1670,7 @@ fn a_baseline_sharpe_of_two_hundredths_is_judged_because_the_length_is_the_guard
 
 #[test]
 fn info_describes_the_holdout_run_without_a_verdict_and_a_null_baseline() {
-    let cand = drift(500, 0.01, 0.010);
+    let cand = drift(500, 0.011, 0.010);
     // A holdout run and no candidate at all.
     let report = build_report(&inputs(
         1,
@@ -1681,6 +1694,200 @@ fn info_describes_the_holdout_run_without_a_verdict_and_a_null_baseline() {
     assert_eq!(report.info["holdout_run"]["trial_id"], json!(2));
     assert!(report.info["holdout_run"]["baseline_trial_id"].is_null());
     assert!(report.info["holdout_baseline_active_sharpe"].is_null());
+}
+
+// ---- the same experiment: limits, starting cash, seed and bar file --------------------------
+
+/// The review's sequence, one version: trial 1 an ordinary run (weak), trial 2 the look made right
+/// after it (its tail as good as trial 1's, so it passes against trial 1's threshold), trial 3 an
+/// ordinary re-run that is strong. Every trial carries the default inputs unless a test changes it.
+fn look_scenario() -> [TrialSeries; 3] {
+    [
+        series(1, 1, false, drift(500, 0.002, 0.010)),
+        holdout_trial(2, 1, drift(60, 0.002, 0.010), Some(60)),
+        series(3, 1, false, drift(500, 0.011, 0.010)),
+    ]
+}
+
+/// The report of the look scenario's three trials, one look made.
+fn judge_scenario(trials: [TrialSeries; 3]) -> GateReport {
+    let mut i = inputs(1, Vec::from(trials), 3);
+    i.holdout_looks = 1;
+    build_report(&i)
+}
+
+/// The holdout gate of a report.
+fn holdout_of(report: &GateReport) -> &GateResult {
+    find(report, "holdout")
+}
+
+#[test]
+fn a_rerun_under_other_limits_is_not_the_experiment_the_look_tested() {
+    // Control: the same re-run under the same limits is judged, and passes.
+    let report = judge_scenario(look_scenario());
+    assert_eq!(report.candidate_trial_id, Some(3));
+    assert_eq!(status(&report, "holdout"), GateStatus::Pass);
+
+    // The review's scenario: the re-run is strong under other limits. It is the candidate, and
+    // the look is not judged for it, so it never passes.
+    let mut trials = look_scenario();
+    trials[2].limits_hash = Some("bbb".to_owned());
+    let report = judge_scenario(trials);
+    assert_eq!(report.candidate_trial_id, Some(3));
+    let gate = holdout_of(&report);
+    assert_eq!(gate.status, GateStatus::NotEvaluated, "{}", gate.note);
+    assert_eq!(gate.note, DIFFERENT_INPUTS);
+    assert_ne!(gate.status, GateStatus::Pass);
+    assert_eq!(report.info["holdout_run"]["baseline_trial_id"], json!(1));
+    assert_eq!(report.info["candidate_run"]["limits_hash"], json!("bbb"));
+    assert_eq!(report.info["holdout_run"]["limits_hash"], json!("aaa"));
+}
+
+#[test]
+fn a_rerun_with_other_starting_cash_or_seed_is_not_the_experiment_the_look_tested() {
+    type Change = fn(&mut TrialSeries);
+    let changes: [(&str, Change); 2] = [
+        ("starting cash", |t| {
+            t.starting_cash = Some("250000".to_owned())
+        }),
+        ("seed", |t| t.seed = Some(8)),
+    ];
+    for (what, change) in changes {
+        let mut trials = look_scenario();
+        change(&mut trials[2]);
+        let report = judge_scenario(trials);
+        let gate = holdout_of(&report);
+        assert_eq!(
+            gate.status,
+            GateStatus::NotEvaluated,
+            "{what}: {}",
+            gate.note
+        );
+        assert_eq!(gate.note, DIFFERENT_INPUTS, "{what}");
+        assert_ne!(gate.status, GateStatus::Pass, "{what}");
+    }
+}
+
+#[test]
+fn starting_cash_is_compared_as_a_decimal() {
+    for equal in ["100000.0", "100000.00"] {
+        let mut trials = look_scenario();
+        trials[2].starting_cash = Some(equal.to_owned());
+        let report = judge_scenario(trials);
+        assert_eq!(
+            status(&report, "holdout"),
+            GateStatus::Pass,
+            "{equal}: {}",
+            holdout_of(&report).note
+        );
+    }
+
+    let mut trials = look_scenario();
+    trials[2].starting_cash = Some("100000.5".to_owned());
+    assert_eq!(
+        holdout_of(&judge_scenario(trials)).note,
+        DIFFERENT_INPUTS,
+        "a different amount"
+    );
+
+    // Not a decimal on either side: never equal, not even to itself.
+    let mut trials = look_scenario();
+    for trial in &mut trials {
+        trial.starting_cash = Some("ten".to_owned());
+    }
+    assert_eq!(
+        holdout_of(&judge_scenario(trials)).note,
+        DIFFERENT_INPUTS,
+        "not a decimal"
+    );
+}
+
+#[test]
+fn a_missing_limits_cash_or_seed_on_any_of_the_three_runs_is_never_equal() {
+    type Blank = fn(&mut TrialSeries);
+    let blanks: [(&str, Blank); 3] = [
+        ("limits_hash", |t| t.limits_hash = None),
+        ("starting_cash", |t| t.starting_cash = None),
+        ("seed", |t| t.seed = None),
+    ];
+    // Trial 1 is the baseline, trial 2 the look, trial 3 the candidate.
+    for (side, index) in [("baseline", 0), ("holdout run", 1), ("candidate", 2)] {
+        for (field, blank) in blanks {
+            let mut trials = look_scenario();
+            blank(&mut trials[index]);
+            let report = judge_scenario(trials);
+            let gate = holdout_of(&report);
+            assert_eq!(
+                gate.status,
+                GateStatus::NotEvaluated,
+                "{side} without {field}: {}",
+                gate.note
+            );
+            assert_eq!(gate.value, None, "{side} without {field}");
+        }
+    }
+}
+
+#[test]
+fn a_look_that_read_another_bar_file_than_its_baseline_has_no_baseline() {
+    let mut other = look_scenario();
+    other[1].bars_file = Some("other.parquet".to_owned());
+    let mut missing_run = look_scenario();
+    missing_run[1].bars_file = None;
+    let mut missing_baseline = look_scenario();
+    missing_baseline[0].bars_file = None;
+    for trials in [other, missing_run, missing_baseline] {
+        let report = judge_scenario(trials);
+        let gate = holdout_of(&report);
+        assert_eq!(gate.status, GateStatus::NotEvaluated, "{}", gate.note);
+        assert_eq!(gate.note, NO_BASELINE);
+    }
+
+    // Control: the same bar file on both sides is judged.
+    let report = judge_scenario(look_scenario());
+    assert_eq!(report.info["holdout_run"]["baseline_trial_id"], json!(1));
+}
+
+#[test]
+fn a_baseline_that_ended_flat_is_not_evaluated() {
+    let mut trials = look_scenario();
+    trials[0].final_drawdown_mode = Some("flat".to_owned());
+    let report = judge_scenario(trials);
+    let gate = holdout_of(&report);
+    assert_eq!(gate.status, GateStatus::NotEvaluated, "{}", gate.note);
+    assert_eq!(gate.note, FLAT_BASELINE);
+    assert_eq!(gate.value, None);
+    assert_eq!(gate.threshold, None);
+}
+
+#[test]
+fn a_baseline_counts_only_its_non_zero_returns_against_252() {
+    // The review's idle baseline: 15 non-zero returns, then 485 zeros (500 sessions in all).
+    let mut idle = drift(15, 0.011, 0.010);
+    idle.extend(vec![0.0; 485]);
+    let mut trials = look_scenario();
+    trials[0].returns = Some(idle);
+    let gate = holdout_of(&judge_scenario(trials)).clone();
+    assert_eq!(gate.status, GateStatus::NotEvaluated, "{}", gate.note);
+    assert_eq!(gate.note, SHORT_BASELINE);
+
+    // Exactly 252 non-zero returns (among zeros) is judged.
+    let mut enough = drift(252, 0.011, 0.010);
+    enough.extend(vec![0.0; 248]);
+    let mut trials = look_scenario();
+    trials[0].returns = Some(enough);
+    let gate = holdout_of(&judge_scenario(trials)).clone();
+    assert_ne!(gate.note, SHORT_BASELINE, "{}", gate.note);
+    assert_ne!(gate.status, GateStatus::NotEvaluated, "{}", gate.note);
+
+    // 251 non-zero returns is not.
+    let mut short = drift(251, 0.011, 0.010);
+    short.extend(vec![0.0; 249]);
+    let mut trials = look_scenario();
+    trials[0].returns = Some(short);
+    let gate = holdout_of(&judge_scenario(trials)).clone();
+    assert_eq!(gate.status, GateStatus::NotEvaluated, "{}", gate.note);
+    assert_eq!(gate.note, SHORT_BASELINE);
 }
 
 // ---- replay and risk ------------------------------------------------------------------------
@@ -1825,6 +2032,10 @@ fn candidate_run_and_holdout_run_carry_the_documented_keys() {
         "dirty_build",
         "costs",
         "symbols",
+        "limits_hash",
+        "starting_cash",
+        "seed",
+        "bars_file",
         "requested_start",
         "requested_end",
         "data_end",
@@ -1840,6 +2051,10 @@ fn candidate_run_and_holdout_run_carry_the_documented_keys() {
         json!({"slippage_bps": "2", "fee_per_share": "0.0001"})
     );
     assert_eq!(run["symbols"], json!(["SPY"]));
+    assert_eq!(run["limits_hash"], json!("aaa"));
+    assert_eq!(run["starting_cash"], json!("100000"));
+    assert_eq!(run["seed"], json!(7));
+    assert_eq!(run["bars_file"], json!("bars.parquet"));
     assert_eq!(run["requested_end"], json!(1000));
     assert_eq!(run["data_end"], json!(BOUNDARY - 1));
     assert_eq!(run["holdout_start"], json!("2023-01-01"));
@@ -1854,11 +2069,15 @@ fn candidate_run_and_holdout_run_carry_the_documented_keys() {
         "sharpe",
         "costs",
         "symbols",
+        "limits_hash",
+        "bars_file",
         "baseline_trial_id",
         "holdout_runs_for_version",
     ] {
         assert!(holdout.get(key).is_some(), "holdout_run misses {key}");
     }
+    assert_eq!(holdout["limits_hash"], json!("aaa"));
+    assert_eq!(holdout["bars_file"], json!("bars.parquet"));
     assert_eq!(holdout["baseline_trial_id"], json!(1));
     assert_eq!(holdout["trial_id"], json!(2));
     assert_eq!(holdout["holdout_sessions"], json!(60));
@@ -1924,7 +2143,7 @@ fn build_report_is_deterministic_and_the_json_has_the_documented_keys() {
 /// dominant, a usable holdout run of 60 sessions whose tail clears the haircut, replay (0, 3),
 /// five orders sent with no breach, identical live and backtest returns.
 fn passing_inputs() -> ReportInputs {
-    let cand = drift(500, 0.01, 0.010);
+    let cand = drift(500, 0.011, 0.010);
     let alts = alternatives(9);
     let mut trials = configurations(&cand, &alts);
     trials.push(holdout_trial(11, 1, cand.clone(), Some(60)));
@@ -1961,7 +2180,7 @@ fn all_pass_holds_only_when_every_gate_passes() {
         ("pbo", |i| {
             for trial in &mut i.trials {
                 if trial.trial_id < 10 {
-                    trial.returns = Some(drift(500, 0.01, 0.010));
+                    trial.returns = Some(drift(500, 0.011, 0.010));
                 }
             }
         }),
@@ -1969,7 +2188,7 @@ fn all_pass_holds_only_when_every_gate_passes() {
         ("replay", |i| i.replay = (1, 3)),
         ("risk_breaches", |i| i.risk_breaches = 1),
         ("tracking", |i| {
-            i.live = Some((drift(500, 0.01, -0.010), drift(500, 0.01, 0.010)));
+            i.live = Some((drift(500, 0.01, -0.010), drift(500, 0.011, 0.010)));
         }),
     ];
     for (name, flip) in flips {
@@ -2092,6 +2311,50 @@ fn an_older_result_without_returns_is_read_with_defaults() {
     assert_eq!(older.holdout_start, None);
     assert_eq!(older.data_end, None);
     assert_eq!(older.costs, Value::Null);
+}
+
+#[test]
+fn the_comparison_fields_are_read_when_present() {
+    let series = TrialSeries::from_stored(&stored(json!({
+        "returns": [0.01], "returns_complete": true,
+        "limits_hash": "abc",
+        "starting_cash": "100000.0",
+        "seed": 42,
+        "bars_file": "bars.parquet",
+    })));
+    assert_eq!(series.limits_hash.as_deref(), Some("abc"));
+    assert_eq!(series.starting_cash.as_deref(), Some("100000.0"));
+    assert_eq!(series.seed, Some(42));
+    assert_eq!(series.bars_file.as_deref(), Some("bars.parquet"));
+}
+
+#[test]
+fn absent_or_mistyped_comparison_fields_are_unknown() {
+    let absent = TrialSeries::from_stored(&stored(json!({
+        "returns": [0.01], "returns_complete": true,
+    })));
+    assert_eq!(absent.limits_hash, None);
+    assert_eq!(absent.starting_cash, None);
+    assert_eq!(absent.seed, None);
+    assert_eq!(absent.bars_file, None);
+
+    let mistyped = TrialSeries::from_stored(&stored(json!({
+        "returns": [0.01], "returns_complete": true,
+        "limits_hash": 7,
+        "starting_cash": 100000,
+        "seed": "42",
+        "bars_file": null,
+    })));
+    assert_eq!(mistyped.limits_hash, None);
+    assert_eq!(mistyped.starting_cash, None);
+    assert_eq!(mistyped.seed, None);
+    assert_eq!(mistyped.bars_file, None);
+
+    let negative_seed = TrialSeries::from_stored(&stored(json!({
+        "returns": [0.01], "returns_complete": true,
+        "seed": -1,
+    })));
+    assert_eq!(negative_seed.seed, None);
 }
 
 // ---- store ----------------------------------------------------------------------------------
