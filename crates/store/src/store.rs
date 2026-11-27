@@ -4,16 +4,18 @@
 use nisse_core::nautilus::UnixNanos;
 use nisse_core::{
     Decision, DecisionId, DecisionLog, IntentLog, KillSwitchSource, OrderEvent, OrderIntent,
-    RestoredOrder, RiskEvent, StrategyVersion, StrategyVersionId,
+    PositionEvent, RestoredOrder, RiskEvent, StrategyVersion, StrategyVersionId,
 };
+use serde_json::Value;
 use tokio_postgres::Client;
 
 use crate::{
     StoreError,
     tables::{
         decision,
+        engine_step::{self, StepStatus},
         fill::{self, FillSide},
-        heartbeat, order_event, risk_event, strategy_version,
+        heartbeat, order_event, position_event, risk_event, strategy_version,
     },
 };
 
@@ -72,6 +74,40 @@ impl Store {
     /// not sit in a queue).
     pub async fn record_risk_event(&self, event: &RiskEvent) -> Result<(), StoreError> {
         risk_event::insert_many(&self.client, std::slice::from_ref(event)).await
+    }
+
+    /// Appends one status row for a step of an engine run. See [`engine_step::insert`].
+    pub async fn record_step(
+        &self,
+        run_key: &str,
+        step: &str,
+        status: StepStatus,
+        detail: &Value,
+        ts: UnixNanos,
+    ) -> Result<(), StoreError> {
+        engine_step::insert(&self.client, run_key, step, status, detail, ts).await
+    }
+
+    /// The newest status of a step of an engine run, with its detail. See
+    /// [`engine_step::latest`].
+    pub async fn step_status(
+        &self,
+        run_key: &str,
+        step: &str,
+    ) -> Result<Option<(StepStatus, Value)>, StoreError> {
+        engine_step::latest(&self.client, run_key, step).await
+    }
+
+    /// The positions a restarting engine starts from. See
+    /// [`position_event::latest_per_symbol`].
+    pub async fn load_positions(&self) -> Result<Vec<PositionEvent>, StoreError> {
+        position_event::latest_per_symbol(&self.client).await
+    }
+
+    /// The hash of the newest loaded limits file, `None` when none was recorded. See
+    /// [`risk_event::latest_limits_hash`].
+    pub async fn latest_limits_hash(&self) -> Result<Option<String>, StoreError> {
+        risk_event::latest_limits_hash(&self.client).await
     }
 }
 
