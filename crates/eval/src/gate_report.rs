@@ -4,13 +4,15 @@
 //! Loading ([`load_inputs`]) and judging ([`build_report`]) are separate, so the judging is
 //! pure and tested without a database. Rules: `docs/phases/phase-5.md`, "Gate report".
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::str::FromStr;
 
 use nisse_core::nautilus::UnixNanos;
 use nisse_core::{EvalScore, StrategyVersionId, SubjectType};
 use nisse_store::StoreError;
 use nisse_store::tables::scoring::{self, TrialWithResult};
 use nisse_store::tables::{eval_score, trial_registry};
+use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use tokio_postgres::GenericClient;
 
@@ -370,26 +372,72 @@ fn candidate(inputs: &ReportInputs) -> Option<&TrialSeries> {
         .max_by_key(|t| t.trial_id)
 }
 
-/// The holdout run judged for `candidate`: the version's oldest holdout run whose costs and
-/// symbols equal the candidate's. The first look counts; a later one cannot rescue it. `None`
-/// when either of the candidate's values is null (nothing to match on).
-fn judged_holdout_run<'a>(
-    inputs: &'a ReportInputs,
-    candidate: &TrialSeries,
-) -> Option<&'a TrialSeries> {
-    if candidate.costs.is_null() || candidate.symbols.is_null() {
-        return None;
-    }
+/// Whether two runs were made with the same inputs: both have a cost model and a symbol list,
+/// the cost objects have the same keys and numerically equal decimal values (`"2"` and `"2.0"`
+/// are equal; a value that is not a decimal string is not), and the symbol arrays hold the same
+/// set of strings (order and duplicates ignored; a non-string element is not).
+fn same_inputs(a: &TrialSeries, b: &TrialSeries) -> bool {
+    same_costs(&a.costs, &b.costs) && same_symbols(&a.symbols, &b.symbols)
+}
+
+fn same_costs(a: &Value, b: &Value) -> bool {
+    let (Some(a), Some(b)) = (a.as_object(), b.as_object()) else {
+        return false;
+    };
+    a.len() == b.len()
+        && a.iter()
+            .all(|(key, value)| b.get(key).is_some_and(|other| same_decimal(value, other)))
+}
+
+/// Two JSON values that are decimal strings and numerically equal.
+fn same_decimal(a: &Value, b: &Value) -> bool {
+    let parse = |value: &Value| value.as_str().and_then(|s| Decimal::from_str(s).ok());
+    matches!((parse(a), parse(b)), (Some(x), Some(y)) if x == y)
+}
+
+fn same_symbols(a: &Value, b: &Value) -> bool {
+    matches!((symbol_set(a), symbol_set(b)), (Some(x), Some(y)) if x == y)
+}
+
+/// The set of symbols of a symbol array, or `None` when it is not an array of strings.
+fn symbol_set(value: &Value) -> Option<BTreeSet<&str>> {
+    value.as_array()?.iter().map(Value::as_str).collect()
+}
+
+/// The holdout run judged by the gate: the version's oldest holdout run, whatever its inputs.
+/// The first look counts; no later look, re-run or change of costs can replace it.
+fn judged_holdout_run(inputs: &ReportInputs) -> Option<&TrialSeries> {
+    inputs
+        .trials
+        .iter()
+        .filter(|t| t.holdout && t.strategy_version_id == inputs.version)
+        .min_by_key(|t| t.trial_id)
+}
+
+/// The holdout baseline of `run`: the newest usable ordinary run of the version registered
+/// before `run` with the same inputs.
+fn holdout_baseline<'a>(inputs: &'a ReportInputs, run: &TrialSeries) -> Option<&'a TrialSeries> {
     inputs
         .trials
         .iter()
         .filter(|t| {
-            t.holdout
+            !t.holdout
                 && t.strategy_version_id == inputs.version
-                && t.costs == candidate.costs
-                && t.symbols == candidate.symbols
+                && t.trial_id < run.trial_id
+                && t.usable(&inputs.gates).is_ok()
+                && same_inputs(t, run)
         })
-        .min_by_key(|t| t.trial_id)
+        .max_by_key(|t| t.trial_id)
+}
+
+/// The annualised Sharpe of a run's returns from the first non-zero return on, or `None` when
+/// it has no returns or none is defined.
+fn baseline_active_sharpe(trial: &TrialSeries, periods_per_year: u32) -> Option<f64> {
+    trial
+        .returns
+        .as_deref()
+        .and_then(|returns| moments::sharpe(active_returns(returns)))
+        .map(|s| moments::annualise(s, periods_per_year))
 }
 
 /// The number of holdout trials the version has, whatever their costs.
@@ -401,7 +449,7 @@ fn holdout_runs_for_version(inputs: &ReportInputs) -> usize {
         .count()
 }
 
-/// The candidate's returns from its first non-zero return on. The flat warm-up before the first
+/// A run's returns from its first non-zero return on. The flat warm-up before the first
 /// trade would understate its Sharpe ratio.
 fn active_returns(returns: &[f64]) -> &[f64] {
     let start = returns
@@ -668,6 +716,7 @@ fn holdout_gate(inputs: &ReportInputs) -> GateResult {
         );
     }
     let ppy = gates.periods_per_year;
+    // (b) and (c): nothing to judge yet.
     let Some(candidate) = candidate(inputs) else {
         return undecided(
             NAME,
@@ -676,22 +725,19 @@ fn holdout_gate(inputs: &ReportInputs) -> GateResult {
             "no backtest trial of this version has a stored result yet",
         );
     };
-    let Some(run) = judged_holdout_run(inputs, candidate) else {
-        return undecided(
-            NAME,
-            None,
-            None,
-            "no holdout run with the candidate's costs and symbols",
-        );
+    let Some(run) = judged_holdout_run(inputs) else {
+        return undecided(NAME, None, None, "no holdout run for this version yet");
     };
-    if candidate.trial_id > run.trial_id {
+    // (d): the candidate must be what the holdout was looked at with.
+    if !same_inputs(candidate, run) {
         return undecided(
             NAME,
             None,
             None,
-            "the candidate was registered after the holdout was looked at",
+            "the candidate's costs or symbols differ from those the holdout was looked at with",
         );
     }
+    // (e) and (f): a run that cannot be used, or that went flat, is not judged on its Sharpe.
     if let Err(reason) = run.usable(gates) {
         return undecided(
             NAME,
@@ -710,24 +756,30 @@ fn holdout_gate(inputs: &ReportInputs) -> GateResult {
             "the holdout run ended flat after a drawdown".to_owned(),
         );
     }
+    // (g): the holdout sessions.
     let tail = match holdout_tail(run) {
         Ok(tail) => tail,
         Err(note) => return undecided(NAME, None, None, &note),
     };
-    let candidate_returns = match usable_returns(candidate, gates) {
-        Ok(returns) => returns,
-        Err(note) => return undecided(NAME, None, None, &note),
-    };
-    let Some(candidate_sharpe) = moments::sharpe(active_returns(candidate_returns)) else {
+    // (h) and (i): the threshold comes from the baseline, not the candidate.
+    let Some(baseline) = holdout_baseline(inputs, run) else {
         return undecided(
             NAME,
             None,
             None,
-            "the candidate's active Sharpe ratio is undefined",
+            "no usable ordinary run before the first holdout look with the same costs and symbols",
         );
     };
-    let threshold =
-        ((1.0 - gates.sharpe_haircut) * moments::annualise(candidate_sharpe, ppy)).max(0.0);
+    let Some(baseline_sharpe) = baseline_active_sharpe(baseline, ppy) else {
+        return undecided(
+            NAME,
+            None,
+            None,
+            "the holdout baseline's active Sharpe ratio is undefined",
+        );
+    };
+    let threshold = ((1.0 - gates.sharpe_haircut) * baseline_sharpe).max(0.0);
+    // (j) and (k).
     let Some(value) = moments::sharpe(tail).map(|s| moments::annualise(s, ppy)) else {
         return undecided(
             NAME,
@@ -880,11 +932,16 @@ fn info(inputs: &ReportInputs, candidate: Option<&TrialSeries>) -> Value {
         "haircut_sharpe": finite(haircut),
         "haircut_sharpe_note": "the limits file's haircut_sharpe may not exceed this",
         "active_sharpe": finite(active_sharpe),
+        "holdout_baseline_active_sharpe": finite(
+            judged_holdout_run(inputs)
+                .and_then(|run| holdout_baseline(inputs, run))
+                .and_then(|baseline| baseline_active_sharpe(baseline, ppy))
+        ),
         "lifetime_trials": inputs.lifetime_trials,
         "trial_budget": gates.trial_budget,
         "candidate_trial_id": candidate.map(|t| t.trial_id),
         "candidate_run": candidate_run(inputs, candidate),
-        "holdout_run": holdout_run(inputs, candidate),
+        "holdout_run": holdout_run(inputs),
     })
 }
 
@@ -906,17 +963,18 @@ fn candidate_run(inputs: &ReportInputs, candidate: Option<&TrialSeries>) -> Valu
     })
 }
 
-/// The holdout run the holdout gate judges: its annualised Sharpe over the holdout sessions (the
-/// figure the gate compares), its costs and symbols, and how many holdout runs the version has
-/// in all. Null without a candidate or without a holdout run matching its costs and symbols.
-fn holdout_run(inputs: &ReportInputs, candidate: Option<&TrialSeries>) -> Value {
+/// The holdout run the holdout gate judges (the version's oldest holdout run): its annualised
+/// Sharpe over the holdout sessions (the figure the gate compares), its costs and symbols, its
+/// holdout baseline (null when there is none), and how many holdout runs the version has in all.
+/// Null without a holdout run of the version.
+fn holdout_run(inputs: &ReportInputs) -> Value {
     let ppy = inputs.gates.periods_per_year;
-    let picked = candidate.and_then(|c| judged_holdout_run(inputs, c));
-    picked.map_or(Value::Null, |run| {
+    judged_holdout_run(inputs).map_or(Value::Null, |run| {
         let sharpe = holdout_tail(run)
             .ok()
             .and_then(moments::sharpe)
             .map(|s| moments::annualise(s, ppy));
+        let baseline = holdout_baseline(inputs, run);
         json!({
             "trial_id": run.trial_id,
             "holdout_sessions": run.holdout_sessions,
@@ -924,6 +982,7 @@ fn holdout_run(inputs: &ReportInputs, candidate: Option<&TrialSeries>) -> Value 
             "sharpe": finite(sharpe),
             "costs": run.costs,
             "symbols": run.symbols,
+            "baseline_trial_id": baseline.map(|t| t.trial_id),
             "holdout_runs_for_version": holdout_runs_for_version(inputs),
         })
     })
