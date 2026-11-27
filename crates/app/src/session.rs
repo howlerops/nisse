@@ -31,8 +31,9 @@ pub const RESIZE_RUN_KEY: &str = "resize";
 /// be completed).
 pub const RESIZE_STEP: &str = "pending";
 /// The step under which a tick records its attempt at an owed rebalance. The run key is
-/// `tick/<UTC date>T<hour>`, so a tick tries at most once an hour: orders that stay blocked
-/// do not turn into a set of decisions every five minutes.
+/// `tick/<UTC date>T<hour>`: a completed attempt is not repeated within the hour unless the
+/// risk scale has dropped since (a step-down, a flattening kill switch), so orders that stay
+/// blocked do not turn into a set of decisions every tick.
 pub const TICK_ATTEMPT_STEP: &str = "rebalance";
 
 /// The step names of a `session-close` run.
@@ -55,7 +56,7 @@ pub struct TickOutcome {
     pub mode_change: Option<(DrawdownMode, DrawdownMode)>,
     pub market_open: bool,
     /// The rebalance this tick ran: one was owed, the market was open, orders could go out,
-    /// and no tick had tried in this hour.
+    /// and no tick had completed an attempt in this hour at this risk scale or a lower one.
     pub rebalance: Option<RebalanceReport>,
 }
 
@@ -113,25 +114,31 @@ pub async fn tick<M: Market, B: Broker, C: Clock>(
 
     let due = resize_owed(store).await? || trader.needs_flatten();
     let attempt_key = format!("tick/{}T{:02}", today, utc_hour(now));
-    // A step-down seen by this very tick is acted on at once. Anything older is tried once
-    // an hour: an attempt that completed (whatever its orders met) is not repeated within
-    // the hour, while one that failed part-way may be.
-    let tried_this_hour = matches!(
-        store.step_status(&attempt_key, TICK_ATTEMPT_STEP).await?,
-        Some((StepStatus::Done, _))
-    );
-    let rebalance = if due
-        && market_open
-        && !halted(&trader, &observed)
-        && (observed.stepped_down || !tried_this_hour)
-    {
+    // An attempt that completed (whatever its orders met) is not repeated within the hour,
+    // while one that failed part-way may be. The exception is a risk scale that has dropped
+    // since that attempt (a drawdown step-down, a kill switch that flattens): that is acted
+    // on at once. An attempt whose recorded scale cannot be read counts as tried.
+    let scale = trader.risk().risk_scale();
+    let tried_this_hour = match store.step_status(&attempt_key, TICK_ATTEMPT_STEP).await? {
+        Some((StepStatus::Done, detail)) => detail
+            .get("risk_scale")
+            .and_then(Value::as_str)
+            .and_then(|text| text.parse::<Decimal>().ok())
+            .is_none_or(|tried_at| scale >= tried_at),
+        _ => false,
+    };
+    let rebalance = if due && market_open && !halted(&trader, &observed) && !tried_this_hour {
         let report = step(
             store,
             &attempt_key,
             TICK_ATTEMPT_STEP,
             now,
             rebalance_pass(&mut trader),
-            rebalance_detail,
+            |report| {
+                let mut detail = rebalance_detail(report);
+                detail["risk_scale"] = json!(scale.to_string());
+                detail
+            },
         )
         .await?;
         settle_or_owe(store, &report, now).await?;
@@ -273,17 +280,31 @@ async fn rebalance_step<B: Broker, C: Clock>(
         return Ok(RebalanceStep::AlreadyDone);
     }
 
-    // `None` means the calendar does not reach the session after this one. Guessing "not a
-    // month end" would skip the monthly rebalance without a trace.
-    let month_end = calendar
-        .is_last_session_of_month(session.date)
-        .ok_or_else(|| {
-            AppError::Market(format!(
+    let owed = resize_owed(store).await? || trader.needs_flatten();
+    let month_end = match calendar.is_last_session_of_month(session.date) {
+        Some(month_end) => month_end,
+        // The calendar does not reach the session after this one. An owed rebalance does not
+        // need the answer; otherwise guessing "not a month end" would skip the monthly
+        // rebalance without a trace, so the step fails.
+        None if owed => false,
+        None => {
+            let err = AppError::Market(format!(
                 "the calendar does not say whether {} ends its month",
                 session.date
-            ))
-        })?;
-    let due = month_end || resize_owed(store).await? || trader.needs_flatten();
+            ));
+            store
+                .record_step(
+                    run_key,
+                    REBALANCE_STEP,
+                    StepStatus::Failed,
+                    &json!({"error": err.to_string()}),
+                    now,
+                )
+                .await?;
+            return Err(err);
+        }
+    };
+    let due = month_end || owed;
     if !due {
         store
             .record_step(

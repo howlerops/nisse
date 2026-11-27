@@ -125,11 +125,14 @@ fn require_by(by: Option<String>) -> Result<String, String> {
 /// How long `kill` waits for one store statement before giving up on it. The broker half
 /// never waits for the store.
 pub const KILL_STORE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How many times `kill` looks for open orders after its last cancel.
+const OPEN_ORDER_CHECKS: u32 = 5;
 
 /// What `kill` did, half by half, so the caller can say exactly what is and is not done.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KillOutcome {
-    /// The broker accepted a cancel of every open order (the last one sent).
+    /// The broker accepted the last cancel of every open order, and afterwards listed no open
+    /// order.
     pub orders_cancelled: bool,
     /// The `kill_switch` event is in the store: every later engine run starts halted.
     pub switch_recorded: bool,
@@ -154,13 +157,14 @@ impl KillOutcome {
 /// Every half is attempted whatever happened to the others, and none is reported as an
 /// error return: the outcome says what was done.
 ///
-/// 1. `broker.cancel_all()`, first, because it does not depend on the store. `broker` is
-///    `None` when the broker client could not be built (missing keys).
-/// 2. Record a `kill_switch` risk event (`engaged: true`, `by`), giving the store
-///    [`KILL_STORE_TIMEOUT`].
-/// 3. Try to take the engine lock, retrying until `lock_wait` has passed. Once taken, no
+/// 1. At the same time: `broker.cancel_all()` (`broker` is `None` when the broker client
+///    could not be built, for example missing keys), and record a `kill_switch` risk event
+///    (`engaged: true`, `by`), giving the store [`KILL_STORE_TIMEOUT`]. Neither waits for the
+///    other.
+/// 2. Try to take the engine lock, retrying until `lock_wait` has passed. Once taken, no
 ///    engine run is in flight and any later run will read the switch as engaged: cancel
 ///    again and report `engine_idle: true`.
+/// 3. Ask the broker for its open orders and report any that remain.
 pub async fn kill<B: Broker, C: Clock>(
     store: &Store,
     broker: Option<&B>,
@@ -169,14 +173,13 @@ pub async fn kill<B: Broker, C: Clock>(
     lock_wait: Duration,
 ) -> KillOutcome {
     let mut errors = Vec::new();
-    let mut orders_cancelled = cancel_for_kill(broker, &mut errors).await;
-
-    let switch_recorded = match tokio::time::timeout(
-        KILL_STORE_TIMEOUT,
-        engage_kill_switch(store, clock, by),
-    )
-    .await
-    {
+    // Together: the switch must not wait for a slow broker, nor the cancel for a slow store.
+    let (cancelled, recorded) = tokio::join!(
+        cancel_for_kill(broker),
+        tokio::time::timeout(KILL_STORE_TIMEOUT, engage_kill_switch(store, clock, by)),
+    );
+    let mut orders_cancelled = note(cancelled, &mut errors);
+    let switch_recorded = match recorded {
         Ok(Ok(())) => true,
         Ok(Err(err)) => {
             errors.push(format!("the switch was NOT recorded: {err}"));
@@ -218,7 +221,15 @@ pub async fn kill<B: Broker, C: Clock>(
     // The lock is held by this connection from here on, so no run is in flight. Cancel what
     // a run placed before it could see the switch. The lock goes with the process.
     if engine_idle {
-        orders_cancelled = cancel_for_kill(broker, &mut errors).await;
+        orders_cancelled = note(cancel_for_kill(broker).await, &mut errors);
+    }
+    // A cancel request the broker accepted is not yet an empty book: look.
+    if orders_cancelled
+        && let Some(broker) = broker
+        && let Err(line) = confirm_no_open_orders(broker).await
+    {
+        errors.push(line);
+        orders_cancelled = false;
     }
 
     KillOutcome {
@@ -229,22 +240,50 @@ pub async fn kill<B: Broker, C: Clock>(
     }
 }
 
-/// One cancel-everything for `kill`; a failure becomes a line in `errors`.
-async fn cancel_for_kill<B: Broker>(broker: Option<&B>, errors: &mut Vec<String>) -> bool {
+/// One cancel-everything for `kill`; a failure is the line to report.
+async fn cancel_for_kill<B: Broker>(broker: Option<&B>) -> Result<(), String> {
     let Some(broker) = broker else {
-        let line = "open orders were NOT cancelled: no broker client";
-        if !errors.iter().any(|known| known == line) {
-            errors.push(line.to_owned());
-        }
-        return false;
+        return Err("open orders were NOT cancelled: no broker client".to_owned());
     };
-    match cancel_open_orders(broker).await {
+    cancel_open_orders(broker)
+        .await
+        .map_err(|err| format!("open orders were NOT cancelled: {err}"))
+}
+
+/// Adds a failure line to `errors` unless it is already there; `true` for success.
+fn note(result: Result<(), String>, errors: &mut Vec<String>) -> bool {
+    match result {
         Ok(()) => true,
-        Err(err) => {
-            errors.push(format!("open orders were NOT cancelled: {err}"));
+        Err(line) => {
+            if !errors.contains(&line) {
+                errors.push(line);
+            }
             false
         }
     }
+}
+
+/// Checks that the broker lists no open order, looking up to `OPEN_ORDER_CHECKS` times a
+/// second apart (a cancel takes a moment to take effect). `Err` is the line to report.
+async fn confirm_no_open_orders<B: Broker>(broker: &B) -> Result<(), String> {
+    let mut left = 0_usize;
+    for attempt in 0..OPEN_ORDER_CHECKS {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        let open = broker
+            .open_orders()
+            .await
+            .map_err(|err| format!("could not confirm that no order is open: {err}"))?;
+        left = open
+            .orders
+            .len()
+            .saturating_add(usize::try_from(open.unrepresentable).unwrap_or(usize::MAX));
+        if left == 0 {
+            return Ok(());
+        }
+    }
+    Err(format!("{left} orders are still open after the cancel"))
 }
 
 /// Records the kill switch as engaged: the first half of [`kill`], on its own for when the

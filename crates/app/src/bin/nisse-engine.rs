@@ -111,28 +111,32 @@ async fn execute(command: &Command, config: &EngineConfig) -> Result<(), RunErro
     }
 }
 
-/// `kill`. Order matters: the broker cancel goes first and waits for nothing else, then the
-/// store is given a bounded time to connect, then the library's `kill` records the switch,
-/// waits for a run in flight and cancels again. Whatever could not be done is printed, one
-/// line each, and makes the exit code 1.
+/// `kill`. A first cancel goes to the broker while the store is given a bounded time to
+/// connect; then the library's `kill` records the switch (cancelling again alongside), waits
+/// for a run in flight, cancels once more and checks that no order is left open. Whatever
+/// could not be done is printed, one line each, and makes the exit code 1.
 async fn run_kill(by: &str) -> ExitCode {
     // The feed only matters to market data, which `kill` never reads.
     let trading = alpaca_http().map(|http| {
         AlpacaTrading::new(http, &AlpacaConfig::paper(nisse_alpaca_adapter::Feed::Iex))
     });
-    let mut first_cancel = false;
-    match &trading {
-        Ok(trading) => match commands::cancel_open_orders(trading).await {
-            Ok(()) => {
-                first_cancel = true;
-                println!("kill: open orders cancelled");
+    // The first cancel goes out while the store connects: neither waits for the other.
+    let (first_cancel, store) = tokio::join!(
+        async {
+            match &trading {
+                Ok(trading) => commands::cancel_open_orders(trading)
+                    .await
+                    .map_err(|err| err.to_string()),
+                Err(err) => Err(format!("no broker client: {err}")),
             }
-            Err(err) => eprintln!("nisse-engine: kill: open orders were NOT cancelled: {err}"),
         },
-        Err(err) => eprintln!("nisse-engine: kill: no broker client: {err}"),
+        tokio::time::timeout(commands::KILL_STORE_TIMEOUT, connect_store()),
+    );
+    match &first_cancel {
+        Ok(()) => println!("kill: cancel of every open order sent"),
+        Err(err) => eprintln!("nisse-engine: kill: open orders were NOT cancelled: {err}"),
     }
-
-    let store = match tokio::time::timeout(commands::KILL_STORE_TIMEOUT, connect_store()).await {
+    let store = match store {
         Ok(Ok(store)) => store,
         Ok(Err(err)) => {
             eprintln!("nisse-engine: kill: the switch was NOT recorded: {err}");
@@ -161,7 +165,7 @@ async fn run_kill(by: &str) -> ExitCode {
         } else {
             "NOT recorded"
         },
-        if outcome.orders_cancelled || (first_cancel && trading.is_err()) {
+        if outcome.orders_cancelled {
             "cancelled"
         } else {
             "NOT cancelled"

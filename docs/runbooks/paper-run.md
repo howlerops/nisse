@@ -27,9 +27,10 @@ runs the engine against Alpaca.
    account held to. For production the file lives outside the checkout; point
    `limits_path` at it.
 6. **Rehearse stopping** once: `docs/runbooks/kill-switch.md`, the out-of-band steps.
-7. **Dry start**: `target/release/nisse-engine status config/engine/paper.json` (reads only,
-   needs no Alpaca keys), then `target/release/nisse-engine tick config/engine/paper.json` by
-   hand during market hours. The first
+7. **Dry start**: `deploy/engine.sh status` (reads only), then `deploy/engine.sh tick` by
+   hand during market hours. `deploy/engine.sh` loads `/etc/nisse/nisse.env` and runs
+   `nisse-engine` with `config/engine/paper.json`, leaving the output on your terminal;
+   running the binary directly from a login shell fails because the variables are not set. The first
    `session-close` downloads the whole bar history.
 8. **Schedule**: `crontab deploy/crontab`. On the first day check `log/tick.log` gets a line
    every two minutes between 13:30 and 21:00 UTC and `log/session.log` gets its lines
@@ -39,7 +40,7 @@ runs the engine against Alpaca.
 
 ## Stopping
 
-`target/release/nisse-engine kill config/engine/paper.json --by <your name>` cancels every
+`deploy/engine.sh kill --by <your name>` cancels every
 open order, engages the kill switch, waits for any engine run in flight to end and cancels
 once more. It prints which of those were done; if any was not, it exits 1: run it again. `release-kill` with the same
 arguments lowers the switch; nothing else does. If the host is unreachable, use the
@@ -54,7 +55,7 @@ outcome line or one error line, and the detail is in the `engine_step`, `risk_ev
 - `log/session.log`: the session-close run ended with every step `done`.
 - `log/tick.log`: no line saying the pass was not reconciled or that foreign orders exist.
 - `log/replay.log`: the replay is clean (exit 0).
-- Alpaca's dashboard: positions and open orders match `nisse-engine status`.
+- Alpaca's dashboard: positions and open orders match `deploy/engine.sh status`.
 
 ## What counts as a break
 
@@ -69,7 +70,7 @@ Write down, with the date, any of:
   bar at the close, which the free `iex` feed can do for a thinly traded fund). The close is
   not made up later; on a month end that skips the monthly rebalance, so say so in the
   write-up and consider the feed decision;
-- a rebalance left owed for more than a day (`nisse-engine status` shows `resize owed: yes`).
+- a rebalance left owed for more than a day (`deploy/engine.sh status` shows `resize owed: yes`).
 
 The exit criterion is two consecutive weeks with none.
 

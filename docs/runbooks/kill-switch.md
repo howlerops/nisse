@@ -21,13 +21,19 @@ row written by a person. Nothing in the engine releases it.
 On the engine host (Phase 6):
 
 ```
-nisse-engine kill config/engine/paper.json --by <your name>
-nisse-engine release-kill config/engine/paper.json --by <your name>
-nisse-engine status config/engine/paper.json
+cd /opt/nisse
+deploy/engine.sh kill --by <your name>
+deploy/engine.sh release-kill --by <your name>
+deploy/engine.sh status
 ```
 
-`kill` asks the broker to cancel every open order, writes the flag, then waits up to a minute
-for any engine run in flight to end and cancels once more. It needs neither the engine's
+`deploy/engine.sh` loads the host's environment file (`/etc/nisse/nisse.env`) and runs
+`nisse-engine` with the output on your terminal. Running the binary directly from a login
+shell does nothing useful: the database URL and the broker keys are not set there.
+
+`kill` asks the broker to cancel every open order and writes the flag at the same time, then
+waits up to a minute for any engine run in flight to end, cancels once more and checks that
+the broker lists no open order. It needs neither the engine's
 state nor its config file to be readable, and the cancel does not wait for the database. It
 prints which of the three were done (orders cancelled, switch recorded, engine idle) and
 exits 1 unless all were: then run it again, or go out of band. Every

@@ -687,3 +687,37 @@ async fn a_step_down_is_acted_on_at_once_even_after_an_attempt_this_hour() {
 
     f.db.drop_db().await.unwrap();
 }
+
+#[tokio::test]
+async fn an_attempt_that_failed_this_hour_is_tried_again() {
+    let f = fixture().await;
+    let sim = broker();
+    let day = date(2025, 12, 15);
+    let close = ManualClock::new(plus_minutes(close_at(day), 10));
+    session_close(&f.config, &f.market, &f.store, f.sink.clone(), &sim, &close)
+        .await
+        .unwrap();
+    owe(&f.store, close.now()).await;
+
+    // An earlier tick of this hour started its attempt and failed part-way.
+    let next = date(2025, 12, 16);
+    f.store
+        .record_step(
+            &format!("tick/{next}T15"),
+            "rebalance",
+            StepStatus::Failed,
+            &json!({"error": "broker timeout"}),
+            at(next, 15),
+        )
+        .await
+        .unwrap();
+
+    let clock = ManualClock::new(plus_minutes(at(next, 15), 2));
+    let outcome = tick(&f.config, &f.market, &f.store, f.sink.clone(), &sim, &clock)
+        .await
+        .unwrap();
+    assert!(outcome.rebalance.is_some(), "{outcome:?}");
+    assert_eq!(owed_status(&f.store).await, Some(StepStatus::Done));
+
+    f.db.drop_db().await.unwrap();
+}
