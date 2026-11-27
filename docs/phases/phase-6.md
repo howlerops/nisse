@@ -73,34 +73,48 @@ one of them.
 
 ## `tick`
 
-1. `restore`.
+1. Take the lock; `restore`.
 2. Reconcile with the broker and record what changed (fills, order states, positions).
    A pass that is not fully reconciled, or that finds orders the engine did not send, is
    logged as an error and the tick ends there (exit code 1): nothing is decided.
 3. Observe the account equity (drawdown state).
-4. If the mode stepped down, or the risk scale is zero and something is still held
-   (`needs_flatten`): rebalance.
-5. Flush the store queue; write a heartbeat.
+4. If the market is open now (the calendar says so; a weekday holiday is not a session) and
+   the mode stepped down, or the risk scale is zero and something is still held
+   (`needs_flatten`): rebalance. With the market closed a tick never decides; the next
+   session-close or the next open tick does.
+5. Flush the store queue; write a heartbeat. A tick that failed writes no heartbeat, so a
+   tick that keeps failing trips the dead-man check.
+
+A decision made by a tick uses the previous session's closing bars. After about noon those
+are older than the 20 hours outcome scoring allows for a base bar (Phase 5), so such a
+decision is scored as `base_too_old`. That is accepted: these are risk exits, not signals.
 
 ## `session-close`
 
-Run key `session-close/<session date>`. Steps, each recorded in `engine_step` as `started`
-then `done` (with a detail) or `failed`:
+The session is the newest one whose close is at or before now. If there is none, or its
+close is more than `MAX_CLOSE_AGE` (6 hours) ago, the command logs that and exits 0 without
+writing anything: the engine never decides off-session, so a close that was missed is not
+made up for the next morning. Working from the close time keeps time zones out of it.
 
-1. `calendar`: fetch the calendar. If today is not a session, or its close has not passed:
-   record `done` with `"skipped": true` and exit 0.
-2. `ingest`: if `<bars_dir>/<date>.parquet` exists, skip; else fetch `history_start..=today`
-   for the universe and the benchmark and write it. A symbol with no bar for today is an
-   error: nothing is decided on a universe with a hole in it.
-3. `restore` (as above, now including today's bars).
-4. `reconcile`, as in `tick` step 2.
-5. `observe`.
-6. `rebalance`: when today is the last session of its month, or the mode stepped down, or
+Run key `session-close/<session date>`. Steps, each recorded in `engine_step` as `started`
+then `done` (with a detail) or `failed` (with the error text):
+
+1. `ingest`: if `<bars_dir>/<date>.parquet` exists, skip; else fetch `history_start..=date`
+   for the universe and the benchmark and write it. A symbol with no bar for the session is
+   an error: nothing is decided on a universe with a hole in it.
+2. `restore` (as above, now including the session's bars). Not a recorded step.
+3. `reconcile`, as in `tick` step 2.
+4. `observe`.
+5. `rebalance`: when the session is the last of its month, or the mode stepped down, or
    `needs_flatten`. If `engine_step` already has `rebalance` `done` for this run key, it is
    skipped, so a re-run of the command after a completed rebalance sends nothing. A re-run
    after a crash in the middle of a rebalance runs it again: orders already sent count as
-   working (Phase 3), so nothing is ordered twice.
-7. `heartbeat`.
+   working (Phase 3), so nothing is ordered twice. When no rebalance is due the step is
+   recorded `done` with `"due": false`.
+6. Flush; heartbeat.
+
+The calendar is fetched from `history_start` to ten days past today, so "last session of its
+month" is known.
 
 Exit codes: 0 done or nothing to do; 1 a step failed (re-run the command); 2 bad arguments;
 3 another engine holds the lock.
