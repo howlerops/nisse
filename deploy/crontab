@@ -1,0 +1,21 @@
+# nisse engine schedule for the engine host. Install with `crontab deploy/crontab` as the
+# user that owns /opt/nisse. Times are the exchange's: cron is told the zone explicitly.
+# The environment (DATABASE_URL, the Alpaca paper keys, the holdout salt) comes from
+# /etc/nisse/nisse.env, which is readable by that user only and is never in this repository.
+CRON_TZ=America/New_York
+SHELL=/bin/bash
+NISSE=/opt/nisse
+RUN=set -a; . /etc/nisse/nisse.env; set +a; cd /opt/nisse &&
+
+# While the market is open: reconcile, watch the drawdown, write a heartbeat.
+35-59/5 9 * * 1-5   $RUN bin/nisse-engine tick config/engine/paper.json >> log/tick.log 2>&1
+*/5 10-15 * * 1-5   $RUN bin/nisse-engine tick config/engine/paper.json >> log/tick.log 2>&1
+
+# After the close: ingest today's bars, reconcile, rebalance on a month end. The second run is
+# a no-op when the first finished; it is there for the evening the first one failed.
+10 16 * * 1-5       $RUN bin/nisse-engine session-close config/engine/paper.json >> log/session.log 2>&1
+40 16 * * 1-5       $RUN bin/nisse-engine session-close config/engine/paper.json >> log/session.log 2>&1
+
+# Nightly jobs: score decisions, then replay every decision this build made.
+0 18 * * 1-5        $RUN bin/nisse-score config/eval/gates.json data/bars >> log/score.log 2>&1
+30 18 * * 1-5       $RUN scripts/replay.sh >> log/replay.log 2>&1
