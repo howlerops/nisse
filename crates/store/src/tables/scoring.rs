@@ -40,6 +40,9 @@ pub struct DecisionOrders {
     pub all_terminal: bool,
     /// At least one order has a row beyond the intent.
     pub sent: bool,
+    /// The latest `event_ts` among the decision's `order_event` rows and the fills of its
+    /// orders. A decision with no fill uses its order rows.
+    pub last_change: UnixNanos,
 }
 
 /// One backtest trial with a stored result.
@@ -54,9 +57,11 @@ pub struct TrialWithResult {
     pub ts: UnixNanos,
 }
 
-/// Every fill, in `fill.id` order, with its order's decision, symbol and side (from the
-/// order's first `order_event` row by id). A fill whose order has no `order_event` row is a
-/// [`StoreError::Data`]: a fill that cannot be attributed to a decision is never skipped.
+/// Every fill, in event time order (`fill.event_ts`), ties broken by `fill.id`, so a fill
+/// stored late (a backfill) sits at its true place in the sequence. Each fill carries its
+/// order's decision, symbol and side (from the order's first `order_event` row by id). A fill
+/// whose order has no `order_event` row is a [`StoreError::Data`]: a fill that cannot be
+/// attributed to a decision is never skipped.
 ///
 /// One statement; the lateral lookup uses `order_event_client_order_id_event_ts_idx`.
 pub async fn fills<C: GenericClient>(client: &C) -> Result<Vec<DecisionFill>, StoreError> {
@@ -69,7 +74,7 @@ pub async fn fills<C: GenericClient>(client: &C) -> Result<Vec<DecisionFill>, St
                  SELECT decision_id, symbol, side FROM order_event \
                  WHERE client_order_id = f.client_order_id ORDER BY id LIMIT 1 \
              ) o ON true \
-             ORDER BY f.id",
+             ORDER BY f.event_ts, f.id",
             &[],
         )
         .await?;
@@ -101,9 +106,10 @@ pub async fn fills<C: GenericClient>(client: &C) -> Result<Vec<DecisionFill>, St
 
 /// One entry per decision that has at least one `order_event` row, in decision id order.
 /// The order-level figures come from each order's first row (`ordered_qty`, symbol, side) and
-/// newest row (`all_terminal`); `sent` is true when any row is beyond the intent.
+/// newest row (`all_terminal`); `sent` is true when any row is beyond the intent. `last_change`
+/// is the latest `event_ts` of the decision's order rows and of the fills of its orders.
 ///
-/// One statement; each CTE scans `order_event` once.
+/// One statement; each CTE scans `order_event` (or `fill`) once.
 pub async fn decision_orders<C: GenericClient>(
     client: &C,
 ) -> Result<Vec<DecisionOrders>, StoreError> {
@@ -120,16 +126,25 @@ pub async fn decision_orders<C: GenericClient>(
              ), beyond_intent AS ( \
                  SELECT client_order_id, bool_or(state <> 'intent') AS sent \
                  FROM order_event GROUP BY client_order_id \
+             ), changes AS ( \
+                 SELECT decision_id, max(ts) AS last_change FROM ( \
+                     SELECT decision_id, event_ts AS ts FROM order_event \
+                     UNION ALL \
+                     SELECT r.decision_id, x.event_ts AS ts \
+                     FROM fill x JOIN first_rows r USING (client_order_id) \
+                 ) t GROUP BY decision_id \
              ) \
              SELECT f.decision_id, \
                     (array_agg(f.symbol ORDER BY f.id))[1] AS symbol, \
                     (array_agg(f.side ORDER BY f.id))[1] AS side, \
                     sum(f.qty)::numeric AS ordered_qty, \
                     bool_and(n.state = ANY($1)) AS all_terminal, \
-                    bool_or(b.sent) AS sent \
+                    bool_or(b.sent) AS sent, \
+                    max(c.last_change) AS last_change \
              FROM first_rows f \
              JOIN newest n USING (client_order_id) \
              JOIN beyond_intent b USING (client_order_id) \
+             JOIN changes c USING (decision_id) \
              GROUP BY f.decision_id \
              ORDER BY f.decision_id",
             &[&terminal],
@@ -141,6 +156,7 @@ pub async fn decision_orders<C: GenericClient>(
         let symbol: String = row.try_get("symbol")?;
         let side: String = row.try_get("side")?;
         let decision_id: i64 = row.try_get("decision_id")?;
+        let last_change: DateTime<Utc> = row.try_get("last_change")?;
         out.push(DecisionOrders {
             decision_id: DecisionId(decision_id),
             symbol: parse_symbol(&symbol)?,
@@ -148,6 +164,7 @@ pub async fn decision_orders<C: GenericClient>(
             ordered_qty: row.try_get("ordered_qty")?,
             all_terminal: row.try_get("all_terminal")?,
             sent: row.try_get("sent")?,
+            last_change: from_ts(last_change)?,
         });
     }
     Ok(out)
@@ -279,9 +296,14 @@ pub async fn replay_failures<C: GenericClient>(
     Ok((row.try_get("failed")?, row.try_get("scored")?))
 }
 
+/// The number of distinct rules the risk gate checks every order against. Equal to the length of
+/// `nisse_risk::rule::ALL`; written here because this crate does not depend on the risk crate.
+const GATE_RULE_COUNT: i64 = 8;
+
 /// Orders of `version`'s decisions that went beyond the intent (have a row whose state is not
-/// `intent`) although one of the decision's `risk_check` rows has `passed = false`. Counted
-/// once per `client_order_id`.
+/// `intent`) and are a breach: either one of the decision's `risk_check` rows has
+/// `passed = false`, or the decision has fewer than [`GATE_RULE_COUNT`] distinct `rule` values
+/// (an order sent without the gate's full set of checks). Counted once per `client_order_id`.
 ///
 /// One statement.
 pub async fn risk_breaches<C: GenericClient>(
@@ -295,11 +317,17 @@ pub async fn risk_breaches<C: GenericClient>(
              JOIN decision d ON d.id = o.decision_id \
              WHERE d.strategy_version_id = $1 \
                AND o.state <> 'intent' \
-               AND EXISTS ( \
-                   SELECT 1 FROM risk_check r \
-                   WHERE r.decision_id = o.decision_id AND NOT r.passed \
+               AND ( \
+                   EXISTS ( \
+                       SELECT 1 FROM risk_check r \
+                       WHERE r.decision_id = o.decision_id AND NOT r.passed \
+                   ) \
+                   OR ( \
+                       SELECT count(DISTINCT r.rule) FROM risk_check r \
+                       WHERE r.decision_id = o.decision_id \
+                   ) < $2 \
                )",
-            &[&version.0],
+            &[&version.0, &GATE_RULE_COUNT],
         )
         .await?;
     Ok(row.try_get(0)?)

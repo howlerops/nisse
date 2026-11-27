@@ -37,21 +37,28 @@ const METRIC_MFE_R: &str = "mfe_r";
 const METRIC_MAE_R: &str = "mae_r";
 const METRIC_CAPTURE: &str = "capture";
 
+/// How long after a decision's last order row or fill its execution is scored: three days. A
+/// terminal order state can still be overturned by reconciliation inside the never-arrived
+/// recheck window, so the score waits that long.
+pub const SETTLE_NANOS: u64 = 3 * 86_400 * 1_000_000_000;
+
 /// What one run did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ExecutionReport {
     /// Decisions that got their execution scores in this run. Includes the decisions counted in
     /// `no_arrival`.
     pub decisions_scored: u64,
-    /// Decisions with orders still open, left for a later run.
+    /// Decisions with orders still open, or terminal but not yet settled (see
+    /// [`SETTLE_NANOS`]), left for a later run.
     pub waiting: u64,
     /// Decisions skipped because they have no arrival price. They are still scored (see
     /// [`score_execution`]), so each is also in `decisions_scored`.
     pub no_arrival: u64,
 }
 
-/// Scores the execution of every decision whose orders were sent and are all terminal, and that
-/// has no `missed_fill_ratio` score yet (that metric is the marker: it is always written). Writes
+/// Scores the execution of every decision whose orders were sent, are all terminal and have
+/// settled ([`SETTLE_NANOS`] after the decision's last order row or fill), and that has no
+/// `missed_fill_ratio` score yet (that metric is the marker: it is always written). Writes
 /// `missed_fill_ratio` and, when they can be computed, `shortfall_bps` and `fees_bps`
 /// (`subject_type` decision, `eval_version` [`EVAL_VERSION`]), all in one `insert_many`.
 ///
@@ -61,6 +68,8 @@ pub struct ExecutionReport {
 /// arithmetic overflowed) writes nothing and is retried by a later run.
 ///
 /// Decisions whose orders have not been sent (only an intent row) are ignored and not counted.
+/// A decision whose last change is less than [`SETTLE_NANOS`] before `now` (or after it) is
+/// counted in `waiting` and not scored.
 pub async fn score_execution<C: GenericClient>(
     client: &C,
     now: UnixNanos,
@@ -81,7 +90,8 @@ pub async fn score_execution<C: GenericClient>(
         if !order.sent {
             continue;
         }
-        if !order.all_terminal {
+        let settled = now.as_u64().saturating_sub(order.last_change.as_u64()) >= SETTLE_NANOS;
+        if !order.all_terminal || !settled {
             report.waiting += 1;
             continue;
         }
@@ -193,9 +203,9 @@ struct Candidate {
 /// figure (or no `ordered_qty`) has no R unit: it is skipped, counted nowhere and not marked,
 /// so it is looked at again on a later run.
 ///
-/// The closes used for the excursions are the symbol's daily bars from the entry's bar through
-/// the exit's bar (the last bar at or before the entry, when the entry is not itself a bar
-/// time). Bars are read once, for every symbol that needs them.
+/// The closes used for the excursions are the symbol's daily bars from the first bar at or after
+/// the entry through the exit's bar. A bar before the entry is not used: its close is from
+/// before the position existed. Bars are read once, for every symbol that needs them.
 pub async fn score_exits<C: GenericClient>(
     client: &C,
     bars: &BarReader,
@@ -420,19 +430,16 @@ fn scaled_risk(entry_risk: Decimal, bought: Decimal, ordered_qty: Decimal) -> Op
     entry_risk.checked_mul(bought)?.checked_div(ordered_qty)
 }
 
-/// Appends to `out` the closes of one symbol's bars (`bars`, in time order) from the entry's
-/// bar through the exit's bar: the bars with `entry <= ts <= exit`, plus the last bar at or
-/// before `entry` when `entry` is not itself a bar time.
+/// Appends to `out` the closes of one symbol's bars (`bars`, in time order) with
+/// `entry <= ts <= exit`: from the first bar at or after the entry through the exit's bar.
+/// Nothing is appended when no bar falls in that range.
 fn closes_between(
     bars: &[(UnixNanos, Decimal)],
     entry: UnixNanos,
     exit: UnixNanos,
     out: &mut Vec<Decimal>,
 ) {
-    let lo = bars.partition_point(|(ts, _)| *ts < entry);
-    let at_entry = bars.get(lo).is_some_and(|(ts, _)| *ts == entry);
-    // When `entry` is not a bar time, the bar before `lo` (if any) is the last one at or before it.
-    let first = if at_entry { lo } else { lo.saturating_sub(1) };
+    let first = bars.partition_point(|(ts, _)| *ts < entry);
     let end = bars.partition_point(|(ts, _)| *ts <= exit);
     if let Some(window) = bars.get(first..end) {
         out.extend(window.iter().map(|(_, close)| *close));
@@ -452,7 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn closes_include_the_last_bar_before_an_off_bar_entry() {
+    fn closes_start_at_the_first_bar_after_an_off_bar_entry() {
         let bars = [
             (t(10), d("1")),
             (t(20), d("2")),
@@ -461,7 +468,7 @@ mod tests {
         ];
         let mut out = Vec::new();
         closes_between(&bars, t(25), t(40), &mut out);
-        assert_eq!(out, vec![d("2"), d("3"), d("4")]);
+        assert_eq!(out, vec![d("3"), d("4")]);
     }
 
     #[test]
@@ -482,13 +489,22 @@ mod tests {
 
     #[test]
     fn closes_are_empty_when_no_bar_falls_in_range() {
+        // The first bar at or after the entry (20) is past the exit (15).
         let bars = [(t(10), d("1")), (t(20), d("2"))];
         let mut out = Vec::new();
         closes_between(&bars, t(12), t(15), &mut out);
-        assert_eq!(out, vec![d("1")]);
+        assert!(out.is_empty());
         let mut none = Vec::new();
         closes_between(&[], t(12), t(15), &mut none);
         assert!(none.is_empty());
+    }
+
+    #[test]
+    fn closes_exclude_a_bar_before_the_entry_even_when_it_is_the_only_one() {
+        let bars = [(t(10), d("1")), (t(20), d("2"))];
+        let mut out = Vec::new();
+        closes_between(&bars, t(15), t(20), &mut out);
+        assert_eq!(out, vec![d("2")]);
     }
 
     #[test]
