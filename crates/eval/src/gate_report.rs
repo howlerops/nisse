@@ -37,6 +37,10 @@ const GATE_RULES: i64 = nisse_risk::rule::ALL.len() as i64;
 /// The fewest holdout sessions a holdout run may be judged on.
 pub const MIN_HOLDOUT_SESSIONS: u64 = 60;
 
+/// The fewest active sessions (after the flat warm-up) the holdout baseline may have. A short
+/// baseline has a noisy Sharpe ratio, so a threshold drawn from it would be arbitrary.
+pub const MIN_BASELINE_SESSIONS: usize = 252;
+
 /// The verdict on one gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateStatus {
@@ -414,15 +418,10 @@ fn judged_holdout_run(inputs: &ReportInputs) -> Option<&TrialSeries> {
         .min_by_key(|t| t.trial_id)
 }
 
-/// The holdout baseline of `run` for `candidate`: the newest usable ordinary run of the version
-/// registered before `run`, with the same inputs as `run` and the same experiment as the
-/// candidate (data snapshot, requested range, costs and symbols). The candidate itself
-/// qualifies when it was registered before `run`.
-fn holdout_baseline<'a>(
-    inputs: &'a ReportInputs,
-    candidate: &TrialSeries,
-    run: &TrialSeries,
-) -> Option<&'a TrialSeries> {
+/// The holdout baseline of `run`: the newest usable ordinary run of the version registered before
+/// `run`, with the same costs and symbols as `run`. It depends only on what existed when the look
+/// was made, so nothing registered later can change it.
+fn holdout_baseline<'a>(inputs: &'a ReportInputs, run: &TrialSeries) -> Option<&'a TrialSeries> {
     inputs
         .trials
         .iter()
@@ -432,7 +431,6 @@ fn holdout_baseline<'a>(
                 && t.trial_id < run.trial_id
                 && t.usable(&inputs.gates).is_ok()
                 && same_inputs(t, run)
-                && same_experiment(t, candidate)
         })
         .max_by_key(|t| t.trial_id)
 }
@@ -777,15 +775,39 @@ fn holdout_gate(inputs: &ReportInputs) -> GateResult {
         Ok(tail) => tail,
         Err(note) => return undecided(NAME, None, None, &note),
     };
-    // (h) and (i): the threshold comes from the baseline, not the candidate.
-    let Some(baseline) = holdout_baseline(inputs, candidate, run) else {
+    // (h) and (i): the threshold comes from the baseline, which the look fixed.
+    let Some(baseline) = holdout_baseline(inputs, run) else {
         return undecided(
             NAME,
             None,
             None,
-            "no usable ordinary run before the first holdout look matches the candidate's data, costs and symbols",
+            "no usable ordinary run before the first holdout look has its costs and symbols",
         );
     };
+    if !same_experiment(candidate, baseline) {
+        return undecided(
+            NAME,
+            None,
+            None,
+            "the holdout look tested another experiment than the candidate (the last ordinary run before the look)",
+        );
+    }
+    // (j): a short baseline has a noisy Sharpe ratio, so it cannot set a threshold.
+    let active_sessions = baseline
+        .returns
+        .as_deref()
+        .map_or(0, |returns| active_returns(returns).len());
+    if active_sessions < MIN_BASELINE_SESSIONS {
+        return undecided(
+            NAME,
+            None,
+            None,
+            &format!(
+                "the holdout baseline has fewer than {MIN_BASELINE_SESSIONS} sessions after its warm-up"
+            ),
+        );
+    }
+    // (k) and (l): a zero or negative threshold would pass anything.
     let Some(baseline_sharpe) = baseline_active_sharpe(baseline, ppy) else {
         return undecided(
             NAME,
@@ -794,7 +816,6 @@ fn holdout_gate(inputs: &ReportInputs) -> GateResult {
             "the holdout baseline's active Sharpe ratio is undefined",
         );
     };
-    // A zero or negative threshold would pass anything: nothing to hold the holdout up to.
     if baseline_sharpe <= 0.0 {
         return undecided(
             NAME,
@@ -803,8 +824,8 @@ fn holdout_gate(inputs: &ReportInputs) -> GateResult {
             "the holdout baseline's Sharpe is not positive, so there is nothing for the holdout to hold up",
         );
     }
-    let threshold = ((1.0 - gates.sharpe_haircut) * baseline_sharpe).max(0.0);
-    // (j) and (k).
+    let threshold = (1.0 - gates.sharpe_haircut) * baseline_sharpe;
+    // (m): the holdout sessions have a Sharpe ratio.
     let Some(value) = moments::sharpe(tail).map(|s| moments::annualise(s, ppy)) else {
         return undecided(
             NAME,
@@ -813,6 +834,7 @@ fn holdout_gate(inputs: &ReportInputs) -> GateResult {
             "the holdout sessions have no Sharpe ratio",
         );
     };
+    // (n).
     judged(
         NAME,
         value >= threshold,
@@ -940,10 +962,7 @@ fn info(inputs: &ReportInputs, candidate: Option<&TrialSeries>) -> Value {
     let sortino_interval =
         returns.and_then(|r| bootstrap::interval(r, annualised(moments::sortino, ppy), &config));
     let expectancy_interval = returns.and_then(|r| bootstrap::interval(r, moments::mean, &config));
-    let run = judged_holdout_run(inputs);
-    let baseline = candidate
-        .zip(run)
-        .and_then(|(candidate, run)| holdout_baseline(inputs, candidate, run));
+    let baseline = judged_holdout_run(inputs).and_then(|run| holdout_baseline(inputs, run));
     json!({
         "summary": candidate.map_or(Value::Null, |t| t.summary.clone()),
         "sharpe": finite(sharpe),
