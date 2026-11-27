@@ -17,5 +17,6 @@
   "bars_dir": "data/bars",
   "limits_path": "config/limits/limits.json",
   "seed": 0,
-  "source": "engine"
+  "source": "engine",
+  "signature": {"manifest": "research/signed/trend-v1.manifest.json", "required": false}
 }
