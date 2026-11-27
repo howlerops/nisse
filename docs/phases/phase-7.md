@@ -52,8 +52,10 @@ the base checkout and the head checkout as directories.
 
 A pull request from a fork, or from a branch named `research/...`, is an **agent pull
 request** (`--agent`): it must change research files and nothing else, and all the rules
-below apply. Any other pull request is checked only if it touches `research/`; if it does
-not, nothing is checked and the workflow says so.
+below apply. Any other pull request is a person's own: rules 1 and 2 do not bind it (it may
+change code beside research files, and reorganise them), but if it touches `research/` it
+is held to rules 3 to 5, so the change budget applies to people too. If it touches nothing
+under `research/`, nothing is checked and the workflow says so.
 
 1. Every changed path is a plain path (letters, digits, `.`, `_`, `-`, `/`; no `..`) under
    `research/configs/`, `research/notes/` or `research/labels/`. (An agent PR that also edits

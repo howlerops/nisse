@@ -486,21 +486,31 @@ pub fn check_proposal(
         failures.push("an agent pull request must change research files".to_owned());
     }
 
-    // Rules 1 and 2: where the changes are, and that nothing is removed, renamed or copied.
+    // Rules 1 and 2 bind an agent's pull request: where its changes are, and that nothing is
+    // removed, renamed or copied. A person's own pull request (not `agent`) may change code
+    // beside research files and may reorganise them; it is still held to rules 3 to 5, and
+    // a research path that is not plain is refused for everyone (it is never opened).
     for change in changes {
         for path in paths_of(change) {
+            let in_research = path == RESEARCH_DIR || path.starts_with("research/");
             if !is_plain_path(path) {
-                failures.push(format!(
-                    "changed path {path:?} is not a plain path: only A-Z a-z 0-9 . _ - and / are allowed, with no leading '/' and no empty, '.' or '..' component"
-                ));
-            } else if ![CONFIG_DIR, NOTES_DIR, LABELS_DIR]
-                .iter()
-                .any(|dir| under(dir, path))
+                if agent || in_research {
+                    failures.push(format!(
+                        "changed path {path:?} is not a plain path: only A-Z a-z 0-9 . _ - and / are allowed, with no leading '/' and no empty, '.' or '..' component"
+                    ));
+                }
+            } else if agent
+                && ![CONFIG_DIR, NOTES_DIR, LABELS_DIR]
+                    .iter()
+                    .any(|dir| under(dir, path))
             {
                 failures.push(format!(
                     "changed path {path:?} is outside research/configs, research/notes and research/labels"
                 ));
             }
+        }
+        if !agent {
+            continue;
         }
         let touches = paths_of(change)
             .into_iter()

@@ -128,12 +128,12 @@ fn added_config(name: &str) -> Vec<Change> {
 
 /// Runs the check with `base` and `head` as the two trees, for a pull request by a person.
 fn run(changes: &[Change], base: &Tree, head: &Tree) -> Vec<String> {
-    check_proposal(changes, false, base.path(), head.path(), today())
+    check_proposal(changes, true, base.path(), head.path(), today())
 }
 
-/// Runs the check as an agent pull request.
-fn run_agent(changes: &[Change], base: &Tree, head: &Tree) -> Vec<String> {
-    check_proposal(changes, true, base.path(), head.path(), today())
+/// Runs the check as a person's own pull request (not an agent's): rules 1 and 2 do not bind.
+fn run_person(changes: &[Change], base: &Tree, head: &Tree) -> Vec<String> {
+    check_proposal(changes, false, base.path(), head.path(), today())
 }
 
 /// Two trees that start with the same base contents: `base_configs` written to both.
@@ -489,7 +489,7 @@ fn parse_changes_keeps_odd_paths_as_written() {
 fn a_change_outside_research_passes_untouched() {
     let (base, head) = trees(&[]);
     let changes = vec![modified("crates/x.rs")];
-    assert!(run(&changes, &base, &head).is_empty());
+    assert!(run_person(&changes, &base, &head).is_empty());
 }
 
 #[test]
@@ -526,7 +526,13 @@ fn outside_paths_in_a_research_pr_fail_and_are_named() {
 fn deleting_a_note_fails() {
     let (base, head) = trees(&[config("trend-v1", "trend", day(0), Value::Null)]);
     let changes = vec![Change::Deleted("research/notes/trend-v1.md".into())];
-    assert_eq!(run(&changes, &base, &head).len(), 1);
+    let failures = run(&changes, &base, &head);
+    assert!(
+        failures.iter().any(|f| f.contains("is deleted")),
+        "{failures:?}"
+    );
+    // A person may reorganise research files; only an agent may not.
+    assert_eq!(run_person(&changes, &base, &head), Vec::<String>::new());
 }
 
 #[test]
@@ -758,8 +764,8 @@ fn a_path_that_is_not_plain_fails_under_rule_1_in_both_modes() {
     }
     // A leading slash is not under research/, so only an agent pull request reaches rule 1 for it.
     let changes = vec![added("/research/configs/x.json")];
-    assert_eq!(run(&changes, &base, &head), Vec::<String>::new());
-    let failures = run_agent(&changes, &base, &head);
+    assert_eq!(run_person(&changes, &base, &head), Vec::<String>::new());
+    let failures = run(&changes, &base, &head);
     assert!(
         failures.iter().any(|f| f.contains("is not a plain path")),
         "{failures:?}"
@@ -820,8 +826,8 @@ fn an_agent_pull_request_must_change_research_files() {
 
     // Only limits changed: a person's pull request passes, an agent's fails.
     let limits = vec![modified("config/limits/limits.json")];
-    assert_eq!(run(&limits, &base, &head), Vec::<String>::new());
-    let failures = run_agent(&limits, &base, &head);
+    assert_eq!(run_person(&limits, &base, &head), Vec::<String>::new());
+    let failures = run(&limits, &base, &head);
     assert!(
         failures
             .iter()
@@ -831,7 +837,7 @@ fn an_agent_pull_request_must_change_research_files() {
 
     // Only a workflow changed: fails for an agent, rule 1 names it.
     let workflow = vec![modified(".github/workflows/sign.yml")];
-    let failures = run_agent(&workflow, &base, &head);
+    let failures = run(&workflow, &base, &head);
     assert!(
         failures
             .iter()
@@ -840,8 +846,8 @@ fn an_agent_pull_request_must_change_research_files() {
     );
 
     // An empty change list fails for an agent only.
-    assert_eq!(run(&[], &base, &head), Vec::<String>::new());
-    let failures = run_agent(&[], &base, &head);
+    assert_eq!(run_person(&[], &base, &head), Vec::<String>::new());
+    let failures = run(&[], &base, &head);
     assert!(
         failures
             .iter()
@@ -856,7 +862,7 @@ fn a_valid_first_config_passes_in_both_modes() {
     head.put(&config("trend-v1", "trend", today(), Value::Null));
     let changes = added_config("trend-v1");
     assert_eq!(run(&changes, &base, &head), Vec::<String>::new());
-    assert_eq!(run_agent(&changes, &base, &head), Vec::<String>::new());
+    assert_eq!(run(&changes, &base, &head), Vec::<String>::new());
 }
 
 // ---- the budget by strategy kind -------------------------------------------------------------
@@ -1030,4 +1036,25 @@ fn budget_conflicts_refuses_a_symlinked_config() {
     tree.put(&config("trend-a", "trend", day(0), Value::Null));
     tree.link("research/configs/link.json", "trend-a.json");
     assert!(budget_conflicts(tree.path(), "trend-a").is_err());
+}
+
+#[test]
+fn a_persons_pull_request_may_change_code_beside_a_config_but_keeps_the_budget() {
+    // Code and a first config together: fine for a person, refused for an agent.
+    let (base, head) = trees(&[]);
+    head.put(&config("trend-v1", "trend", today(), Value::Null));
+    let mut changes = added_config("trend-v1");
+    changes.push(modified("crates/eval/src/proposal.rs"));
+    changes.push(modified("research/agents/overnight.md"));
+    assert_eq!(run_person(&changes, &base, &head), Vec::<String>::new());
+    assert!(!run(&changes, &base, &head).is_empty());
+
+    // The budget and the one-config rule bind a person too.
+    let (base, head) = trees(&[config("trend-v1", "trend", day(0), Value::Null)]);
+    head.put(&config("trend-v2", "trend", day(5), json!("trend-v1")));
+    let failures = run_person(&added_config("trend-v2"), &base, &head);
+    assert!(
+        failures.iter().any(|f| f.contains("less than 30 days")),
+        "{failures:?}"
+    );
 }

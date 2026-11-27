@@ -8,7 +8,8 @@
 #
 # A pull request from a fork, or from a branch named research/..., is an agent pull request:
 # it may change research files and nothing else, and it fails if it changes anything else or
-# nothing at all. Any other pull request is checked only if it touches research/.
+# nothing at all. Any other pull request is a person's own: it is checked only if it touches
+# research/, and then for the config rules and the change budget, not for what else it changes.
 #
 # Actions are pinned by commit SHA. Changes under .github/ are a sensitive path (see CLAUDE.md).
 name: Research proposal
