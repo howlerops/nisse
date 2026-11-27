@@ -39,7 +39,6 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     env:
-      BASE_SHA: ${{ github.event.pull_request.base.sha }}
       HEAD_SHA: ${{ github.event.pull_request.head.sha }}
       # Compared as strings in the shell; never interpolated into a command.
       HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
@@ -50,7 +49,9 @@ jobs:
       - name: "Check out the base (trusted, the checker is built from it)"
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          # The tip of main as it is now, not as it was when the pull request was opened:
+          # re-running this job re-judges the pull request against today's main.
+          ref: refs/heads/main
           path: base
           fetch-depth: 0
           persist-credentials: false
@@ -65,7 +66,10 @@ jobs:
 
       - name: Build the merge result and list what it changes
         id: changes
+        shell: bash
         run: |
+          BASE_SHA="$(git -C base rev-parse HEAD)"
+          echo "Judging against main at $BASE_SHA"
           # What is judged is what merging would do to the base, not how the pull request's
           # branch differs from some ancestor: a branch built on old history can undo newer
           # commits without that showing in a diff from a merge base.
@@ -106,21 +110,24 @@ jobs:
             fi
             if [[ "$agent" == true && "$status" != D && "$new_mode" != 100644 ]]; then
               bad_mode=true
-              printf 'not an ordinary file (mode %s): ' "$new_mode"
-              printf '%s' "$path" | cat -v
-              echo
+              printf 'not an ordinary file (mode %s): %q\n' "$new_mode" "$path"
             fi
+            # File names are untrusted text: %q prints them shell-quoted on one line, so a
+            # name cannot start a line of its own in this log.
+            printf '%s %q\n' "$status" "$path"
           done < raw.bin
-          # File names are untrusted text: shown with control characters made visible.
-          tr '\0' '\n' < changes.bin | cat -v
           if [[ "$bad_mode" == true ]]; then
             echo "::error::An agent pull request may add or change ordinary files only."
             exit 1
           fi
 
-          # The merge result as plain files, for the checker to read (never to run).
+          # The merge result as plain files, for the checker to read (never to run). Written
+          # with checkout-index from a scratch index, not `git archive`: an archive obeys
+          # export-ignore attributes in the tree, which would let a tree hide files from
+          # its own judge.
           mkdir merged
-          git -C base archive "$tree" | tar -x -C merged
+          GIT_INDEX_FILE="$PWD/merged.index" git -C base read-tree "$tree"
+          GIT_INDEX_FILE="$PWD/merged.index" git -C base checkout-index --all --prefix="$PWD/merged/"
 
           echo "agent=$agent" >> "$GITHUB_OUTPUT"
           if [[ "$agent" == true || "$research" == true ]]; then

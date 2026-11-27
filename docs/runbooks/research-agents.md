@@ -82,6 +82,9 @@ Treat it as untrusted input. Before merging:
   `scripts/evaluate-proposal.sh /tmp/<name>.json` from a clean checkout of `main` (the
   script refuses anything else). It registers a trial; the count never resets. Read the
   gate report.
+- Just before merging, re-run the "Research proposal" job (it judges against `main` as it is
+  now; an old green result does not account for anything merged since, or for the proposal's
+  date having gone stale).
 - A person merges. Paper or recent live results are never a reason to merge.
 
 ## Turning it off

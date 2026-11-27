@@ -50,7 +50,9 @@ Run by the "Research proposal" workflow, for pull requests into `main` only. The
 first computes **the result of merging the pull request into the base** (`git merge-tree`;
 a conflict fails) and judges that: the changed paths are the difference between the base and
 the merged tree, NUL-separated so that no file name can disguise a path, and the checker
-reads the merged tree. (A branch's own diff from a merge base can hide that the branch
+reads the merged tree, written out file by file (not as a `git archive`, which obeys
+`export-ignore` attributes inside the tree and so could hide a file from its judge). The
+base is the tip of `main` at the time the job runs. (A branch's own diff from a merge base can hide that the branch
 undoes newer commits.) For an agent pull request the workflow also requires every added or
 changed entry to be an ordinary file (mode 100644): no symbolic link, executable or
 submodule anywhere.
@@ -77,10 +79,14 @@ under `research/`, nothing is checked and the workflow says so.
    30 days; a `parent` names a config that exists at the base in the same family; a modified
    config keeps its `name` and `family`.
 
-Two proposals opened on the same day can each pass against the same base. So the signer
-checks the budget again over the configs on `main` and refuses a config dated fewer than
-30 days after another of its family or kind (the later of a pair; the earlier one stays
-signable).
+A green check is a judgement at one moment against `main` as it was then. It is not re-run
+when `main` moves: two proposals can each pass against the same base, and a pull request
+left open keeps its old result. So (a) the reviewer re-runs the check just before merging
+(re-running the job judges against today's `main`; the job prints the commit it judged
+against), and (b) the signer checks the budget again over the configs on `main` and refuses
+a config dated fewer than 30 days after another of its family or kind: the later of a pair,
+so the earlier one stays signable. Two with the same date are both refused until one is
+re-dated by a later change.
 
 Exit 0 pass, 1 fail (each failure on its own line), 2 bad arguments.
 
@@ -100,13 +106,13 @@ The manifest (`research/signed/<name>.manifest.json`):
 The key is at least 32 bytes, given as hex in `NISSE_SIGNING_KEY`; it is never printed.
 
 The engine config gains `"signature": {"manifest": "<path>", "required": true|false}`.
+The check is made by `tick` and `session-close` themselves, not only by the binary. A
+refusal stops the command before it reconciles: see the runbook for what that means for
+positions already held; whether an unsigned engine should still reconcile and reduce is the
+owner's call.
+
 Before `tick` or `session-close` does anything, the engine computes the deployment hash of
 its own config and
-
-(The check is made by `tick` and `session-close` themselves, not only by the binary. A
-refusal stops the command before it reconciles: see the runbook for what that means for
-positions already held, and whether an unsigned engine should still reconcile and reduce is
-the owner's call.)
 
 - with `required: true`: the manifest must exist, its MAC must verify, its hash must equal
   the engine's, and its stage must be `paper`; otherwise the command exits 2 and nothing

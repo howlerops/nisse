@@ -33,8 +33,9 @@ config="$(realpath "$1")"
 cd "$(dirname "$0")/.."
 
 # The code that is about to run next to the store must be main's, unmodified.
-if ! git diff --quiet HEAD --; then
-  echo "evaluate-proposal: this checkout has modified tracked files; run from a clean checkout of main" >&2
+# Untracked files count: cargo would use an untracked build script or .cargo/config.toml.
+if [[ -n "$(git status --porcelain --untracked-files=normal)" ]]; then
+  echo "evaluate-proposal: this checkout has modified or untracked files; run from a clean checkout of main" >&2
   exit 2
 fi
 if ! git merge-base --is-ancestor HEAD origin/main 2>/dev/null; then

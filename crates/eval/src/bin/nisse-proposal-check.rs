@@ -1,6 +1,7 @@
 //! `nisse-proposal-check`: the checks a proposal pull request must pass on `research/`.
 //!
-//! CI runs it on every pull request. The changed paths go on standard input as the output of
+//! The "Research proposal" workflow runs it on pull requests into main, against the result of
+//! merging the pull request. The changed paths go on standard input as the output of
 //! `git diff -z --name-status` (NUL-separated, not the line format); the base and head checkouts
 //! are the two directories. A pull request that changes nothing under `research/` passes
 //! untouched, unless `--agent` is given: a research agent's pull request must change research

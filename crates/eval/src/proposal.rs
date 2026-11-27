@@ -372,8 +372,8 @@ fn under(dir: &str, path: &str) -> bool {
 }
 
 /// Whether `path` is a plain relative path: non-empty, made only of `A-Z a-z 0-9 . _ - /`, not
-/// starting with `/`, and with no empty, `.` or `..` component. Only such a path may be joined
-/// onto a checkout directory.
+/// starting with `/`, and with no empty component and none that starts with a dot (so no `.`,
+/// no `..` and no hidden file). Only such a path may be joined onto a checkout directory.
 #[must_use]
 pub fn is_plain_path(path: &str) -> bool {
     !path.is_empty()
@@ -503,7 +503,7 @@ pub fn check_proposal(
             if !is_plain_path(path) {
                 if agent || in_research {
                     failures.push(format!(
-                        "changed path {path:?} is not a plain path: only A-Z a-z 0-9 . _ - and / are allowed, with no leading '/' and no empty, '.' or '..' component"
+                        "changed path {path:?} is not a plain path: only A-Z a-z 0-9 . _ - and / are allowed, with no leading '/', no empty component and none starting with '.'"
                     ));
                 }
             } else if agent
@@ -641,9 +641,17 @@ fn check_budget_and_parent(
     today: NaiveDate,
     failures: &mut Vec<String>,
 ) {
-    // A config that does not parse was reported by rule 4; there is nothing more to check.
-    let Ok(config) = load_config(head, path) else {
-        return;
+    // The changed config must be there to be judged. If it cannot be read or parsed, that is
+    // a failure here even when rule 4 did not see the file at all (rule 4 lists what is in
+    // the directory; a file that is missing from it would otherwise pass unjudged).
+    let config = match load_config(head, path) {
+        Ok(config) => config,
+        Err(message) => {
+            if !failures.contains(&message) {
+                failures.push(message);
+            }
+            return;
+        }
     };
 
     if config.created > today {

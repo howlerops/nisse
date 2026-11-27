@@ -127,7 +127,7 @@ fn added_config(name: &str) -> Vec<Change> {
     ]
 }
 
-/// Runs the check with `base` and `head` as the two trees, for a pull request by a person.
+/// Runs the check with `base` and `head` as the two trees, for an agent pull request.
 fn run(changes: &[Change], base: &Tree, head: &Tree) -> Vec<String> {
     check_proposal(changes, true, base.path(), head.path(), today())
 }
@@ -1107,4 +1107,26 @@ fn hidden_files_are_not_plain_paths() {
         failures.iter().any(|f| f.contains("is not a plain path")),
         "{failures:?}"
     );
+}
+
+#[test]
+fn a_changed_config_that_is_not_in_the_head_tree_fails() {
+    // The diff says a config was added, but the tree handed to the checker does not have it
+    // (however that came about): it must not pass unjudged.
+    let (base, head) = trees(&[config("trend-v1", "trend", day(0), Value::Null)]);
+    for agent in [false, true] {
+        let failures = check_proposal(
+            &added_config("trend-v3"),
+            agent,
+            base.path(),
+            head.path(),
+            today(),
+        );
+        assert!(
+            failures
+                .iter()
+                .any(|f| f.contains("research/configs/trend-v3.json")),
+            "agent={agent}: {failures:?}"
+        );
+    }
 }
