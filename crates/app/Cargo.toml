@@ -21,6 +21,7 @@ nisse-engine = { workspace = true }
 nisse-risk = { workspace = true }
 nisse-store = { workspace = true }
 rust_decimal = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

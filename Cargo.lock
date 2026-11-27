@@ -1877,6 +1877,7 @@ dependencies = [
  "nisse-risk",
  "nisse-store",
  "rust_decimal",
+ "serde",
  "serde_json",
  "thiserror",
  "tokio",
