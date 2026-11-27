@@ -759,9 +759,10 @@ async fn a_flattening_kill_is_acted_on_within_the_hour_and_then_not_repeated() {
     assert!(entered.orders_submitted > 0, "{entered:?}");
     let decided = count(&f.store, "decision").await;
 
-    // The switch is engaged four minutes later. The next tick cancels the orders working from
-    // the first (the switch was engaged elsewhere), so nothing is held or working afterwards:
-    // there is nothing to flatten and no decision is made, even though the scale is zero.
+    // The switch is engaged four minutes later. The limits flatten on a kill, so the scale is
+    // now zero with orders working: the next tick acts although one has tried this hour. It
+    // does so through the rebalance (which cancels the waiting buys and would send exits),
+    // not through a blanket cancel, which on later runs would cancel the exits as well.
     engage_kill_switch(&f.store, &first, "test").await.unwrap();
     let second = ManualClock::new(plus_minutes(at(next, 15), 6));
     let outcome = tick(
@@ -774,11 +775,10 @@ async fn a_flattening_kill_is_acted_on_within_the_hour_and_then_not_repeated() {
     )
     .await
     .unwrap();
-    assert!(outcome.kill_cancelled, "{outcome:?}");
-    assert!(outcome.rebalance.is_none(), "{outcome:?}");
-    assert!(sim.open_orders().await.unwrap().orders.is_empty());
+    assert!(!outcome.kill_cancelled, "{outcome:?}");
+    assert!(outcome.rebalance.is_some(), "{outcome:?}");
     let after_kill = count(&f.store, "decision").await;
-    assert_eq!(after_kill, decided);
+    assert!(after_kill > decided);
 
     // Same hour, same (zero) scale: whatever is still held, it is not decided again.
     let third = ManualClock::new(plus_minutes(at(next, 15), 8));

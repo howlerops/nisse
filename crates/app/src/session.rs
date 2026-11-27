@@ -442,16 +442,20 @@ fn plus_margin(date: NaiveDate) -> Result<NaiveDate, AppError> {
         .ok_or_else(|| AppError::Market(format!("{date} is out of range")))
 }
 
-/// When the kill switch is engaged and the engine still has orders it believes are open,
-/// asks the broker to cancel everything. The switch may have been engaged by a row written
+/// When the kill switch is engaged, halts trading (the limits do not flatten on a kill) and
+/// the engine still has orders it believes are open, asks the broker to cancel everything. The switch may have been engaged by a row written
 /// from elsewhere (the phone), in which case nothing has cancelled yet. Returns whether a
 /// cancel was sent. A broker failure is returned: the run fails and writes no heartbeat.
 async fn cancel_if_killed<B: Broker, C: Clock>(
     trader: &EngineTrader<'_, B, C>,
 ) -> Result<bool, AppError> {
-    let engaged = trader.risk().state().kill_switch_engaged;
+    let gate = trader.risk();
+    let engaged = gate.state().kill_switch_engaged;
     let open = trader.state().tracker.unresolved_orders().next().is_some();
-    if !(engaged && open) {
+    // With `flatten_on_kill` the switch means "exit": the rebalance that follows cancels the
+    // waiting buys itself and sends the exits, and cancelling everything here on every run
+    // would cancel those exits too. Only a switch that halts (no flatten) cancels everything.
+    if !(engaged && open) || gate.limits().flatten_on_kill {
         return Ok(false);
     }
     trader
