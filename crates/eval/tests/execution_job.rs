@@ -15,7 +15,7 @@ use nisse_core::nautilus::{
     VenueOrderId,
 };
 use nisse_core::{DecisionId, OrderEvent, OrderIntent, OrderState, RiskCheck, StrategyVersionId};
-use nisse_eval::execution_job::{self, EVAL_VERSION, ExecutionReport, ExitReport};
+use nisse_eval::execution_job::{self, EVAL_VERSION, ExecutionReport, ExitReport, SETTLE_NANOS};
 use nisse_store::tables::{order_event, risk_check};
 use nisse_store::testing::ScratchDb;
 use rust_decimal::Decimal;
@@ -771,7 +771,7 @@ async fn two_symbols_on_the_same_days_do_not_mix() {
 }
 
 #[tokio::test]
-async fn an_entry_off_a_bar_time_takes_the_last_bar_before_it() {
+async fn an_entry_off_a_bar_time_starts_at_the_next_bar() {
     let db = ScratchDb::create().await;
     let client = db.client().await.unwrap();
     let v = version(&client).await;
@@ -813,8 +813,334 @@ async fn an_entry_off_a_bar_time_takes_the_last_bar_before_it() {
         .await
         .unwrap();
     let rows = scores(&client).await;
-    // The day-1 bar at 9 is in the window, so the lowest close is 9: MAE = −100 / 50 = −2.
-    assert_close(value(&rows, buy, "mae_r"), -2.0);
+    // The day-1 bar (9) is from before the position existed, so the window is 10 to 12: the
+    // lowest close is 10, MAE = 0; the highest is 12, MFE = 200 / 50 = 4.
+    assert_close(value(&rows, buy, "mae_r"), 0.0);
     assert_close(value(&rows, buy, "mfe_r"), 4.0);
+    db.drop_db().await.unwrap();
+}
+
+const DAY_NANOS: u64 = 86_400 * NANOS_PER_SECOND;
+
+/// `t` moved forward by `nanos`.
+fn after(t: UnixNanos, nanos: u64) -> UnixNanos {
+    UnixNanos::from(t.as_u64() + nanos)
+}
+
+/// One 100-share SPY trip on version `v`: bought at `entry_px` at `entry_at` (risk 50 recorded
+/// for the entry) and sold at `exit_px` at `exit_at`. Returns the entry decision.
+async fn trip(
+    client: &Client,
+    v: StrategyVersionId,
+    entry_at: UnixNanos,
+    entry_px: &str,
+    exit_px: &str,
+    exit_at: UnixNanos,
+) -> DecisionId {
+    let buy = decision(client, v, "SPY", json!({})).await;
+    risk(client, buy, "50").await;
+    filled(
+        client,
+        buy,
+        "SPY",
+        "B-1",
+        OrderSide::Buy,
+        "100",
+        entry_px,
+        entry_at,
+    )
+    .await;
+    filled(
+        client,
+        decision(client, v, "SPY", json!({})).await,
+        "SPY",
+        "S-1",
+        OrderSide::Sell,
+        "100",
+        exit_px,
+        exit_at,
+    )
+    .await;
+    buy
+}
+
+#[tokio::test]
+async fn execution_is_scored_only_once_the_orders_have_settled() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let v = version(&client).await;
+    let d = decision(&client, v, "SPY", json!({"close": "100"})).await;
+    filled(
+        &client,
+        d,
+        "SPY",
+        "O-1",
+        OrderSide::Buy,
+        "100",
+        "100",
+        at(1, 21),
+    )
+    .await;
+    let last = at(1, 21);
+
+    // One day after the last row: terminal, but not settled.
+    let early = execution_job::score_execution(&client, after(last, DAY_NANOS))
+        .await
+        .unwrap();
+    assert_eq!(
+        early,
+        ExecutionReport {
+            decisions_scored: 0,
+            waiting: 1,
+            no_arrival: 0
+        }
+    );
+    assert!(scores(&client).await.is_empty());
+
+    // One nanosecond short of settling: still waiting.
+    let short = execution_job::score_execution(&client, after(last, SETTLE_NANOS - 1))
+        .await
+        .unwrap();
+    assert_eq!(short.waiting, 1);
+    assert!(scores(&client).await.is_empty());
+
+    // Exactly SETTLE_NANOS after the last row: scored.
+    let settled = execution_job::score_execution(&client, after(last, SETTLE_NANOS))
+        .await
+        .unwrap();
+    assert_eq!(
+        settled,
+        ExecutionReport {
+            decisions_scored: 1,
+            waiting: 0,
+            no_arrival: 0
+        }
+    );
+    let rows = scores(&client).await;
+    assert_close(value(&rows, d, "missed_fill_ratio"), 0.0);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_late_fill_restarts_the_settle_clock() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let v = version(&client).await;
+    let d = decision(&client, v, "SPY", json!({"close": "100"})).await;
+    let order = place(&client, d, "SPY", "O-1", OrderSide::Buy, "100", at(1, 21)).await;
+    set_state(&client, &order, OrderState::Accepted, "0", at(1, 21)).await;
+    // The order fills two days later: the last change is the fill, not the accepted row.
+    set_state(&client, &order, OrderState::Filled, "100", at(3, 21)).await;
+    fill(&client, "O-1", "100", "100", "0", at(3, 21)).await;
+
+    // Three days after the accepted row, but one day after the fill: still waiting.
+    let early = execution_job::score_execution(&client, after(at(1, 21), 3 * DAY_NANOS))
+        .await
+        .unwrap();
+    assert_eq!(early.waiting, 1);
+    assert!(scores(&client).await.is_empty());
+
+    let settled = execution_job::score_execution(&client, after(at(3, 21), SETTLE_NANOS))
+        .await
+        .unwrap();
+    assert_eq!(settled.decisions_scored, 1);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_last_change_after_now_waits() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let v = version(&client).await;
+    let d = decision(&client, v, "SPY", json!({"close": "100"})).await;
+    filled(
+        &client,
+        d,
+        "SPY",
+        "O-1",
+        OrderSide::Buy,
+        "100",
+        "100",
+        at(2, 21),
+    )
+    .await;
+
+    // `now` is before the last change: the difference saturates to zero and nothing settles.
+    let report = execution_job::score_execution(&client, at(1, 21))
+        .await
+        .unwrap();
+    assert_eq!(report.waiting, 1);
+    assert_eq!(report.decisions_scored, 0);
+    assert!(scores(&client).await.is_empty());
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_rejection_overturned_by_a_late_fill_is_scored_once_with_the_fill() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let v = version(&client).await;
+    let d = decision(&client, v, "SPY", json!({"close": "100"})).await;
+    let order = place(&client, d, "SPY", "O-1", OrderSide::Buy, "100", at(1, 21)).await;
+    set_state(&client, &order, OrderState::Rejected, "0", at(1, 21)).await;
+
+    // A day after the rejection it is still provisional: nothing is written.
+    let provisional = execution_job::score_execution(&client, after(at(1, 21), DAY_NANOS))
+        .await
+        .unwrap();
+    assert_eq!(
+        provisional,
+        ExecutionReport {
+            decisions_scored: 0,
+            waiting: 1,
+            no_arrival: 0
+        }
+    );
+    assert!(scores(&client).await.is_empty());
+
+    // Reconciliation overturns the rejection a day later: a fill and a filled row.
+    set_state(&client, &order, OrderState::Filled, "100", at(2, 21)).await;
+    fill(&client, "O-1", "100", "100", "0", at(2, 21)).await;
+
+    // Five days after the rejection, the order has settled: scored as filled, not as missed.
+    let late = execution_job::score_execution(&client, after(at(1, 21), 5 * DAY_NANOS))
+        .await
+        .unwrap();
+    assert_eq!(
+        late,
+        ExecutionReport {
+            decisions_scored: 1,
+            waiting: 0,
+            no_arrival: 0
+        }
+    );
+    let rows = scores(&client).await;
+    assert_close(value(&rows, d, "missed_fill_ratio"), 0.0);
+
+    // A later run writes nothing: the decision was scored exactly once.
+    let again = execution_job::score_execution(&client, after(at(1, 21), 6 * DAY_NANOS))
+        .await
+        .unwrap();
+    assert_eq!(again, ExecutionReport::default());
+    let missed = scores(&client)
+        .await
+        .iter()
+        .filter(|(id, m, _)| *id == d.0 && m == "missed_fill_ratio")
+        .count();
+    assert_eq!(missed, 1);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_backfilled_buy_still_closes_the_sell_stored_before_it() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let v = version(&client).await;
+    // The sell is stored first but happened on day 4; the buy is a backfill stored after it.
+    let sell = decision(&client, v, "SPY", json!({})).await;
+    filled(
+        &client,
+        sell,
+        "SPY",
+        "S-1",
+        OrderSide::Sell,
+        "100",
+        "12",
+        close_of(4),
+    )
+    .await;
+    let buy = decision(&client, v, "SPY", json!({})).await;
+    risk(&client, buy, "50").await;
+    filled(
+        &client,
+        buy,
+        "SPY",
+        "B-1",
+        OrderSide::Buy,
+        "100",
+        "10",
+        close_of(1),
+    )
+    .await;
+    let (_dir, reader) = bars_dir(
+        "backfill",
+        &[
+            ("SPY", close_of(1), "10"),
+            ("SPY", close_of(2), "13"),
+            ("SPY", close_of(3), "9"),
+            ("SPY", close_of(4), "12"),
+        ],
+    );
+
+    let report = execution_job::score_exits(&client, &reader, now())
+        .await
+        .unwrap();
+    assert_eq!(
+        report,
+        ExitReport {
+            entries_scored: 1,
+            open: 0,
+            unmatched_sell_qty: Decimal::ZERO
+        }
+    );
+    let rows = scores(&client).await;
+    assert_close(value(&rows, buy, "realized_r"), 4.0);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn excursions_use_the_closes_from_the_entry_fill_on() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let v = version(&client).await;
+    // Bought at 100 at 12:00 on day 2, between the day-1 close (105, from before the position
+    // existed) and the day-2 close (101).
+    let buy = trip(&client, v, at(2, 12), "100", "102", close_of(4)).await;
+    let (_dir, reader) = bars_dir(
+        "excursions",
+        &[
+            ("SPY", close_of(1), "105"),
+            ("SPY", close_of(2), "101"),
+            ("SPY", close_of(3), "103"),
+            ("SPY", close_of(4), "102"),
+        ],
+    );
+
+    execution_job::score_exits(&client, &reader, now())
+        .await
+        .unwrap();
+    let rows = scores(&client).await;
+    assert_close(value(&rows, buy, "realized_r"), 4.0);
+    // Closes 101, 103, 102 (not 105): the highest is 103, MFE = 3 × 100 / 50 = 6.
+    assert_close(value(&rows, buy, "mfe_r"), 6.0);
+    assert_close(value(&rows, buy, "mae_r"), 2.0);
+    assert_close(value(&rows, buy, "capture"), 200.0 / 300.0);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_entry_on_a_bar_time_includes_that_bar() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let v = version(&client).await;
+    // Bought at 100 exactly at the day-2 bar (close 110): that bar's close is in the window.
+    let buy = trip(&client, v, close_of(2), "100", "102", close_of(4)).await;
+    let (_dir, reader) = bars_dir(
+        "ontime",
+        &[
+            ("SPY", close_of(1), "105"),
+            ("SPY", close_of(2), "110"),
+            ("SPY", close_of(3), "103"),
+            ("SPY", close_of(4), "102"),
+        ],
+    );
+
+    execution_job::score_exits(&client, &reader, now())
+        .await
+        .unwrap();
+    let rows = scores(&client).await;
+    // Window 110, 103, 102: MFE = 10 × 100 / 50 = 20, MAE = 2 × 100 / 50 = 4.
+    assert_close(value(&rows, buy, "mfe_r"), 20.0);
+    assert_close(value(&rows, buy, "mae_r"), 4.0);
     db.drop_db().await.unwrap();
 }

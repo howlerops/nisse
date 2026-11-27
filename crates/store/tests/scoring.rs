@@ -21,6 +21,18 @@ use tokio_postgres::Client;
 const BASE: u64 = 1_650_390_305_000_000;
 const DAY_MICROS: u64 = 86_400 * 1_000_000;
 
+/// The eight rule names of `nisse_risk::rule::ALL`, the checks the gate writes for every order.
+const RULES: [&str; 8] = [
+    "kill_switch",
+    "account_blocked",
+    "drawdown_flat",
+    "stale_data",
+    "no_short",
+    "risk_per_trade",
+    "kelly_exposure",
+    "day_trade_limit",
+];
+
 fn micros(us: u64) -> UnixNanos {
     UnixNanos::from(us * 1_000)
 }
@@ -354,25 +366,29 @@ async fn decision_orders_summarise_each_decision() {
 
     let summary = scoring::decision_orders(&client).await.unwrap();
     let spy_sym = spy();
-    let expected = |decision_id, ordered_qty: &str, all_terminal, sent| DecisionOrders {
-        decision_id,
-        symbol: spy_sym,
-        side: OrderSide::Buy,
-        ordered_qty: dec(ordered_qty),
-        all_terminal,
-        sent,
-    };
+    // `last_change` is the newest order row: `order_on` writes its states at BASE + 1 + i, and
+    // the intent at BASE. No fills in this test.
+    let expected =
+        |decision_id, ordered_qty: &str, all_terminal, sent, last_change: u64| DecisionOrders {
+            decision_id,
+            symbol: spy_sym,
+            side: OrderSide::Buy,
+            ordered_qty: dec(ordered_qty),
+            all_terminal,
+            sent,
+            last_change: micros(BASE + last_change),
+        };
     assert_eq!(
         summary,
         vec![
-            expected(d1, "5", true, true),
-            expected(d2, "4", false, true),
-            expected(d3, "2", false, false),
-            expected(d4, "5", true, true),
-            expected(d6, "1", true, true),
+            expected(d1, "5", true, true, 2),
+            expected(d2, "4", false, true, 1),
+            expected(d3, "2", false, false, 0),
+            expected(d4, "5", true, true, 1),
+            expected(d6, "1", true, true, 1),
             DecisionOrders {
                 side: OrderSide::Sell,
-                ..expected(d7, "1", true, true)
+                ..expected(d7, "1", true, true, 1)
             },
         ]
     );
@@ -563,9 +579,13 @@ async fn risk_breaches_count_sent_orders_of_failed_decisions_once_each() {
     .await;
     assert_eq!(scoring::risk_breaches(&client, a).await.unwrap(), 1);
 
-    // All checks passed and the order was sent: not a breach.
+    // All eight gate checks passed and the order was sent: not a breach. (Before the full-set
+    // rule, one passed check was enough; a decision with fewer than eight distinct rules is now a
+    // breach, so this decision writes all eight.)
     let d3 = spy_decision(&client, a).await;
-    check(&client, d3, "max_position", dec("100"), true).await;
+    for rule in RULES {
+        check(&client, d3, rule, dec("100"), true).await;
+    }
     order(
         &client,
         d3,
@@ -615,5 +635,170 @@ async fn risk_breaches_count_sent_orders_of_failed_decisions_once_each() {
     .await;
     assert_eq!(scoring::risk_breaches(&client, a).await.unwrap(), 3);
     assert_eq!(scoring::risk_breaches(&client, b).await.unwrap(), 1);
+    db.drop_db().await.unwrap();
+}
+
+/// Appends a row moving `order` to `state` with `cum` filled, at `BASE` plus `at` microseconds.
+async fn state_at(client: &Client, order: &OrderIntent, state: OrderState, cum: &str, at: u64) {
+    let event = OrderEvent::of(
+        order,
+        state,
+        Some(VenueOrderId::from("V-1")),
+        Quantity::from(cum),
+        micros(BASE + at),
+    );
+    order_event::insert(client, &event).await.unwrap();
+}
+
+#[tokio::test]
+async fn fills_come_in_event_time_order_then_id_order() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let v = version(&client, 1).await;
+    let d1 = spy_decision(&client, v).await;
+    order(
+        &client,
+        d1,
+        "buy-1",
+        OrderSide::Buy,
+        "5",
+        &[(OrderState::Filled, "5")],
+    )
+    .await;
+    order(
+        &client,
+        d1,
+        "sell-1",
+        OrderSide::Sell,
+        "1",
+        &[(OrderState::Filled, "1")],
+    )
+    .await;
+
+    // The sell is stored first but happened later; the buy is a backfill stored after it.
+    put_fill(&client, "sell-1", "T-S", "400.5", "1", BASE + 20).await;
+    put_fill(&client, "buy-1", "T-B", "500.10", "1", BASE + 10).await;
+    // Two fills with the same event time come back in the order they were stored.
+    put_fill(&client, "buy-1", "T-X", "501", "2", BASE + 30).await;
+    put_fill(&client, "buy-1", "T-Y", "502", "3", BASE + 30).await;
+
+    let fills = scoring::fills(&client).await.unwrap();
+    let fill = |side, qty: &str, px: &str, at: u64| DecisionFill {
+        decision_id: d1,
+        symbol: spy(),
+        side,
+        qty: dec(qty),
+        px: dec(px),
+        fee: Decimal::ZERO,
+        ts: micros(BASE + at),
+    };
+    assert_eq!(
+        fills,
+        vec![
+            fill(OrderSide::Buy, "1", "500.10", 10),
+            fill(OrderSide::Sell, "1", "400.5", 20),
+            fill(OrderSide::Buy, "2", "501", 30),
+            fill(OrderSide::Buy, "3", "502", 30),
+        ]
+    );
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn last_change_is_the_latest_order_row_or_fill() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let v = version(&client, 1).await;
+
+    // d1: order rows at 100 and 200, a fill at 300 (later than both): 300.
+    let d1 = spy_decision(&client, v).await;
+    let o1 = intent(d1, "o-1", "SPY", OrderSide::Buy, "5", 0);
+    order_event::insert(&client, &OrderEvent::intent(&o1))
+        .await
+        .unwrap();
+    state_at(&client, &o1, OrderState::Accepted, "0", 100).await;
+    state_at(&client, &o1, OrderState::Filled, "5", 200).await;
+    put_fill(&client, "o-1", "T-1", "100", "5", BASE + 300).await;
+
+    // d2: order rows at 100 and 200 and no fill: the newest order row, 200.
+    let d2 = spy_decision(&client, v).await;
+    let o2 = intent(d2, "o-2", "SPY", OrderSide::Buy, "5", 0);
+    order_event::insert(&client, &OrderEvent::intent(&o2))
+        .await
+        .unwrap();
+    state_at(&client, &o2, OrderState::Accepted, "0", 100).await;
+    state_at(&client, &o2, OrderState::Filled, "5", 200).await;
+
+    // d3: an order row at 200 and a fill at 150, older than the row: the row's time, 200.
+    let d3 = spy_decision(&client, v).await;
+    let o3 = intent(d3, "o-3", "SPY", OrderSide::Buy, "5", 0);
+    order_event::insert(&client, &OrderEvent::intent(&o3))
+        .await
+        .unwrap();
+    state_at(&client, &o3, OrderState::Accepted, "0", 200).await;
+    put_fill(&client, "o-3", "T-3", "100", "1", BASE + 150).await;
+
+    let changes: Vec<(DecisionId, UnixNanos)> = scoring::decision_orders(&client)
+        .await
+        .unwrap()
+        .iter()
+        .map(|order| (order.decision_id, order.last_change))
+        .collect();
+    assert_eq!(
+        changes,
+        vec![
+            (d1, micros(BASE + 300)),
+            (d2, micros(BASE + 200)),
+            (d3, micros(BASE + 200)),
+        ]
+    );
+    db.drop_db().await.unwrap();
+}
+
+/// Writes one decision on a fresh version `n` with `checks` as `(rule, passed)` rows and one
+/// order (sent, or intent only), and returns the version's risk breaches.
+async fn breaches_of(client: &Client, n: u8, checks: &[(&str, bool)], sent: bool) -> i64 {
+    let v = version(client, n).await;
+    let d = spy_decision(client, v).await;
+    for (rule, passed) in checks {
+        check(client, d, rule, dec("1"), *passed).await;
+    }
+    let states: &[(OrderState, &str)] = if sent {
+        &[(OrderState::Accepted, "0")]
+    } else {
+        &[]
+    };
+    order(client, d, &format!("o-v{n}"), OrderSide::Buy, "5", states).await;
+    scoring::risk_breaches(client, v).await.unwrap()
+}
+
+#[tokio::test]
+async fn risk_breaches_need_all_eight_distinct_rules() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+
+    // All eight passed, sent: clean.
+    let all: Vec<(&str, bool)> = RULES.iter().map(|r| (*r, true)).collect();
+    assert_eq!(breaches_of(&client, 3, &all, true).await, 0);
+
+    // Only seven distinct rules, all passed, sent: a breach.
+    let seven: Vec<(&str, bool)> = RULES[..7].iter().map(|r| (*r, true)).collect();
+    assert_eq!(breaches_of(&client, 4, &seven, true).await, 1);
+
+    // No risk_check rows at all, sent: a breach.
+    assert_eq!(breaches_of(&client, 5, &[], true).await, 1);
+
+    // All eight rules, one failed, sent: a breach.
+    let mut one_failed = all.clone();
+    one_failed[3].1 = false;
+    assert_eq!(breaches_of(&client, 6, &one_failed, true).await, 1);
+
+    // Eight rows but only seven distinct rules (one repeated): duplicates do not count, a breach.
+    let mut repeated = seven.clone();
+    repeated.push((RULES[0], true));
+    assert_eq!(breaches_of(&client, 7, &repeated, true).await, 1);
+
+    // Intent only, no checks: not sent, so not a breach.
+    assert_eq!(breaches_of(&client, 8, &[], false).await, 0);
     db.drop_db().await.unwrap();
 }
