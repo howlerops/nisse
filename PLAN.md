@@ -54,6 +54,7 @@ Two loops that meet only at a human-approved merge.
 ### UI notes (Phase 8)
 
 - Take inspiration from [herdr-app](https://github.com/herdrdev/herdr-app), an app built with Native Shell, in particular its ability to open an agent that edits the app in real time, per user.
+- Phase 8 built the app without an in-app agent ([`docs/phases/phase-8.md`](docs/phases/phase-8.md)). The phone's database role (`nisse_ui`) can read the store and call one function that engages the kill switch; it cannot release it or write anything else.
 - If nisse gets such an in-app agent, the existing boundaries still hold: it edits UI code only, never the engine, risk gate, adapter or limits; it never sees broker credentials; and it cannot place orders or change what the kill switch does. Anything it changes outside a user's own UI session still lands as a PR that a human merges.
 
 ## Trade store and evals
@@ -208,7 +209,7 @@ Intraday is out of scope unless a gated strategy needs it. The day-trade limit s
 - [ ] Market data: free IEX feed or the $99/month SIP plan; decide before backtesting.
 - [ ] Whether Alpaca fractional orders can be limit orders (Alpaca docs disagree); test in paper.
 - [x] NautilusTrader pinned at `0.68.0` (Phase 0). Licence decided 2026-11-26: this repo's own code is MIT. NautilusTrader stays a separate `LGPL-3.0-only` dependency that this repo does not relicense; its terms apply to that library if a built binary is ever given to someone else.
-- [ ] Confirm Native Shell can read Postgres through a Rust module before building screens.
+- [ ] Confirm Native Shell can read Postgres through a Rust module before building screens. Phase 8: confirmed on the build machine (the app's Rust module reads and writes a real Postgres in headless tests); **not** yet confirmed on a phone, where the device build has never been made.
 - [ ] Whether Anthropic's Commercial Terms or Usage Policy carry a securities clause like the Consumer Terms; read before moving agents to an API key.
 - [ ] Taxable account or IRA.
 - [ ] Alpaca reliability (repeated incidents in 2026): keep our own ledger and reconcile from fills.

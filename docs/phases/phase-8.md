@@ -6,19 +6,22 @@ The UI is a [Native Shell](https://nsh.dev) app: TSX screens that import a Rust 
 code base for phone and desktop. It shows the engine's state and can do exactly one thing to
 it: engage the kill switch.
 
-## What could and could not be done in this phase's build session
+## What is verified, and what is not
 
-- **Built and tested here:** the database role and function the phone uses, the engine's
-  reaction to a kill switch engaged from outside its own process, and the Rust data layer
-  (queries and the kill call), all against a real Postgres.
-- **Written but not compiled or run here:** the Native Shell app itself (`ui/`). The session
-  that wrote it could not install the `nsh` command (its release download is outside the
-  network the session is allowed, and building it from source was not permitted). The app
-  follows the framework's documentation and its own `rust-exports` example, and keeps
-  everything that matters in the tested data layer, but its first compile, `nsh check`,
-  `nsh test` and run on a phone are the owner's, and it should be expected to need fixes.
-- **The owner's:** installing Native Shell, building for the phone, how the phone reaches
-  the database, and the end-to-end test against paper.
+- **Tested here:** the database role and function the phone uses, the engine's reaction to a
+  kill switch engaged from outside its own process, the Rust data layer, and **the app
+  itself, headless**: Native Shell's own test crate bundles `ui/App.tsx`, runs it on QuickJS
+  with no window and no device, and drives it by pressing and typing. In those tests the app
+  uses its real Rust module and a real Postgres, connected as the role a phone would have;
+  the kill switch is engaged from the Kill screen and read back from the store. CI runs them.
+- **Not verified:** anything on a device. The session that built this could not install the
+  `nsh` command (its release download is outside the network the session is allowed), so
+  there has been no `nsh check` (TypeScript type-checking: the headless bundler strips types
+  without checking them), no `nsh run`, and no iOS or Android build. Whether every crate the
+  module depends on (the NautilusTrader model crate comes in through `nisse-core`) builds
+  for a phone target is unknown.
+- **The owner's:** installing Native Shell, the device build, how the phone reaches the
+  database, and the end-to-end test from a phone against paper.
 
 ## Decisions taken in this phase
 
@@ -74,10 +77,10 @@ A Native Shell "mixed" app, its own Cargo workspace (so the main workspace and C
 build a UI framework):
 
 ```
-ui/nsh.json        app id, name, the Rust crate
-ui/App.tsx         navigation and the five screens
-ui/App.test.tsx    headless tests with the native module faked
-ui/native/         crate nisse-ui-native: #[native_module("nisse/native")], wraps nisse-ui-data
+ui/nsh.json              app id, name, the Rust crate
+ui/App.tsx               the six screens
+ui/ext/nisse-native/     crate: #[native_module("nisse-native")], wraps nisse-ui-data
+ui/ext/nisse-native/tests/app.rs   headless tests: the screens, the module and Postgres together
 ```
 
 Screens: **Status** (switch, mode, heartbeat age, owed rebalance; red when anything cannot be
@@ -94,12 +97,14 @@ encrypted storage, so this is a plain file in the app's sandbox).
 | U1 | Role and kill function | `migrations/0014_ui_role.sql`, tests | 1 |
 | U3 | Engine cancels open orders when the switch is engaged | `crates/app/src/session.rs`, tests | 1 |
 | U2 | Data layer | `crates/ui-data/src/lib.rs`, tests | 2 (U1) |
-| U4 | The app (lead; not compiled here) | `ui/` | 3 |
+| U4 | The app and its headless tests (lead) | `ui/` | 3 |
 | U5 | Runbook | `docs/runbooks/phone-ui.md` | 3 |
 
 ## The owner's
 
-- Install Native Shell; `nsh check`, `nsh test`, then run on a phone. Expect to fix the app.
+- Install Native Shell; `nsh check` (types), then run on a phone. The device build is the
+  untested part: if a dependency does not build for the phone, the fix is to make
+  `nisse-ui-data` independent of `nisse-core`'s NautilusTrader types.
 - Private network or TLS for the phone's database connection.
 - Create the login role for the phone (member of `nisse_ui`).
 - The end-to-end test: engage from the phone against paper, watch the next tick cancel.

@@ -11,6 +11,9 @@ members = [
     "crates/app",
     "crates/ui-data",
 ]
+# The phone app has its own workspace (ui/ext/nisse-native): the main workspace and CI do not
+# build a UI framework.
+exclude = ["ui"]
 
 [workspace.package]
 version = "0.0.0"

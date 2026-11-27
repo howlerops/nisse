@@ -67,6 +67,57 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-features --locked
 
+  ui:
+    # The phone app (ui/): its Rust module and its screens, run headless on QuickJS against a
+    # real Postgres. A workspace of its own, so it is built and cached separately.
+    name: phone app, headless
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust # throwaway CI database: no password exists, so none is stored in the repo
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgres://postgres@localhost:5432/postgres
+    defaults:
+      run:
+        working-directory: ui/ext/nisse-native
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+        working-directory: .
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ui/ext/nisse-native/target
+          key: ui-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'ui/ext/nisse-native/Cargo.lock') }}
+          restore-keys: |
+            ui-${{ runner.os }}-
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
   migrations:
     name: migrations apply to fresh Postgres
     runs-on: ubuntu-24.04
