@@ -39,6 +39,8 @@ Paper is a plumbing test, not a promotion signal. This phase has two halves:
   not read the config file. With the store unreachable it still cancels and checks; with
   the broker keys missing it still records the switch. It prints which of the three (orders
   cancelled, switch recorded, engine idle) were done and exits 1 unless all were.
+- `nisse-engine kill-watch <config.json>` (Phase 8): every minute from cron; if the switch is
+  engaged, cancels what is open at the broker. One query when it is off.
 - `nisse-engine status <config.json>`: prints the risk state, open orders and positions the
   engine would start from. Reads only.
 

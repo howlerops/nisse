@@ -1973,6 +1973,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "nisse-ui-data"
+version = "0.0.0"
+dependencies = [
+ "chrono",
+ "nisse-core",
+ "nisse-risk",
+ "nisse-store",
+ "rust_decimal",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-postgres",
+]
+
+[[package]]
 name = "num-bigint"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

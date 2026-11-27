@@ -1,0 +1,34 @@
+# The app's Rust module: a thin wrapper around nisse-ui-data (crates/ui-data), which holds the
+# queries and is tested against Postgres in the main workspace.
+#
+# Its own workspace, so the main workspace does not build a UI framework; CI tests it in a job
+# of its own. Keep the nsh-* versions equal to the installed `nsh` command's version. The lock
+# file pins the bundler's crates (rolldown, oxc) to the versions Native Shell 0.7.2 itself
+# locks: newer ones do not build together.
+[package]
+name = "nisse-native"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[workspace]
+
+[dependencies]
+nsh-core = "0.7.2"
+nsh-base = "0.7.2"
+nisse-ui-data = { path = "../../../crates/ui-data" }
+nisse-store = { path = "../../../crates/store" }
+tokio = { version = "1", features = ["rt", "time"] }
+tokio-postgres = "0.7"
+
+# The headless test runs `App.tsx` against this crate's module and a real Postgres:
+# `nsh-testing` bundles the TSX and runs it on QuickJS, with no window and no device.
+[dev-dependencies]
+nsh-engine = "0.7.2"
+nsh-testing = { version = "0.7.2", features = ["bundle"] }
+nisse-store = { path = "../../../crates/store", features = ["test-support"] }
+nisse-core = { path = "../../../crates/core" }
+nisse-ui-data = { path = "../../../crates/ui-data" }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }

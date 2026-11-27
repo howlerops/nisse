@@ -1,0 +1,11 @@
+{
+  "name": "Nisse",
+  "id": "dev.howlerops.nisse",
+  "version": "0.1.0",
+  "build": 1,
+  "dependencies": {
+    "nisse-native": {
+      "path": "ext/nisse-native"
+    }
+  }
+}

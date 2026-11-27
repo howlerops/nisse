@@ -27,8 +27,12 @@ use nisse_core::nautilus::{
     AggregationSource, Bar, BarAggregation, BarSpecification, BarType, InstrumentId, Price,
     PriceType, Quantity, Symbol, UnixNanos, Venue,
 };
-use nisse_core::{MarketCalendar, Session};
-use nisse_engine::{CostModel, SimBroker};
+use nisse_core::nautilus::{ClientOrderId, VenueOrderId};
+use nisse_core::{
+    AccountSnapshot, Broker, BrokerOrder, BrokerPosition, MarketCalendar, OpenOrders, OrderIntent,
+    ReplaceRequest, Session, SubmitError,
+};
+use nisse_engine::{CostModel, SimBroker, SimError};
 use nisse_store::{Store, StoreWriter, WriterConfig, testing::ScratchDb};
 use rust_decimal::Decimal;
 
@@ -310,4 +314,60 @@ pub async fn count(store: &Store, table: &str) -> i64 {
         .await
         .unwrap()
         .get(0)
+}
+
+/// The simulated broker, except that cancelling every open order fails.
+pub struct CancelFails<'a>(pub &'a SimBroker);
+
+impl Broker for CancelFails<'_> {
+    type Error = SimError;
+
+    async fn submit(&self, intent: &OrderIntent) -> Result<BrokerOrder, SubmitError<SimError>> {
+        self.0.submit(intent).await
+    }
+
+    async fn cancel(&self, venue_order_id: VenueOrderId) -> Result<(), SimError> {
+        self.0.cancel(venue_order_id).await
+    }
+
+    async fn cancel_all(&self) -> Result<(), SimError> {
+        Err(SimError("the broker refused the cancel".to_owned()))
+    }
+
+    async fn replace(
+        &self,
+        venue_order_id: VenueOrderId,
+        request: &ReplaceRequest,
+    ) -> Result<BrokerOrder, SubmitError<SimError>> {
+        self.0.replace(venue_order_id, request).await
+    }
+
+    async fn order_by_client_id(
+        &self,
+        client_order_id: ClientOrderId,
+    ) -> Result<Option<BrokerOrder>, SimError> {
+        self.0.order_by_client_id(client_order_id).await
+    }
+
+    async fn open_orders(&self) -> Result<OpenOrders, SimError> {
+        self.0.open_orders().await
+    }
+
+    async fn positions(&self) -> Result<Vec<BrokerPosition>, SimError> {
+        self.0.positions().await
+    }
+
+    async fn account(&self) -> Result<AccountSnapshot, SimError> {
+        self.0.account().await
+    }
+}
+
+/// The repository limits with `flatten_on_kill` on, written into `dir`.
+pub fn flattening_limits(dir: &Path) -> PathBuf {
+    let mut limits: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(repo_limits()).unwrap()).unwrap();
+    limits["flatten_on_kill"] = serde_json::json!(true);
+    let path = dir.join("limits.json");
+    std::fs::write(&path, limits.to_string()).unwrap();
+    path
 }

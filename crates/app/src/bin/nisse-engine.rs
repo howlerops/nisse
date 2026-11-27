@@ -5,6 +5,7 @@
 //! nisse-engine session-close <config.json>
 //! nisse-engine tick <config.json>
 //! nisse-engine status <config.json>
+//! nisse-engine kill-watch <config.json>
 //! nisse-engine kill <config.json> --by NAME
 //! nisse-engine release-kill <config.json> --by NAME
 //! ```
@@ -12,9 +13,15 @@
 //! Environment variables (none of them is ever printed):
 //! - `DATABASE_URL`: the Postgres store. Read by every command.
 //! - `APCA_API_KEY_ID` and `APCA_API_SECRET_KEY`: the Alpaca paper keys. Read by `session-close`,
-//!   `tick` and `kill` only; `status` and `release-kill` need neither.
+//!   `tick`, `kill` and `kill-watch` only;
+//!   `status` and `release-kill` need neither.
 //! - `NISSE_SIGNING_KEY`: the signing key as hex. Read by `session-close` and `tick` only, and
 //!   only when the config requires a signature (`signature.required`).
+//!
+//! `kill-watch` runs every minute: with the switch off it reads one row and asks the broker for
+//! the account (to show it could cancel); engaged, it
+//! cancels what rests at the broker (see `kill_watch`). It takes no engine lock and does not
+//! need a valid config beyond `limits_path` (a broken config still enforces, as a halt).
 //!
 //! Exit codes: 0 done or nothing to do; 1 failed (re-run); 2 bad arguments or config, or a
 //! deployment that is not signed when its config requires it (nothing is traded); 3 another
@@ -29,11 +36,12 @@ use nisse_app::{
     commands::{self, Command, USAGE},
     config::EngineConfig,
     deployment::{Deployment, ENV_SIGNING_KEY, verify_deployment},
+    kill_watch::{flatten_on_kill, watch_once},
     market::AlpacaMarket,
     restore::wait_for_engine_lock,
     session::{session_close, tick},
 };
-use nisse_core::SystemClock;
+use nisse_core::{Clock, SystemClock};
 use nisse_store::{Store, StoreError, StoreWriter, WriterConfig};
 
 /// The HTTP timeout of every Alpaca request.
@@ -57,6 +65,9 @@ async fn main() -> ExitCode {
     // client needs nothing from it (this build only knows Alpaca's paper endpoints).
     if let Command::Kill { by, .. } = &command {
         return run_kill(by).await;
+    }
+    if let Command::KillWatch { config } = &command {
+        return run_kill_watch(config).await;
     }
     let config = match EngineConfig::load(command.config_path()) {
         Ok(config) => config,
@@ -115,7 +126,7 @@ enum RunError {
     Store(#[from] StoreError),
     #[error("record writer task failed: {0}")]
     WriterTask(String),
-    #[error("kill is handled before the other commands")]
+    #[error("kill and kill-watch are handled before the other commands")]
     KillNotDispatched,
 }
 
@@ -191,6 +202,53 @@ async fn run_kill(by: &str) -> ExitCode {
     }
 }
 
+/// `kill-watch`: one run of the watcher (`watch_once`). It builds the trading client on
+/// every run and asks the broker for the account even when the switch is off, so that missing
+/// or rejected keys show as a failing watcher; engaged, it enforces the switch. No engine
+/// lock, no signature check, no record writer. The config is read only for `limits_path`; if
+/// it cannot be read, the switch halts (no flatten) and everything is cancelled, and that is
+/// said on stderr.
+async fn run_kill_watch(config_path: &std::path::Path) -> ExitCode {
+    let flatten = match EngineConfig::load(config_path) {
+        Ok(config) => flatten_on_kill(&config.limits_path),
+        Err(err) => {
+            eprintln!(
+                "nisse-engine: kill-watch: config unreadable, using flatten_on_kill = false: {err}"
+            );
+            false
+        }
+    };
+    let store = match connect_store().await {
+        Ok(store) => store,
+        Err(err) => {
+            eprintln!("nisse-engine: kill-watch: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // No client (missing keys, for example) is passed on with its reason: the watcher then
+    // fails, and leaves no heartbeat, because it could not cancel if it had to.
+    let trading = alpaca_http()
+        .map(|http| AlpacaTrading::new(http, &AlpacaConfig::paper(nisse_alpaca_adapter::Feed::Iex)))
+        .map_err(|err| err.to_string());
+    match watch_once(
+        &store,
+        trading.as_ref().map_err(Clone::clone),
+        flatten,
+        SystemClock.now(),
+    )
+    .await
+    {
+        Ok(outcome) => {
+            println!("{}", commands::describe_kill_watch(&outcome));
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("nisse-engine: kill-watch: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// Connects to the store named by `DATABASE_URL`, which is never printed (it may hold a
 /// password).
 async fn connect_store() -> Result<Store, RunError> {
@@ -216,9 +274,9 @@ async fn dispatch(
             println!("release-kill: released by {by}");
             Ok(())
         }
-        // `main` handles `kill` before any config or store is needed; this arm only keeps
-        // the match total.
-        Command::Kill { .. } => Err(RunError::KillNotDispatched),
+        // `main` handles `kill` and `kill-watch` before any config or store is needed; this
+        // arm only keeps the match total.
+        Command::Kill { .. } | Command::KillWatch { .. } => Err(RunError::KillNotDispatched),
         Command::Tick { .. } => {
             let (trading, market) = alpaca_trading_and_market(config)?;
             wait_for_turn(store).await?;

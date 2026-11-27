@@ -1,5 +1,6 @@
-//! The `nisse-engine` command line: argument parsing and the `kill`, `release-kill` and
-//! `status` commands. `tick` and `session-close` are in [`crate::session`].
+//! The `nisse-engine` command line: argument parsing and the `kill`, `release-kill`,
+//! `status` and `kill-watch` commands. `tick` and `session-close` are in [`crate::session`];
+//! the kill switch enforcement is in [`crate::kill_watch`].
 
 use std::borrow::Borrow;
 use std::fmt;
@@ -22,13 +23,14 @@ use serde_json::json;
 
 use crate::AppError;
 use crate::config::EngineConfig;
+use crate::kill_watch::KillEnforcement;
 use crate::restore::wait_for_engine_lock;
 use crate::session::{
     RESIZE_RUN_KEY, RESIZE_STEP, RebalanceStep, SessionCloseOutcome, TickOutcome,
 };
 
 /// The usage text printed with an argument error.
-pub const USAGE: &str = "usage: nisse-engine <session-close|tick|status> <config.json>\n       nisse-engine <kill|release-kill> <config.json> --by NAME";
+pub const USAGE: &str = "usage: nisse-engine <session-close|tick|status|kill-watch> <config.json>\n       nisse-engine <kill|release-kill> <config.json> --by NAME";
 
 /// The longest name `--by` accepts.
 const MAX_BY_CHARS: usize = 64;
@@ -40,6 +42,7 @@ pub enum Command {
     Kill { config: PathBuf, by: String },
     ReleaseKill { config: PathBuf, by: String },
     Status { config: PathBuf },
+    KillWatch { config: PathBuf },
 }
 
 impl Command {
@@ -83,13 +86,14 @@ impl Command {
                 config,
                 by: require_by(by)?,
             }),
-            "session-close" | "tick" | "status" => {
+            "session-close" | "tick" | "status" | "kill-watch" => {
                 if by.is_some() {
                     return Err("--by is only for kill and release-kill".to_owned());
                 }
                 Ok(match name.as_str() {
                     "session-close" => Self::SessionClose { config },
                     "tick" => Self::Tick { config },
+                    "kill-watch" => Self::KillWatch { config },
                     _ => Self::Status { config },
                 })
             }
@@ -105,7 +109,8 @@ impl Command {
             | Self::Tick { config }
             | Self::Kill { config, .. }
             | Self::ReleaseKill { config, .. }
-            | Self::Status { config } => config,
+            | Self::Status { config }
+            | Self::KillWatch { config } => config,
         }
     }
 }
@@ -506,7 +511,36 @@ pub fn describe_tick(outcome: &TickOutcome) -> String {
         },
     ];
     parts.extend(mode_change_text(outcome.mode_change));
+    if outcome.kill_cancelled {
+        parts.push("open orders cancelled (kill switch)".to_owned());
+    }
     format!("tick: {}", parts.join("; "))
+}
+
+/// The one line `kill-watch` prints: whether the switch is engaged, and what was cancelled.
+#[must_use]
+pub fn describe_kill_watch(outcome: &KillEnforcement) -> String {
+    if !outcome.engaged {
+        "kill-watch: switch off".to_owned()
+    } else if outcome.cancelled && outcome.open_orders == 0 {
+        // The broker could not list its orders, so everything was cancelled blind.
+        "kill-watch: switch ENGAGED; orders could not be listed, cancel of everything sent"
+            .to_owned()
+    } else if outcome.open_orders == 0 {
+        "kill-watch: switch ENGAGED; nothing open".to_owned()
+    } else if outcome.cancelled {
+        // Sent, not confirmed here: the kill/cancel step says whether the broker then
+        // listed none left.
+        format!(
+            "kill-watch: switch ENGAGED; cancel sent for {} open orders",
+            outcome.open_orders
+        )
+    } else {
+        format!(
+            "kill-watch: switch ENGAGED; {} open orders, none cancelled (exits left)",
+            outcome.open_orders
+        )
+    }
 }
 
 /// The one line `session-close` prints, e.g.
@@ -672,6 +706,7 @@ mod tests {
             mode_change: None,
             market_open: true,
             rebalance: None,
+            kill_cancelled: false,
         };
         assert_eq!(
             describe_tick(&open),
@@ -683,6 +718,7 @@ mod tests {
             mode_change: None,
             market_open: false,
             rebalance: None,
+            kill_cancelled: false,
         };
         assert_eq!(
             describe_tick(&one_closed),
@@ -699,6 +735,7 @@ mod tests {
                 orders_failed: 1,
                 orders_blocked: 0,
             }),
+            kill_cancelled: false,
         };
         assert_eq!(
             describe_tick(&rebalanced),

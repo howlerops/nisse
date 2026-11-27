@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 
 use crate::deployment::verify_from_env;
 use crate::ingest::{IngestOutcome, ingest_session};
+use crate::kill_watch::{enforce_kill, flatten_on_kill};
 use crate::market::Market;
 use crate::restore::{EngineTrader, Restored, restore, take_engine_lock};
 use crate::{AppError, config::EngineConfig};
@@ -59,6 +60,8 @@ pub struct TickOutcome {
     /// The rebalance this tick ran: one was owed, the market was open, orders could go out,
     /// and no tick had completed an attempt in this hour at this risk scale or a lower one.
     pub rebalance: Option<RebalanceReport>,
+    /// Open orders were cancelled because the switch was found engaged.
+    pub kill_cancelled: bool,
 }
 
 /// What the rebalance step of a `session-close` run did.
@@ -90,8 +93,11 @@ pub enum SessionCloseOutcome {
     },
 }
 
-/// Runs one `tick`: lock, restore, reconcile, observe, rebalance if the market is open and one
-/// is owed, then flush and write a heartbeat. Any error returns before the heartbeat.
+/// Runs one `tick`. Order: enforce the kill switch → verify the signature → lock → restore →
+/// reconcile → observe → (re-read the switch) → rebalance if the market is open and one is
+/// owed → finish. The kill switch is enforced first, from the store and the broker alone, so
+/// it holds whatever the deployment or the engine's state. Any error returns before the
+/// heartbeat.
 pub async fn tick<M: Market, B: Broker, C: Clock>(
     config: &EngineConfig,
     market: &M,
@@ -100,7 +106,14 @@ pub async fn tick<M: Market, B: Broker, C: Clock>(
     broker: B,
     clock: C,
 ) -> Result<TickOutcome, AppError> {
-    // Before anything else: a deployment that must be signed and is not trades nothing.
+    let kill = enforce_kill(
+        store,
+        &broker,
+        flatten_on_kill(&config.limits_path),
+        clock.now(),
+    )
+    .await?;
+    // Before the lock: a deployment that must be signed and is not trades nothing.
     verify_from_env(config)?;
     let now = clock.now();
     take_engine_lock(store).await?;
@@ -116,11 +129,18 @@ pub async fn tick<M: Market, B: Broker, C: Clock>(
     let market_open = calendar.is_open(now);
 
     let due = resize_owed(store).await? || trader.needs_flatten();
+    // Only a rebalance about to be considered re-reads the switch: the restore read it before
+    // this run's observe pass, and a row written since then must stop the rebalance.
+    let may_rebalance = due
+        && market_open
+        && !halted(&trader, &observed)
+        && !refresh_halts(&mut trader, store, &observed).await;
     let attempt_key = format!("tick/{}T{:02}", today, utc_hour(now));
     // An attempt that completed (whatever its orders met) is not repeated within the hour,
     // while one that failed part-way may be. The exception is a risk scale that has dropped
     // since that attempt (a drawdown step-down, a kill switch that flattens): that is acted
     // on at once. An attempt whose recorded scale cannot be read counts as tried.
+    // Read after the switch is re-read: an engaged switch can change the scale.
     let scale = trader.risk().risk_scale();
     let tried_this_hour = match store.step_status(&attempt_key, TICK_ATTEMPT_STEP).await? {
         Some((StepStatus::Done, detail)) => detail
@@ -130,7 +150,7 @@ pub async fn tick<M: Market, B: Broker, C: Clock>(
             .is_none_or(|tried_at| scale >= tried_at),
         _ => false,
     };
-    let rebalance = if due && market_open && !halted(&trader, &observed) && !tried_this_hour {
+    let rebalance = if may_rebalance && !tried_this_hour {
         let report = step(
             store,
             &attempt_key,
@@ -156,11 +176,16 @@ pub async fn tick<M: Market, B: Broker, C: Clock>(
         mode_change: observed.mode_change,
         market_open,
         rebalance,
+        kill_cancelled: kill.cancelled,
     })
 }
 
 /// Runs one `session-close` for the newest session that closed no more than
 /// `MAX_CLOSE_AGE_NANOS` before now. See `docs/phases/phase-6.md`, "session-close".
+///
+/// Order: enforce the kill switch → verify the signature → lock → ingest → restore →
+/// reconcile → observe → (re-read the switch) → rebalance on a month end or when one is owed
+/// → finish. The kill switch is enforced first, as in [`tick`].
 pub async fn session_close<M: Market, B: Broker, C: Clock>(
     config: &EngineConfig,
     market: &M,
@@ -169,7 +194,14 @@ pub async fn session_close<M: Market, B: Broker, C: Clock>(
     broker: B,
     clock: C,
 ) -> Result<SessionCloseOutcome, AppError> {
-    // Before anything else: a deployment that must be signed and is not trades nothing.
+    enforce_kill(
+        store,
+        &broker,
+        flatten_on_kill(&config.limits_path),
+        clock.now(),
+    )
+    .await?;
+    // Before the lock: a deployment that must be signed and is not trades nothing.
     verify_from_env(config)?;
     let now = clock.now();
     take_engine_lock(store).await?;
@@ -244,14 +276,13 @@ pub async fn session_close<M: Market, B: Broker, C: Clock>(
     )
     .await?;
 
-    let halted = halted(&trader, &observed);
     let rebalance = rebalance_step(
         &mut trader,
         store,
         &calendar,
         &session,
         &run_key,
-        halted,
+        &observed,
         now,
     )
     .await?;
@@ -275,7 +306,7 @@ async fn rebalance_step<B: Broker, C: Clock>(
     calendar: &MarketCalendar,
     session: &Session,
     run_key: &str,
-    halted: bool,
+    observed: &Observed,
     now: UnixNanos,
 ) -> Result<RebalanceStep, AppError> {
     if matches!(
@@ -322,7 +353,9 @@ async fn rebalance_step<B: Broker, C: Clock>(
             .await?;
         return Ok(RebalanceStep::NotDue);
     }
-    if halted {
+    // Re-read the switch right before the rebalance: a row written after this run restored
+    // must stop it.
+    if refresh_halts(trader, store, observed).await {
         // Deciding now would only write decisions whose orders are all refused. The
         // rebalance stays owed and is made by the first open tick that can trade.
         owe_rebalance(store, json!({"reason": "halted at the close"}), now).await?;
@@ -367,6 +400,18 @@ fn rebalance_detail(report: &RebalanceReport) -> Value {
 fn halted<B: Broker, C: Clock>(trader: &EngineTrader<'_, B, C>, observed: &Observed) -> bool {
     let gate = trader.risk();
     (gate.state().kill_switch_engaged && !gate.limits().flatten_on_kill) || observed.trading_blocked
+}
+
+/// Re-reads the kill switch from the store into the trader's gate, then says whether trading
+/// is halted. Called immediately before a rebalance: the switch may have been engaged by a
+/// row written after this run restored. An unreadable switch counts as engaged.
+async fn refresh_halts<B: Broker, C: Clock>(
+    trader: &mut EngineTrader<'_, B, C>,
+    store: &Store,
+    observed: &Observed,
+) -> bool {
+    trader.refresh_kill_switch(store).await;
+    halted(trader, observed)
 }
 
 /// The UTC hour of `now`.
