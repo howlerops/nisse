@@ -122,6 +122,13 @@ only:
 - a label queue: at most 20 visible decisions with what was decided and how it was executed
   and **no outcome** (no forward return, no P&L), for the post-mortem labels.
 
+Known limit of the cohort rule: a cohort is the oldest 30, 60, ... visible decisions *that
+have the score*. If a score for an older decision arrives late, or a decision is re-scored
+by a new evaluation version, a published figure can move without 30 new decisions, and the
+change then reflects fewer than 30 values. Scores are written oldest first and figures are
+rounded, which blunts this; freezing a cohort once published would close it and needs a
+place to keep what was published (a new table: the owner's call).
+
 Decisions hidden by the holdout are never counted or listed. No date is finer than a month
 except in the data checks.
 
