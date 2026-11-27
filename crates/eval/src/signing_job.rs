@@ -14,8 +14,7 @@ use nisse_core::signing::{Manifest, STAGE_PAPER, SigningKey, deployment_hash};
 use crate::EvalError;
 use crate::proposal::{CONFIG_DIR, ResearchConfig, check_note};
 
-/// The environment variable holding the signing key as hex. Never printed.
-pub const ENV_SIGNING_KEY: &str = "NISSE_SIGNING_KEY";
+pub use nisse_core::signing::ENV_SIGNING_KEY;
 
 /// Where manifests live, relative to a checkout's root.
 const SIGNED_DIR: &str = "research/signed";

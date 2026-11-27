@@ -14,8 +14,7 @@ use nisse_core::signing::{Manifest, STAGE_PAPER, SigningKey};
 use crate::AppError;
 use crate::config::EngineConfig;
 
-/// The environment variable holding the signing key as hex. Never printed.
-pub const ENV_SIGNING_KEY: &str = "NISSE_SIGNING_KEY";
+pub use nisse_core::signing::ENV_SIGNING_KEY;
 
 /// What the check found.
 #[derive(Debug, Clone, PartialEq, Eq)]

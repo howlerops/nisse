@@ -15,6 +15,10 @@ use sha2::{Digest, Sha256};
 use crate::hash::hex_value;
 use crate::{CoreError, Hash32, canonical_json, config_hash};
 
+/// The environment variable holding the signing key as hex. Read by the binaries that sign
+/// or verify; its value is never printed.
+pub const ENV_SIGNING_KEY: &str = "NISSE_SIGNING_KEY";
+
 /// Shortest key accepted, in bytes.
 pub const MIN_KEY_BYTES: usize = 32;
 
