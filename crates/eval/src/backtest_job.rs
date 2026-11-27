@@ -22,7 +22,7 @@ use nisse_engine::{
 use nisse_risk::Limits;
 use nisse_store::{
     Store,
-    tables::{trial_registry, trial_result},
+    tables::{scoring, trial_registry, trial_result},
 };
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde_json::{Map, Number, Value, json};
@@ -158,11 +158,14 @@ pub struct JobOutcome {
 /// 3. Read the bars in range. No bars at all, or none for one of the requested symbols, is an
 ///    error; nothing has been written yet.
 /// 4. The holdout rule. An ordinary run whose last bar is on or after the holdout boundary is
-///    `HoldoutTouched`. A holdout run must reach the boundary and must have looks left under
-///    `holdout_max_looks`, else `InvalidJob` or `HoldoutRetired`. Nothing is written in these.
-/// 5. Ensure the strategy version.
-/// 6. Register the trial, before the run. A holdout run is marked in its registered result, so
-///    the look counts even if the run then fails.
+///    `HoldoutTouched`. A holdout run must start before the boundary (its warm-up is ordinary
+///    history) and must reach it, else `InvalidJob`. Nothing is written in these.
+/// 5. A holdout run takes `HOLDOUT_LOCK` (or is refused as busy), then checks its looks against
+///    `holdout_max_looks` (`HoldoutRetired`, nothing written). Ordinary runs take no lock.
+/// 6. Ensure the strategy version and register the trial, before the run. A holdout run is
+///    marked in its registered result, so the look counts even if the run then fails. The
+///    holdout lock is released after registration, and on every refusal between taking it and
+///    registering.
 /// 7. Run the backtest. On failure the trial stays registered with no result.
 /// 8. Store the result.
 pub async fn run_backtest_job(
@@ -216,28 +219,35 @@ pub async fn run_backtest_job(
             "the bars for {short} stop before the last session in range"
         )));
     }
-    let boundary = day_nanos(gates.holdout_start, false, "holdout_start")?;
+    let boundary = gates.holdout_boundary().ok_or_else(|| {
+        EvalError::InvalidGates("holdout_start: is outside the representable range".to_owned())
+    })?;
+    let first_session = first.ts_event;
     let last_session = last.ts_event;
     if options.holdout {
+        // The warm-up is ordinary history, so the run starts before the boundary. With the first
+        // session before it, `holdout_sessions <= sessions - 1 = returns.len()`, so the gate
+        // report can always take the holdout tail of the returns.
+        if first_session.as_u64() >= boundary.as_u64() {
+            return Err(EvalError::InvalidJob(
+                "a holdout run must start before the holdout period: its warm-up is ordinary history"
+                    .to_owned(),
+            ));
+        }
         if last_session.as_u64() < boundary.as_u64() {
             return Err(EvalError::InvalidJob(
                 "a holdout run must reach into the holdout period".to_owned(),
             ));
         }
-        let looks = trial_registry::holdout_count(store.client()).await?;
-        let max = gates.holdout_max_looks;
-        if looks >= i64::from(max) {
-            return Err(EvalError::HoldoutRetired { looks, max });
-        }
     } else if last_session.as_u64() >= boundary.as_u64() {
         return Err(EvalError::HoldoutTouched(format!(
             "the holdout starts {}, but the bars run to {}",
-            gates.holdout_start,
+            gates.holdout_start_text(),
             date_text(last_session)
         )));
     }
 
-    let data_start = first.ts_event;
+    let data_start = first_session;
     let data_end = last
         .ts_event
         .as_u64()
@@ -261,17 +271,39 @@ pub async fn run_backtest_job(
         parent_id: None,
         ts: now,
     };
-    let strategy_version_id = store.ensure_strategy_version(&version).await?;
-
-    let trial = Trial {
-        strategy_version_id,
-        kind: TrialKind::Backtest,
-        data_start,
-        data_end,
-        result: options.holdout.then(|| json!({"holdout": true})),
-        ts: now,
+    let (strategy_version_id, trial_id) = if options.holdout {
+        // Held from the look-count check until the trial is registered, so two holdout runs
+        // cannot both pass the check. Released on every path once taken.
+        if !scoring::try_advisory_lock(store.client(), scoring::HOLDOUT_LOCK).await? {
+            return Err(EvalError::InvalidJob(
+                "another holdout run is in progress; try again when it has registered its trial"
+                    .to_owned(),
+            ));
+        }
+        let registered = register_trial(
+            store,
+            &version,
+            (data_start, data_end),
+            options,
+            gates.holdout_max_looks,
+            now,
+        )
+        .await;
+        let released = scoring::advisory_unlock(store.client(), scoring::HOLDOUT_LOCK).await;
+        let ids = registered?;
+        released?;
+        ids
+    } else {
+        register_trial(
+            store,
+            &version,
+            (data_start, data_end),
+            options,
+            gates.holdout_max_looks,
+            now,
+        )
+        .await?
     };
-    let trial_id = trial_registry::insert(store.client(), &trial).await?;
 
     let config = BacktestConfig {
         strategy_version_id,
@@ -291,7 +323,8 @@ pub async fn run_backtest_job(
     let summary = metrics::summarize(&run.equity_curve, built.sessions_per_year)
         .map_or(Value::Null, |summary| summary.to_json());
     let (returns, returns_complete) = returns_json(&run.equity_curve);
-    // Zero for an ordinary run, which is refused when its last bar reaches the boundary.
+    // Zero for an ordinary run, which is refused when its last bar reaches the boundary. For a
+    // holdout run the first session is before the boundary, so this is at most `returns.len()`.
     let holdout_sessions = run
         .equity_curve
         .iter()
@@ -302,7 +335,7 @@ pub async fn run_backtest_job(
         "returns": returns,
         "returns_complete": returns_complete,
         "holdout": options.holdout,
-        "holdout_start": gates.holdout_start.to_string(),
+        "holdout_start": gates.holdout_start_text(),
         "holdout_sessions": holdout_sessions,
         "git_sha": GIT_SHA,
         "dirty_build": !options.replayable,
@@ -341,6 +374,39 @@ pub async fn run_backtest_job(
         strategy_version_id,
         result,
     })
+}
+
+/// The look-count check (a holdout run only), then the strategy version and the trial. A holdout
+/// run is refused here, before anything is written, once `max_looks` looks exist. Returns the
+/// strategy version id and the trial id. The caller holds `HOLDOUT_LOCK` across this call.
+async fn register_trial(
+    store: &Store,
+    version: &StrategyVersion,
+    span: (UnixNanos, UnixNanos),
+    options: RunOptions,
+    max_looks: u32,
+    now: UnixNanos,
+) -> Result<(StrategyVersionId, i64), EvalError> {
+    if options.holdout {
+        let looks = trial_registry::holdout_count(store.client()).await?;
+        if looks >= i64::from(max_looks) {
+            return Err(EvalError::HoldoutRetired {
+                looks,
+                max: max_looks,
+            });
+        }
+    }
+    let strategy_version_id = store.ensure_strategy_version(version).await?;
+    let trial = Trial {
+        strategy_version_id,
+        kind: TrialKind::Backtest,
+        data_start: span.0,
+        data_end: span.1,
+        result: options.holdout.then(|| json!({"holdout": true})),
+        ts: now,
+    };
+    let trial_id = trial_registry::insert(store.client(), &trial).await?;
+    Ok((strategy_version_id, trial_id))
 }
 
 /// The daily returns `equity_t / equity_{t-1} - 1`, one per session after the first, as JSON
