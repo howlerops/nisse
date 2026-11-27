@@ -18,7 +18,11 @@ use std::{
 
 use chrono::{Datelike, NaiveDate, Weekday};
 use nisse_alpaca_adapter::{Feed, VENUE};
-use nisse_app::{AppError, config::EngineConfig, market::Market};
+use nisse_app::{
+    AppError,
+    config::{EngineConfig, SignatureRule},
+    market::Market,
+};
 use nisse_core::nautilus::{
     AggregationSource, Bar, BarAggregation, BarSpecification, BarType, InstrumentId, Price,
     PriceType, Quantity, Symbol, UnixNanos, Venue,
@@ -138,6 +142,10 @@ pub fn config(bars_dir: PathBuf, limits_path: PathBuf) -> EngineConfig {
         limits_path,
         seed: 0,
         source: "engine".to_owned(),
+        signature: SignatureRule {
+            manifest: PathBuf::from("research/signed/trend-v1.manifest.json"),
+            required: false,
+        },
     }
 }
 

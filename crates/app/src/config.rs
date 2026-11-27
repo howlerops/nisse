@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use chrono::{Datelike, NaiveDate};
 use nisse_alpaca_adapter::Feed;
 use nisse_core::nautilus::Symbol;
+use nisse_core::{Hash32, signing};
 use serde_json::Value;
 
 use crate::AppError;
@@ -39,9 +40,26 @@ pub struct EngineConfig {
     pub seed: u64,
     /// Heartbeat source name.
     pub source: String,
+    /// Whether the deployment must be signed, and where its manifest is.
+    pub signature: SignatureRule,
+}
+
+/// The `signature` setting: where the deployment's manifest is and whether it must verify.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignatureRule {
+    pub manifest: PathBuf,
+    pub required: bool,
 }
 
 /// The file as written: strings for symbols, feed and dates, checked by [`EngineConfig::parse`].
+/// The `signature` object as written. Unknown keys and a non-boolean `required` are errors.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSignature {
+    manifest: String,
+    required: bool,
+}
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
@@ -57,6 +75,7 @@ struct RawConfig {
     seed: Value,
     #[serde(default = "default_source")]
     source: String,
+    signature: RawSignature,
 }
 
 fn default_source() -> String {
@@ -168,6 +187,8 @@ impl EngineConfig {
             return Err(invalid("source must not be empty"));
         }
 
+        let manifest = check_path("signature.manifest", &raw.signature.manifest)?;
+
         Ok(Self {
             strategy: raw.strategy,
             symbols,
@@ -181,6 +202,10 @@ impl EngineConfig {
                 .as_u64()
                 .ok_or_else(|| invalid("seed must be a non-negative integer (u64)"))?,
             source: raw.source,
+            signature: SignatureRule {
+                manifest,
+                required: raw.signature.required,
+            },
         })
     }
 
@@ -189,6 +214,17 @@ impl EngineConfig {
         let text = std::fs::read_to_string(path)
             .map_err(|e| invalid(format!("cannot read {}: {e}", path.display())))?;
         Self::parse(&text)
+    }
+
+    /// The deployment hash of this config: what the engine trades (strategy, universe and
+    /// benchmark). See `nisse_core::signing::deployment_hash`.
+    pub fn deployment_hash(&self) -> Result<Hash32, AppError> {
+        let symbols: Vec<&str> = self.symbols.iter().map(Symbol::as_str).collect();
+        Ok(signing::deployment_hash(
+            &self.strategy,
+            &symbols,
+            self.benchmark.as_str(),
+        )?)
     }
 
     /// Every symbol whose bars are fetched: the universe plus the benchmark, sorted, no duplicate.
@@ -264,6 +300,11 @@ mod tests {
         );
         assert_eq!(config.seed, 0);
         assert_eq!(config.source, "engine");
+        assert_eq!(
+            config.signature.manifest,
+            PathBuf::from("research/signed/trend-v1.manifest.json")
+        );
+        assert!(!config.signature.required);
         assert_eq!(config.strategy["strategy"], "trend_vol_target");
         assert_eq!(config.fetch_symbols().len(), 8);
     }
@@ -296,6 +337,7 @@ mod tests {
             "bars_dir",
             "limits_path",
             "seed",
+            "signature",
         ];
         for key in required {
             let message = refused(|v| {
@@ -465,6 +507,76 @@ mod tests {
         assert!(message.contains("strategy"), "{message}");
         let message = refused(|v| v["strategy"] = json!(["trend_vol_target"]));
         assert!(message.contains("strategy"), "{message}");
+    }
+
+    #[test]
+    fn missing_signature_is_refused() {
+        let message = refused(|v| {
+            v.as_object_mut().expect("object").remove("signature");
+        });
+        assert!(message.contains("signature"), "{message}");
+    }
+
+    #[test]
+    fn unknown_key_inside_signature_is_refused() {
+        let message = refused(|v| v["signature"]["extra"] = json!(true));
+        assert!(message.contains("extra"), "{message}");
+    }
+
+    #[test]
+    fn empty_signature_manifest_is_refused() {
+        let message = refused(|v| v["signature"]["manifest"] = json!("  "));
+        assert!(message.contains("signature.manifest"), "{message}");
+    }
+
+    #[test]
+    fn non_boolean_signature_required_is_refused() {
+        for bad in [json!("false"), json!(0), json!(null)] {
+            let message = refused(|v| v["signature"]["required"] = bad.clone());
+            assert!(message.contains("boolean"), "{bad}: {message}");
+        }
+    }
+
+    #[test]
+    fn signature_required_true_is_accepted() {
+        let config = accepted(|v| v["signature"]["required"] = json!(true));
+        assert!(config.signature.required);
+    }
+
+    #[test]
+    fn deployment_hash_of_repository_config_matches_research_config() {
+        // The paper engine config and the research config must trade the same deployment.
+        // Only the trading parameters are read here, with serde_json alone.
+        let config = EngineConfig::parse(VALID).expect("repository config parses");
+        let research_text = include_str!("../../../research/configs/trend-v1.json");
+        let research: Value = serde_json::from_str(research_text).expect("research config is JSON");
+        let symbols: Vec<&str> = research["symbols"]
+            .as_array()
+            .expect("symbols is an array")
+            .iter()
+            .map(|s| s.as_str().expect("symbol is a string"))
+            .collect();
+        let benchmark = research["benchmark"]
+            .as_str()
+            .expect("benchmark is a string");
+        let expected = signing::deployment_hash(&research["strategy"], &symbols, benchmark)
+            .expect("research deployment hashes");
+        assert_eq!(
+            config.deployment_hash().expect("engine deployment hashes"),
+            expected
+        );
+    }
+
+    #[test]
+    fn deployment_hash_changes_with_a_strategy_parameter() {
+        let base = EngineConfig::parse(VALID)
+            .expect("parses")
+            .deployment_hash()
+            .unwrap();
+        let changed = accepted(|v| v["strategy"]["lookback_days"] = json!(253))
+            .deployment_hash()
+            .unwrap();
+        assert_ne!(base, changed);
     }
 
     #[test]
