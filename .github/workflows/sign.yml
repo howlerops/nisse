@@ -1,0 +1,75 @@
+# Signs the research configs on main. Runs only on a push to main (that is, after a person
+# merged) or when started by hand, never on a pull request: a pull request must not be able
+# to reach the signing key. The key is the secret NISSE_SIGNING_KEY of the environment
+# "signing"; restrict that environment to the main branch in the repository settings.
+#
+# The manifests are printed to the job summary. Copy the one you want to
+# research/signed/<name>.manifest.json on the engine host (docs/runbooks/research-agents.md).
+# Actions are pinned by commit SHA. Changes under .github/ are a sensitive path (see CLAUDE.md).
+name: Sign research configs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "research/configs/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sign-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  sign:
+    name: sign
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    environment: signing
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: sign-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: |
+            sign-${{ runner.os }}-
+
+      # Built before the key is in the environment of any step.
+      - name: Build the signer
+        run: cargo build --locked -p nisse-eval --bin nisse-sign
+
+      - name: Sign every config on main
+        env:
+          NISSE_SIGNING_KEY: ${{ secrets.NISSE_SIGNING_KEY }}
+        run: |
+          if [[ -z "$NISSE_SIGNING_KEY" ]]; then
+            echo "::error::The secret NISSE_SIGNING_KEY is not set in the 'signing' environment."
+            exit 1
+          fi
+          shopt -s nullglob
+          for config in research/configs/*.json; do
+            {
+              echo "### $config"
+              echo '```json'
+              target/debug/nisse-sign "$config"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          done
