@@ -13,6 +13,7 @@ mod hash;
 mod ids;
 mod order;
 mod record;
+pub mod signing;
 mod types;
 
 pub use calendar::{FULL_SESSION_NANOS, MarketCalendar, Session};

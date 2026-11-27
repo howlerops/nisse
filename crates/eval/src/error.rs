@@ -26,6 +26,9 @@ pub enum EvalError {
     /// than the plan allows.
     #[error("invalid gates: {0}")]
     InvalidGates(String),
+    /// A research config, its note or a proposal's set of changes breaks a rule.
+    #[error("invalid proposal: {0}")]
+    InvalidProposal(String),
     /// The risk limits file could not be read or is not acceptable.
     #[error(transparent)]
     Risk(#[from] nisse_risk::RiskError),

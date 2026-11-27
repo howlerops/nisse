@@ -1,0 +1,20 @@
+{
+  "name": "trend-v1",
+  "family": "trend",
+  "created": "2026-11-27",
+  "parent": null,
+  "strategy": {
+    "strategy": "trend_vol_target",
+    "lookback_days": 252,
+    "skip_days": 21,
+    "vol_window": 60,
+    "target_vol": "0.09",
+    "max_weight": "0.125",
+    "min_trade_notional": "25",
+    "sessions_per_year": 252
+  },
+  "symbols": ["DBC", "EEM", "EFA", "GLD", "IEF", "SPY", "TLT", "VNQ"],
+  "benchmark": "SPY",
+  "rationale": "research/notes/trend-v1.md",
+  "expected_effect": "A diversified, slow trend book targeting 9% volatility: lower drawdowns than holding the universe, at the cost of lagging sharp reversals."
+}

@@ -5,6 +5,10 @@ pub enum AppError {
     /// for something this build refuses (an environment other than paper).
     #[error("invalid engine config: {0}")]
     InvalidConfig(String),
+    /// The engine's config requires a signed deployment and does not have one: the manifest
+    /// is missing, does not verify, or is for a different deployment or stage.
+    #[error("unsigned deployment: {0}")]
+    Unsigned(String),
     /// Another engine process holds the database lock. Nothing was done.
     #[error("another engine process is running")]
     Busy,
