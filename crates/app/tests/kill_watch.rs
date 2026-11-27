@@ -114,11 +114,30 @@ fn resting_sell(id: &str) -> OrderIntent {
     }
 }
 
-/// The simulated broker, counting the calls to `open_orders`, which fail when `list_fails`.
+/// The simulated broker, counting the calls to `open_orders`, with faults that can be turned
+/// on: the listing fails, a cancel of everything is accepted and does nothing, or the account
+/// cannot be read.
+#[derive(Default)]
+struct Faults {
+    list_fails: bool,
+    cancel_all_does_nothing: bool,
+    account_fails: bool,
+}
+
 struct Counting<'a> {
     sim: &'a SimBroker,
     opens: AtomicUsize,
-    list_fails: bool,
+    faults: Faults,
+}
+
+impl<'a> Counting<'a> {
+    fn with(sim: &'a SimBroker, faults: Faults) -> Self {
+        Self {
+            sim,
+            opens: AtomicUsize::new(0),
+            faults,
+        }
+    }
 }
 
 impl Broker for Counting<'_> {
@@ -133,6 +152,9 @@ impl Broker for Counting<'_> {
     }
 
     async fn cancel_all(&self) -> Result<(), SimError> {
+        if self.faults.cancel_all_does_nothing {
+            return Ok(());
+        }
         self.sim.cancel_all().await
     }
 
@@ -153,7 +175,7 @@ impl Broker for Counting<'_> {
 
     async fn open_orders(&self) -> Result<OpenOrders, SimError> {
         self.opens.fetch_add(1, Ordering::SeqCst);
-        if self.list_fails {
+        if self.faults.list_fails {
             return Err(SimError("the broker could not list its orders".to_owned()));
         }
         self.sim.open_orders().await
@@ -164,6 +186,9 @@ impl Broker for Counting<'_> {
     }
 
     async fn account(&self) -> Result<AccountSnapshot, SimError> {
+        if self.faults.account_fails {
+            return Err(SimError("the broker refused the keys".to_owned()));
+        }
         self.sim.account().await
     }
 }
@@ -226,11 +251,7 @@ async fn switch_off_does_not_ask_the_broker() {
     let sim = broker();
     month_end_orders_resting(&f, &sim).await;
     let open = sim.open_orders().await.unwrap().orders.len();
-    let counting = Counting {
-        sim: &sim,
-        opens: AtomicUsize::new(0),
-        list_fails: false,
-    };
+    let counting = Counting::with(&sim, Faults::default());
 
     let outcome = enforce_kill(&f.store, &counting, false, now())
         .await
@@ -242,6 +263,7 @@ async fn switch_off_does_not_ask_the_broker() {
             engaged: false,
             open_orders: 0,
             cancelled: false,
+            failed: false,
         }
     );
     assert_eq!(counting.opens.load(Ordering::SeqCst), 0);
@@ -269,6 +291,7 @@ async fn engaged_with_halting_limits_cancels_everything_and_records_it() {
             engaged: true,
             open_orders: open,
             cancelled: true,
+            failed: false,
         }
     );
     assert!(sim.open_orders().await.unwrap().orders.is_empty());
@@ -280,7 +303,10 @@ async fn engaged_with_halting_limits_cancels_everything_and_records_it() {
         .unwrap()
         .unwrap();
     assert_eq!(status, StepStatus::Done);
-    assert_eq!(detail, json!({"open_orders": open, "flatten": false}));
+    assert_eq!(
+        detail,
+        json!({"open_orders": open, "flatten": false, "remaining": 0})
+    );
 
     f.db.drop_db().await.unwrap();
 }
@@ -301,6 +327,7 @@ async fn engaged_with_nothing_open_cancels_nothing_and_records_nothing() {
             engaged: true,
             open_orders: 0,
             cancelled: false,
+            failed: false,
         }
     );
     assert_eq!(kill_rows(&f.store).await, 0);
@@ -328,6 +355,7 @@ async fn flatten_mode_cancels_the_buys_and_leaves_the_sells() {
             engaged: true,
             open_orders: buys + 1,
             cancelled: true,
+            failed: false,
         }
     );
     let left = sim.open_orders().await.unwrap().orders;
@@ -339,7 +367,10 @@ async fn flatten_mode_cancels_the_buys_and_leaves_the_sells() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(detail, json!({"open_orders": buys + 1, "flatten": true}));
+    assert_eq!(
+        detail,
+        json!({"open_orders": buys + 1, "flatten": true, "remaining": 0})
+    );
 
     f.db.drop_db().await.unwrap();
 }
@@ -361,6 +392,7 @@ async fn flatten_mode_with_only_sells_open_cancels_nothing() {
             engaged: true,
             open_orders: 1,
             cancelled: false,
+            failed: false,
         }
     );
     assert_eq!(sim.open_orders().await.unwrap().orders.len(), 1);
@@ -504,6 +536,7 @@ fn describe_kill_watch_lines() {
             engaged,
             open_orders,
             cancelled,
+            failed: false,
         })
     };
     assert_eq!(line(false, 0, false), "kill-watch: switch off");
@@ -542,11 +575,13 @@ async fn a_halting_switch_cancels_blind_when_the_broker_cannot_list_orders() {
     engage_kill_switch(&f.store, &ManualClock::new(now()), "phone")
         .await
         .unwrap();
-    let no_list = Counting {
-        sim: &sim,
-        opens: AtomicUsize::new(0),
-        list_fails: true,
-    };
+    let no_list = Counting::with(
+        &sim,
+        Faults {
+            list_fails: true,
+            ..Faults::default()
+        },
+    );
 
     let outcome = enforce_kill(&f.store, &no_list, false, now())
         .await
@@ -560,8 +595,21 @@ async fn a_halting_switch_cancels_blind_when_the_broker_cannot_list_orders() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(status, StepStatus::Done);
+    // Sent, but nothing could confirm it: "started", not "done".
+    assert_eq!(status, StepStatus::Started);
     assert!(detail["listing_failed"].is_string(), "{detail}");
+
+    // The next run can list again, finds nothing open, and that confirms the cancel.
+    let outcome = enforce_kill(&f.store, &sim, false, now()).await.unwrap();
+    assert!(!outcome.cancelled, "{outcome:?}");
+    let (status, detail) = f
+        .store
+        .step_status(KILL_RUN_KEY, KILL_CANCEL_STEP)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status, StepStatus::Done);
+    assert_eq!(detail["confirmed_empty"], json!(true));
 
     f.db.drop_db().await.unwrap();
 }
@@ -575,11 +623,13 @@ async fn a_flattening_switch_that_cannot_list_orders_fails_and_says_so() {
     engage_kill_switch(&f.store, &ManualClock::new(now()), "phone")
         .await
         .unwrap();
-    let no_list = Counting {
-        sim: &sim,
-        opens: AtomicUsize::new(0),
-        list_fails: true,
-    };
+    let no_list = Counting::with(
+        &sim,
+        Faults {
+            list_fails: true,
+            ..Faults::default()
+        },
+    );
 
     let err = enforce_kill(&f.store, &no_list, true, now())
         .await
@@ -607,25 +657,44 @@ async fn the_watcher_leaves_a_heartbeat_when_it_did_its_job() {
     let f = fixture().await;
     let sim = broker();
 
-    // Switch off, with and without a broker client: nothing to do, and that is recorded.
-    watch_once(&f.store, Some(&sim), false, now())
+    // Switch off and a broker that answers: nothing to do, and a heartbeat says the watcher
+    // could have cancelled.
+    watch_once(&f.store, Ok(&sim), false, now()).await.unwrap();
+    assert_eq!(watch_beats(&f.store).await, 1);
+
+    // Switch off but no broker client, or a broker that refuses the keys: the watcher could
+    // not cancel if it had to, so it fails and leaves no heartbeat.
+    let err = watch_once(
+        &f.store,
+        Err::<&SimBroker, _>("no keys".to_owned()),
+        false,
+        now(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, AppError::KillNotEnforced(_)), "{err:?}");
+    let locked_out = Counting::with(
+        &sim,
+        Faults {
+            account_fails: true,
+            ..Faults::default()
+        },
+    );
+    watch_once(&f.store, Ok(&locked_out), false, now())
         .await
-        .unwrap();
-    watch_once(&f.store, None::<&SimBroker>, false, now())
-        .await
-        .unwrap();
-    assert_eq!(watch_beats(&f.store).await, 2);
+        .unwrap_err();
+    assert_eq!(watch_beats(&f.store).await, 1);
+    // With the switch off nothing was recorded as a failed kill cancel.
+    assert_eq!(kill_rows(&f.store).await, 0);
 
     // Engaged with orders resting: cancelled, and a heartbeat.
     month_end_orders_resting(&f, &sim).await;
     engage_kill_switch(&f.store, &ManualClock::new(now()), "phone")
         .await
         .unwrap();
-    let outcome = watch_once(&f.store, Some(&sim), false, now())
-        .await
-        .unwrap();
+    let outcome = watch_once(&f.store, Ok(&sim), false, now()).await.unwrap();
     assert!(outcome.cancelled, "{outcome:?}");
-    assert_eq!(watch_beats(&f.store).await, 3);
+    assert_eq!(watch_beats(&f.store).await, 2);
 
     f.db.drop_db().await.unwrap();
 }
@@ -640,12 +709,17 @@ async fn a_watcher_that_cannot_enforce_an_engaged_switch_leaves_no_heartbeat() {
         .unwrap();
 
     // No broker client (missing keys).
-    let err = watch_once(&f.store, None::<&SimBroker>, false, now())
-        .await
-        .unwrap_err();
+    let err = watch_once(
+        &f.store,
+        Err::<&SimBroker, _>("no keys".to_owned()),
+        false,
+        now(),
+    )
+    .await
+    .unwrap_err();
     assert!(matches!(err, AppError::KillNotEnforced(_)), "{err:?}");
     // The cancel is refused.
-    watch_once(&f.store, Some(&CancelFails(&sim)), false, now())
+    watch_once(&f.store, Ok(&CancelFails(&sim)), false, now())
         .await
         .unwrap_err();
 
@@ -658,5 +732,72 @@ async fn a_watcher_that_cannot_enforce_an_engaged_switch_leaves_no_heartbeat() {
         .unwrap();
     assert_eq!(status, StepStatus::Failed);
 
+    f.db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_cancel_the_broker_accepted_but_did_not_carry_out_is_not_called_done() {
+    let f = fixture().await;
+    let sim = broker();
+    month_end_orders_resting(&f, &sim).await;
+    let resting = sim.open_orders().await.unwrap().orders.len();
+    engage_kill_switch(&f.store, &ManualClock::new(now()), "phone")
+        .await
+        .unwrap();
+    // The broker answers "accepted" and cancels nothing (what a per-order failure inside a
+    // multi-status answer looks like from outside).
+    let sticky = Counting::with(
+        &sim,
+        Faults {
+            cancel_all_does_nothing: true,
+            ..Faults::default()
+        },
+    );
+
+    let outcome = enforce_kill(&f.store, &sticky, false, now()).await.unwrap();
+
+    assert!(outcome.cancelled, "{outcome:?}");
+    let (status, detail) = f
+        .store
+        .step_status(KILL_RUN_KEY, KILL_CANCEL_STEP)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status, StepStatus::Started);
+    assert_eq!(detail["remaining"], json!(resting));
+
+    f.db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_lost_store_connection_is_an_error_and_cancels_nothing() {
+    let f = fixture().await;
+    let sim = broker();
+    month_end_orders_resting(&f, &sim).await;
+    let resting = sim.open_orders().await.unwrap().orders.len();
+
+    // The switch is OFF. The store's connection is then killed from another one, as a
+    // database restart would: the read fails, which says nothing about the switch.
+    let pid: i32 = f
+        .store
+        .client()
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let other = f.db.client().await.unwrap();
+    other
+        .execute("SELECT pg_terminate_backend($1)", &[&pid])
+        .await
+        .unwrap();
+
+    let err = enforce_kill(&f.store, &sim, false, now())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, AppError::Store(_)), "{err:?}");
+    assert_eq!(sim.open_orders().await.unwrap().orders.len(), resting);
+
+    drop(other);
     f.db.drop_db().await.unwrap();
 }

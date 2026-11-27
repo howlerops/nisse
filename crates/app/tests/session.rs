@@ -1022,7 +1022,10 @@ async fn session_close_cancels_and_records_the_kill_cancel_step_under_the_kill_k
         .unwrap()
         .unwrap();
     assert_eq!(status, StepStatus::Done);
-    assert_eq!(detail, json!({"open_orders": open, "flatten": false}));
+    assert_eq!(
+        detail,
+        json!({"open_orders": open, "flatten": false, "remaining": 0})
+    );
     assert!(sim.open_orders().await.unwrap().orders.is_empty());
     // The session's own run key carries no kill step any more.
     assert_eq!(

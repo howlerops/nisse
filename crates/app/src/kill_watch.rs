@@ -9,7 +9,7 @@ use nisse_core::nautilus::{OrderSide, UnixNanos};
 use nisse_core::{Broker, KillSwitchSource, OpenOrders};
 use nisse_engine::EngineError;
 use nisse_risk::Limits;
-use nisse_store::{Store, tables::engine_step::StepStatus};
+use nisse_store::{Store, StoreError, tables::engine_step::StepStatus};
 use serde_json::json;
 
 use crate::AppError;
@@ -21,37 +21,69 @@ pub const KILL_CANCEL_STEP: &str = "cancel";
 /// What enforcing the kill switch found and did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KillEnforcement {
-    /// The store says the switch is engaged. A newest switch row that cannot be read counts as
-    /// engaged; a store that cannot be reached at all is an error, and nothing is cancelled
-    /// (a database outage must not cancel orders every minute).
+    /// The store says the switch is engaged. A newest switch row that cannot be understood
+    /// counts as engaged; any other failure to read the switch is an error, and nothing is
+    /// cancelled (a database outage must not cancel orders every minute).
     pub engaged: bool,
-    /// Orders the broker had open when it was asked (0 when the switch is off: the broker is not asked).
+    /// Orders the broker had open when it was asked (0 when the switch is off, when the
+    /// broker is not asked, and when it could not say).
     pub open_orders: usize,
     /// A cancel was sent.
     pub cancelled: bool,
+    /// A cancel was refused and the run went on (only with `flatten_on_kill`; without it a
+    /// refused cancel is an error). The failure is recorded as a step.
+    pub failed: bool,
+}
+
+impl KillEnforcement {
+    const OFF: Self = Self {
+        engaged: false,
+        open_orders: 0,
+        cancelled: false,
+        failed: false,
+    };
+}
+
+/// Reads the switch. `Ok(true)` also for a newest switch row that cannot be understood
+/// (someone wrote a kill row this build cannot read: fail closed). Any other error, such as a
+/// lost connection, is returned: it says nothing about the switch.
+async fn switch_engaged(store: &Store) -> Result<bool, AppError> {
+    match store.kill_switch_engaged().await {
+        Ok(engaged) => Ok(engaged),
+        Err(StoreError::Data(_)) => Ok(true),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// How many of `open` an engaged switch wants gone: every order when the switch halts (or
+/// when something the engine cannot represent is open), the buys when it flattens.
+fn targets(open: &OpenOrders, flatten_on_kill: bool) -> usize {
+    let unrepresentable = usize::try_from(open.unrepresentable).unwrap_or(usize::MAX);
+    if !flatten_on_kill || unrepresentable > 0 {
+        open.orders.len().saturating_add(unrepresentable)
+    } else {
+        open.orders
+            .iter()
+            .filter(|order| order.side == OrderSide::Buy)
+            .count()
+    }
 }
 
 /// Enforces the kill switch from the store and the broker alone: no trader, no bar files, no
 /// signature, no engine lock. Safe to run at any time, alongside any other engine command.
+///
+/// What it records under `kill` / `cancel`, which the phone shows: `started` when cancels
+/// were sent but the broker still lists orders that should be gone (or could not be asked);
+/// `done` only when a listing made after the cancel shows none left; `failed` with the error
+/// when a cancel was refused or could not be attempted.
 pub async fn enforce_kill<B: Broker>(
     store: &Store,
     broker: &B,
     flatten_on_kill: bool,
     now: UnixNanos,
 ) -> Result<KillEnforcement, AppError> {
-    let engaged = match store.kill_switch_engaged().await {
-        Ok(engaged) => engaged,
-        Err(err) => {
-            tracing::error!(error = %err, "kill switch unreadable; treating it as engaged");
-            true
-        }
-    };
-    if !engaged {
-        return Ok(KillEnforcement {
-            engaged: false,
-            open_orders: 0,
-            cancelled: false,
-        });
+    if !switch_engaged(store).await? {
+        return Ok(KillEnforcement::OFF);
     }
 
     let open = match broker.open_orders().await {
@@ -65,11 +97,26 @@ pub async fn enforce_kill<B: Broker>(
         .orders
         .len()
         .saturating_add(usize::try_from(open.unrepresentable).unwrap_or(usize::MAX));
-    if open_orders == 0 {
+    if targets(&open, flatten_on_kill) == 0 {
+        // Nothing left to cancel. If the last cancel was sent but never confirmed, this
+        // listing is the confirmation.
+        if matches!(
+            store.step_status(KILL_RUN_KEY, KILL_CANCEL_STEP).await?,
+            Some((StepStatus::Started, _))
+        ) {
+            record(
+                store,
+                StepStatus::Done,
+                json!({"confirmed_empty": true}),
+                now,
+            )
+            .await?;
+        }
         return Ok(KillEnforcement {
             engaged: true,
-            open_orders: 0,
+            open_orders,
             cancelled: false,
+            failed: false,
         });
     }
 
@@ -83,28 +130,41 @@ pub async fn enforce_kill<B: Broker>(
         if !flatten_on_kill {
             return Err(AppError::Engine(err));
         }
-    } else if cancelled {
-        store
-            .record_step(
-                KILL_RUN_KEY,
-                KILL_CANCEL_STEP,
-                StepStatus::Done,
-                &json!({"open_orders": open_orders, "flatten": flatten_on_kill}),
-                now,
-            )
-            .await?;
+        return Ok(KillEnforcement {
+            engaged: true,
+            open_orders,
+            cancelled,
+            failed: true,
+        });
     }
+
+    // The broker accepting a cancel is not the orders being gone (it answers before it has
+    // cancelled, and may fail order by order): look again, and say "done" only for an empty
+    // list.
+    let remaining = match broker.open_orders().await {
+        Ok(after) => Some(targets(&after, flatten_on_kill)),
+        Err(_) => None,
+    };
+    let detail =
+        json!({"open_orders": open_orders, "flatten": flatten_on_kill, "remaining": remaining});
+    let status = if remaining == Some(0) {
+        StepStatus::Done
+    } else {
+        StepStatus::Started
+    };
+    record(store, status, detail, now).await?;
     Ok(KillEnforcement {
         engaged: true,
         open_orders,
         cancelled,
+        failed: false,
     })
 }
 
 /// The broker could not list its open orders while the switch is engaged. A switch that
-/// halts does not need the list: everything is cancelled blind, and that is recorded. One
-/// that flattens must not cancel the exits, so it cannot act without the list: the failure
-/// is recorded and returned.
+/// halts does not need the list: everything is cancelled blind, recorded as `started` because
+/// nothing can confirm it. One that flattens must not cancel the exits, so it cannot act
+/// without the list: the failure is recorded and returned.
 async fn listing_failed<B: Broker>(
     store: &Store,
     broker: &B,
@@ -121,80 +181,90 @@ async fn listing_failed<B: Broker>(
         record_failure(store, &err, now).await;
         return Err(AppError::Engine(err));
     }
-    store
-        .record_step(
-            KILL_RUN_KEY,
-            KILL_CANCEL_STEP,
-            StepStatus::Done,
-            &json!({"open_orders": null, "flatten": false, "listing_failed": listing_error.to_string()}),
-            now,
-        )
-        .await?;
+    record(
+        store,
+        StepStatus::Started,
+        json!({"flatten": false, "remaining": null, "listing_failed": listing_error.to_string()}),
+        now,
+    )
+    .await?;
     Ok(KillEnforcement {
         engaged: true,
         open_orders: 0,
         cancelled: true,
+        failed: false,
     })
 }
 
+/// Appends one `kill` / `cancel` row.
+async fn record(
+    store: &Store,
+    status: StepStatus,
+    detail: serde_json::Value,
+    now: UnixNanos,
+) -> Result<(), AppError> {
+    store
+        .record_step(KILL_RUN_KEY, KILL_CANCEL_STEP, status, &detail, now)
+        .await?;
+    Ok(())
+}
+
 /// Records that enforcing the switch failed, so it can be seen from the phone. If the record
-/// itself cannot be written, that is logged: the caller still has the error.
+/// itself cannot be written, that goes to standard error (the engine installs no log
+/// subscriber): the caller still has the error.
 async fn record_failure(store: &Store, err: &impl std::fmt::Display, now: UnixNanos) {
-    let body = json!({"error": err.to_string()});
-    if let Err(record_err) = store
-        .record_step(
-            KILL_RUN_KEY,
-            KILL_CANCEL_STEP,
-            StepStatus::Failed,
-            &body,
-            now,
-        )
-        .await
+    if let Err(record_err) = record(
+        store,
+        StepStatus::Failed,
+        json!({"error": err.to_string()}),
+        now,
+    )
+    .await
     {
-        tracing::error!(
-            step = KILL_CANCEL_STEP,
-            error = %record_err,
-            "could not record the failed kill cancel"
-        );
+        eprintln!("nisse-engine: could not record the failed kill cancel: {record_err}");
     }
 }
 
-/// The heartbeat source the watcher writes under after every run that did its job.
+/// The heartbeat source the watcher writes under after every run that could have cancelled.
 pub const WATCH_SOURCE: &str = "kill-watch";
 
-/// One run of the watcher: enforce the switch, then write the watcher's own heartbeat, so
-/// that a watcher that is not running (or cannot do its job) can be told from one with
-/// nothing to do. `broker` is `None` when no broker client could be built (missing keys):
-/// that only matters when the switch is engaged, and then it is a recorded failure.
+/// One run of the watcher: enforce the switch, then write the watcher's own heartbeat.
+///
+/// The heartbeat means "a kill engaged now would have been enforced": the store was read,
+/// the broker answered an authenticated request, and no cancel was refused. So `broker` being
+/// `Err` (no client could be built: the reason is given), a broker that does not answer, and
+/// a refused cancel all end without a heartbeat, and the phone then shows the watcher as not
+/// running, which for its purpose it is not.
 pub async fn watch_once<B: Broker>(
     store: &Store,
-    broker: Option<&B>,
+    broker: Result<&B, String>,
     flatten_on_kill: bool,
     now: UnixNanos,
 ) -> Result<KillEnforcement, AppError> {
-    let outcome = match broker {
-        Some(broker) => enforce_kill(store, broker, flatten_on_kill, now).await?,
-        None => {
-            let engaged = match store.kill_switch_engaged().await {
-                Ok(engaged) => engaged,
-                Err(err) => {
-                    tracing::error!(error = %err, "kill switch unreadable; treating it as engaged");
-                    true
-                }
-            };
-            if engaged {
-                let message = "the kill switch is engaged but there is no broker client: \
-                               open orders were NOT cancelled";
+    let broker = match broker {
+        Ok(broker) => broker,
+        Err(reason) => {
+            let message = format!("no broker client: {reason}");
+            if switch_engaged(store).await? {
                 record_failure(store, &message, now).await;
-                return Err(AppError::KillNotEnforced(message.to_owned()));
             }
-            KillEnforcement {
-                engaged: false,
-                open_orders: 0,
-                cancelled: false,
-            }
+            return Err(AppError::KillNotEnforced(message));
         }
     };
+    let outcome = enforce_kill(store, broker, flatten_on_kill, now).await?;
+    if outcome.failed {
+        return Err(AppError::KillNotEnforced(
+            "a cancel was refused; see the kill/cancel step".to_owned(),
+        ));
+    }
+    if !outcome.engaged {
+        // The switch is off, so the broker was not needed. Ask it something anyway: a
+        // watcher whose keys no longer work must not look healthy.
+        broker
+            .account()
+            .await
+            .map_err(|err| EngineError::Broker(Box::new(err)))?;
+    }
     store.heartbeat(WATCH_SOURCE, now).await?;
     Ok(outcome)
 }
@@ -236,7 +306,9 @@ pub fn flatten_on_kill(limits_path: &Path) -> bool {
     match Limits::load(limits_path) {
         Ok(limits) => limits.flatten_on_kill,
         Err(err) => {
-            tracing::error!(error = %err, "limits unreadable; a kill halts and cancels everything");
+            eprintln!(
+                "nisse-engine: limits unreadable ({err}); a kill halts and cancels everything"
+            );
             false
         }
     }

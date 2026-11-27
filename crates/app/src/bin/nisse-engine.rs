@@ -223,16 +223,19 @@ async fn run_kill_watch(config_path: &std::path::Path) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // The broker client is only needed when the switch is engaged; missing keys are not an
-    // error while it is off. `watch_once` records the failure when they are needed and absent.
-    let trading = match alpaca_http() {
-        Ok(http) => Some(AlpacaTrading::new(
-            http,
-            &AlpacaConfig::paper(nisse_alpaca_adapter::Feed::Iex),
-        )),
-        Err(_) => None,
-    };
-    match watch_once(&store, trading.as_ref(), flatten, SystemClock.now()).await {
+    // No client (missing keys, for example) is passed on with its reason: the watcher then
+    // fails, and leaves no heartbeat, because it could not cancel if it had to.
+    let trading = alpaca_http()
+        .map(|http| AlpacaTrading::new(http, &AlpacaConfig::paper(nisse_alpaca_adapter::Feed::Iex)))
+        .map_err(|err| err.to_string());
+    match watch_once(
+        &store,
+        trading.as_ref().map_err(Clone::clone),
+        flatten,
+        SystemClock.now(),
+    )
+    .await
+    {
         Ok(outcome) => {
             println!("{}", commands::describe_kill_watch(&outcome));
             ExitCode::SUCCESS
