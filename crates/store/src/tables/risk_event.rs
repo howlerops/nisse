@@ -93,3 +93,33 @@ pub async fn kill_switch_engaged<C: GenericClient>(client: &C) -> Result<bool, S
         }
     }
 }
+
+/// The `hash` of the newest `limits_loaded` row (by id); `None` when there is none. A newest
+/// row whose `hash` is missing or not a string is a `Data` error, so the caller can tell a
+/// limits file that changed from one that cannot be identified.
+pub async fn latest_limits_hash<C: GenericClient>(
+    client: &C,
+) -> Result<Option<String>, StoreError> {
+    let kind = <&'static str>::from(RiskEventKind::LimitsLoaded);
+    let row = client
+        .query_opt(
+            "SELECT detail FROM risk_event WHERE kind = $1 ORDER BY id DESC LIMIT 1",
+            &[&kind],
+        )
+        .await?;
+    match row {
+        None => Ok(None),
+        Some(row) => {
+            let detail: Value = row.try_get("detail")?;
+            detail
+                .get("hash")
+                .and_then(Value::as_str)
+                .map(|hash| Some(hash.to_string()))
+                .ok_or_else(|| {
+                    StoreError::Data(
+                        "limits_loaded risk_event has no string \"hash\" in its detail".to_string(),
+                    )
+                })
+        }
+    }
+}

@@ -5,6 +5,7 @@
 
 pub mod decision;
 pub mod decision_holdout;
+pub mod engine_step;
 pub mod eval_score;
 pub mod fill;
 pub mod heartbeat;
