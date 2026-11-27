@@ -6,11 +6,14 @@ the owner's; none of it has been done.
 ## What the app can do
 
 Read the store, and engage the kill switch. It cannot release the switch, write anything
-else, or reach the broker. Engaging from the phone writes a row; every engine run reads the
-switch when it starts, and a run that finds it engaged cancels the open orders. Ticks run
-every two minutes in market hours, so "engaged from the phone" means: no new orders from
-that moment the row is read, open orders cancelled within one tick. For an immediate and
-complete stop, `deploy/engine.sh kill --by <name>` on the host, or the out-of-band steps in
+else, or reach the broker. Engaging from the phone writes a row. On the host a watcher
+(`nisse-engine kill-watch`, every minute, day and night) reads the switch and, when it is
+engaged, cancels what is open at the broker; every engine run also reads the switch first,
+and again just before it would send orders. So "engaged from the phone" means: open orders
+cancelled within about a minute at any hour, and no new ones, except that a rebalance in
+the very act of sending may still send, and is then cancelled by the watcher. The watcher
+must be running: it is a line in `deploy/crontab`. For an immediate and complete stop,
+`deploy/engine.sh kill --by <name>` on the host, or the out-of-band steps in
 `docs/runbooks/kill-switch.md`, remain the stronger tools.
 
 ## Decide first
@@ -26,8 +29,9 @@ needs one new dependency in the app's Rust module.
    function). Create the phone's login, a member of `nisse_ui` only:
    `CREATE ROLE nisse_phone LOGIN PASSWORD '...' IN ROLE nisse_ui;`
    Let that login connect only from the private network (`pg_hba.conf`).
-2. **Engine.** The host must be running the build that includes Phase 8 (the engine cancels
-   open orders when it finds the switch engaged).
+2. **Engine.** The host must be running the build that includes Phase 8, and its crontab
+   must have the `kill-watch` line (re-install `deploy/crontab`). Check `log/killwatch.log`
+   gets "kill-watch: switch off" every minute.
 3. **Native Shell.** Install it on your computer (`https://nsh.dev/docs/installation`), the
    same version as the `nsh-*` crates in `ui/ext/nisse-native/Cargo.toml` (0.7.2).
 4. **Check and run.** In `ui/`: `nsh check` (TypeScript types: this has never been run),
@@ -49,8 +53,10 @@ not send makes its reconciliation stop.
 1. On the phone, Status shows "Kill switch: off" and a recent heartbeat.
 2. Kill: type your name, "Engage kill switch", "Yes, engage now". The app shows
    "Kill switch ENGAGED" only after reading it back.
-3. Within one tick, `log/tick.log` on the host has a line ending
-   "open orders cancelled (kill switch)", and Alpaca shows no open orders.
+3. Within about a minute, the app's Activity screen shows "kill  cancel: done",
+   `log/killwatch.log` on the host has "switch ENGAGED; N open orders cancelled", and Alpaca
+   shows no open orders. Repeat the test once in the evening, with the market closed and an
+   order resting for the next open: that is the case the watcher exists for.
 4. Status on the phone shows "Kill switch: ENGAGED".
 5. Turn the phone's network off and open the app: it shows "CANNOT CONFIRM", never a state.
 6. Release on the host: `deploy/engine.sh release-kill --by <name>`. Status shows "off".

@@ -40,8 +40,9 @@ exits 1 unless all were: then run it again, or go out of band. Every
 engine run reads the flag when it starts. `status` shows the flag, the drawdown mode,
 positions and the last heartbeat without changing anything.
 
-The phone UI that sets the flag is Phase 8. If the host cannot be reached, use the
-out-of-band steps below.
+From the phone (Phase 8, `docs/runbooks/phone-ui.md`) the flag can be engaged but not
+released; a watcher on the host (`nisse-engine kill-watch`, every minute) then cancels what is
+open. If neither the host nor the app can be reached, use the out-of-band steps below.
 
 ## 2. Out of band, at Alpaca
 
