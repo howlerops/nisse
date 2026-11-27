@@ -124,10 +124,15 @@ jobs:
           # The merge result as plain files, for the checker to read (never to run). Written
           # with checkout-index from a scratch index, not `git archive`: an archive obeys
           # export-ignore attributes in the tree, which would let a tree hide files from
-          # its own judge.
+          # its own judge. For the same reason no attribute from the tree is applied while
+          # writing (--attr-source names an empty tree): otherwise the tree's .gitattributes
+          # could rewrite files (ident, eol) or invoke a configured filter such as LFS on them.
           mkdir merged
+          empty_tree="$(git -C base mktree < /dev/null)"
+          export GIT_LFS_SKIP_SMUDGE=1 GIT_ATTR_NOSYSTEM=1
           GIT_INDEX_FILE="$PWD/merged.index" git -C base read-tree "$tree"
-          GIT_INDEX_FILE="$PWD/merged.index" git -C base checkout-index --all --prefix="$PWD/merged/"
+          GIT_INDEX_FILE="$PWD/merged.index" git -C base --attr-source="$empty_tree" \
+            checkout-index --all --prefix="$PWD/merged/"
 
           echo "agent=$agent" >> "$GITHUB_OUTPUT"
           if [[ "$agent" == true || "$research" == true ]]; then

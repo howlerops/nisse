@@ -34,7 +34,9 @@ cd "$(dirname "$0")/.."
 
 # The code that is about to run next to the store must be main's, unmodified.
 # Untracked files count: cargo would use an untracked build script or .cargo/config.toml.
-if [[ -n "$(git status --porcelain --untracked-files=normal)" ]]; then
+# Captured first, so that a failing `git status` stops the script and is not read as "clean".
+dirty="$(git status --porcelain --untracked-files=normal)"
+if [[ -n "$dirty" ]]; then
   echo "evaluate-proposal: this checkout has modified or untracked files; run from a clean checkout of main" >&2
   exit 2
 fi

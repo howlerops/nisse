@@ -84,7 +84,13 @@ Treat it as untrusted input. Before merging:
   gate report.
 - Just before merging, re-run the "Research proposal" job (it judges against `main` as it is
   now; an old green result does not account for anything merged since, or for the proposal's
-  date having gone stale).
+  date having gone stale). If `.github/workflows/proposal.yml` itself has changed on `main`
+  since the pull request's last run, close and reopen the pull request instead: a re-run
+  keeps the workflow file of the original run.
+- Read the result in the "Research proposal" workflow's own run, not from the list of check
+  names: the run says "Judging against main at <commit>" and ends with `proposal check: ok`.
+  A pull request from a fork also runs the fork's copy of the ordinary CI workflow, which
+  could contain a job with a reassuring name.
 - A person merges. Paper or recent live results are never a reason to merge.
 
 ## Turning it off
