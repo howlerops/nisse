@@ -875,10 +875,11 @@ async fn a_decision_with_a_too_old_base_bar_is_counted_apart_from_waiting() {
 
 #[tokio::test]
 async fn a_decision_19h59m_after_its_bar_is_not_counted_as_too_old() {
-    // The same gap, but the decision is 19 hours 59 minutes after session 0: inside the age
-    // limit, so it is never counted as too old (the exact boundary is pinned in `outcome`).
-    let fx = Fixture::new("recent", &bars_with_aaa_gaps(SESSIONS, &[1, 2, 3])).await;
-    seed_decision(
+    // AAA has every session, so the only thing under test is the age limit: the decision is 19
+    // hours 59 minutes after session 0, inside the limit, so it is scored from session 0 and never
+    // counted as too old (the exact boundary is pinned in `outcome`).
+    let fx = Fixture::new("recent", &bars_for(SESSIONS, None)).await;
+    let id = seed_decision(
         &fx.client,
         fx.version,
         "AAA",
@@ -889,7 +890,64 @@ async fn a_decision_19h59m_after_its_bar_is_not_counted_as_too_old() {
     let report = score_outcomes(&fx.client, &fx.reader(), &gates(), now())
         .await
         .unwrap();
-    assert_eq!(report.base_too_old, 0);
+    assert_eq!(
+        report,
+        OutcomeReport {
+            written: 3,
+            quality_scores: 3,
+            waiting: 0,
+            base_too_old: 0
+        }
+    );
+    assert_eq!(outcome_count(&fx.client, id).await, 3);
+    assert_eq!(quality_scores(&fx.client, id).await.len(), 3);
+
+    fx.finish().await;
+}
+
+#[tokio::test]
+async fn a_decision_a_day_after_the_newest_bar_waits_then_is_scored() {
+    // The nightly job runs before today's bar is ingested: the file ends at session 29, and the
+    // decisions are stamped 24 hours later, at session 30's close. Nothing later exists, so they
+    // are waiting, not too old.
+    let fx = Fixture::new("day-ahead", &bars_for(SESSIONS, None)).await;
+    let first = fx.decision("AAA", SESSIONS, Some(0.16)).await;
+    let second = fx.decision("AAA", SESSIONS, Some(0.16)).await;
+    let reader = fx.reader();
+    let gates = gates();
+
+    let waiting = score_outcomes(&fx.client, &reader, &gates, now())
+        .await
+        .unwrap();
+    assert_eq!(
+        waiting,
+        OutcomeReport {
+            written: 0,
+            quality_scores: 0,
+            waiting: 6,
+            base_too_old: 0
+        }
+    );
+    assert_eq!(outcome_count(&fx.client, first).await, 0);
+    assert_eq!(outcome_count(&fx.client, second).await, 0);
+
+    // Today's bars arrive: a complete file that includes session 30 and the sessions after it.
+    fx.add_bars("0002-bars.parquet", &bars_for(60, None));
+    let scored = score_outcomes(&fx.client, &reader, &gates, now())
+        .await
+        .unwrap();
+    assert_eq!(
+        scored,
+        OutcomeReport {
+            written: 6,
+            quality_scores: 6,
+            waiting: 0,
+            base_too_old: 0
+        }
+    );
+    assert_eq!(outcome_count(&fx.client, first).await, 3);
+    assert_eq!(outcome_count(&fx.client, second).await, 3);
+    assert_eq!(quality_scores(&fx.client, first).await.len(), 3);
 
     fx.finish().await;
 }

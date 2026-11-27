@@ -126,7 +126,9 @@ pub struct OutcomeReport {
     /// symbol or the benchmark).
     pub waiting: u64,
     /// Decision-horizon pairs left unscored because the decision was made 20 hours or more after
-    /// its bar; see `outcome::MAX_BASE_AGE_NANOS`. Not counted in `waiting`.
+    /// its bar and a later bar exists for the symbol or the benchmark, so the decision's own
+    /// session should be in the file and waiting will not fix it; see
+    /// `outcome::MAX_BASE_AGE_NANOS` and `outcome::base_too_old`. Not counted in `waiting`.
     pub base_too_old: u64,
 }
 
@@ -134,8 +136,8 @@ pub struct OutcomeReport {
 /// scored with `outcome(..)` from the bars in `bars`; those that can be computed get an
 /// `outcome_window` row and, when the decision has an `expected_vol > 0`, an `eval_score` row
 /// (`subject_type` decision, metric `decision_quality_<horizon>`, `eval_version`
-/// `EVAL_VERSION`); the rest are counted in `waiting`, or in `base_too_old` when their base bar
-/// is too old to ever be scored from these bars.
+/// `EVAL_VERSION`); the rest are counted in `base_too_old` when `outcome::base_too_old` holds
+/// (the base bar is too old and a later bar exists), and in `waiting` otherwise.
 pub async fn score_outcomes<C: GenericClient>(
     client: &C,
     bars: &BarReader,
@@ -183,7 +185,7 @@ pub async fn score_outcomes<C: GenericClient>(
                 .get(decision.symbol.as_str())
                 .map_or(no_bars, Vec::as_slice);
             let Some(result) = outcome(symbol_bars, benchmark, decision.ts, horizon) else {
-                if base_too_old(symbol_bars, decision.ts) {
+                if base_too_old(symbol_bars, benchmark, decision.ts) {
                     report.base_too_old += 1;
                 } else {
                     report.waiting += 1;
