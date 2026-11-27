@@ -49,6 +49,19 @@ fn start_with_storage(url: Option<&str>, ready: &str) -> (Headless, Arc<MemorySt
     (app, storage)
 }
 
+/// As [`start`], with a clock the test moves (`fast_forward`): timers fire only when it does.
+fn start_with_manual_clock(url: &str, ready: &str) -> Headless {
+    let mut app = Headless::start(EngineConfig {
+        ui_sets: ui_sets(),
+        storage: Some(MemoryStorage::new([(URL_KEY.to_owned(), url.to_owned())])),
+        clock: nsh_core::time::Clock::manual(std::time::SystemTime::now()),
+        ..EngineConfig::new(app())
+    })
+    .expect("the engine starts");
+    app.wait_for(ready).unwrap();
+    app
+}
+
 /// A runtime for the test's own database work (the app has the engine's).
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
@@ -378,4 +391,144 @@ fn the_heartbeat_source_is_the_engine_configs() {
         serde_json::from_str(include_str!("../../../../config/engine/paper.json")).unwrap();
     assert_eq!(config["source"], "engine");
     assert!(include_str!("../src/lib.rs").contains("const HEARTBEAT_SOURCE: &str = \"engine\";"));
+}
+
+#[test]
+fn a_read_that_is_not_refreshed_stops_being_shown() {
+    let rt = runtime();
+    let db = store_with_a_live_engine(&rt);
+    let mut app = start_with_manual_clock(&as_ui_role(&db.url), "Kill switch: off");
+
+    // The store stops answering (a lock held on the table the status read needs), so the
+    // refresh neither succeeds nor fails for a while. Eighty seconds pass on the device.
+    let mut blocker = rt.block_on(db.client()).unwrap();
+    let held = rt.block_on(blocker.transaction()).unwrap();
+    rt.block_on(held.execute("LOCK TABLE risk_event IN ACCESS EXCLUSIVE MODE", &[]))
+        .unwrap();
+    app.fast_forward(std::time::Duration::from_secs(80))
+        .unwrap();
+
+    // The old "off" is taken down because of its age alone.
+    app.wait_for("The last read is 80 s old and has not been refreshed.")
+        .unwrap();
+    assert!(!app.shows("Kill switch: off"));
+
+    drop(app);
+    rt.block_on(held.rollback()).unwrap();
+    drop(blocker);
+    rt.block_on(db.drop_db()).unwrap();
+}
+
+#[test]
+fn the_kill_result_is_taken_down_after_a_while() {
+    let rt = runtime();
+    let db = store_with_a_live_engine(&rt);
+    let mut app = start_with_manual_clock(&as_ui_role(&db.url), "Kill switch: off");
+    app.press("Kill").unwrap();
+    app.wait_for("Engage kill switch").unwrap();
+    app.type_text("Your name", "ana").unwrap();
+    app.press("Engage kill switch").unwrap();
+    app.press("Yes, engage now").unwrap();
+    app.wait_for("Kill switch ENGAGED").unwrap();
+    // The watcher is alive, but a cancel is not claimed: only that it is not yet confirmed.
+    assert!(app.shows("Cancel of open orders: not yet confirmed"));
+
+    app.fast_forward(std::time::Duration::from_secs(80))
+        .unwrap();
+    app.wait_for("The earlier result is no longer current. Read Status for the state now.")
+        .unwrap();
+    assert!(!app.shows("Kill switch ENGAGED"));
+
+    drop(app);
+    rt.block_on(db.drop_db()).unwrap();
+}
+
+#[test]
+fn a_kill_with_a_late_watcher_says_orders_are_not_being_cancelled() {
+    // The watcher last ran ten minutes ago: it is not relied on.
+    let rt = runtime();
+    let db = rt.block_on(ScratchDb::create());
+    let client = rt.block_on(db.client()).unwrap();
+    rt.block_on(client.execute(
+        "INSERT INTO heartbeat (source, event_ts) VALUES \
+         ('engine', clock_timestamp() - interval '5 seconds'), \
+         ('kill-watch', clock_timestamp() - interval '10 minutes')",
+        &[],
+    ))
+    .unwrap();
+    let mut app = start(Some(&as_ui_role(&db.url)), "Kill switch: off");
+    app.press("Kill").unwrap();
+    app.wait_for("Engage kill switch").unwrap();
+    app.type_text("Your name", "ana").unwrap();
+    app.press("Engage kill switch").unwrap();
+    app.press("Yes, engage now").unwrap();
+    app.wait_for("Open orders are NOT being cancelled").unwrap();
+
+    // Status says the same, with the way out.
+    app.press("Status").unwrap();
+    app.wait_for("THE KILL SWITCH IS ENGAGED BUT NOT ENFORCED")
+        .unwrap();
+    assert!(app.shows("Open orders: no cancel recorded, and the kill watcher is not running"));
+
+    drop(app);
+    drop(client);
+    rt.block_on(db.drop_db()).unwrap();
+}
+
+/// A store with a live engine and watcher, the switch engaged a minute ago, and one
+/// `kill` / `cancel` step of `status` recorded just now.
+fn store_with_a_kill_and_its_cancel(rt: &tokio::runtime::Runtime, status: &str) -> ScratchDb {
+    let db = store_with_a_live_engine(rt);
+    let client = rt.block_on(db.client()).unwrap();
+    rt.block_on(client.execute(
+        "INSERT INTO risk_event (kind, detail, event_ts) VALUES \
+         ('kill_switch', '{\"engaged\": true, \"by\": \"ana\"}', \
+          clock_timestamp() - interval '1 minute')",
+        &[],
+    ))
+    .unwrap();
+    rt.block_on(client.execute(
+        "INSERT INTO engine_step (run_key, step, status, detail, event_ts) \
+         VALUES ('kill', 'cancel', $1, '{}', clock_timestamp())",
+        &[&status],
+    ))
+    .unwrap();
+    db
+}
+
+#[test]
+fn status_says_cancelled_only_for_a_confirmed_cancel() {
+    let rt = runtime();
+    let db = store_with_a_kill_and_its_cancel(&rt, "done");
+    let app = start(
+        Some(&as_ui_role(&db.url)),
+        "Open orders: cancelled, broker listed none left (just now)",
+    );
+    assert!(app.shows("Kill switch: ENGAGED"));
+    assert!(!app.shows("THE KILL SWITCH IS ENGAGED BUT NOT ENFORCED"));
+    drop(app);
+    rt.block_on(db.drop_db()).unwrap();
+
+    let db = store_with_a_kill_and_its_cancel(&rt, "started");
+    let app = start(
+        Some(&as_ui_role(&db.url)),
+        "Open orders: cancel sent, NOT yet confirmed (just now)",
+    );
+    assert!(!app.shows("Open orders: cancelled, broker listed none left (just now)"));
+    drop(app);
+    rt.block_on(db.drop_db()).unwrap();
+}
+
+#[test]
+fn status_shows_a_failed_cancel_and_the_way_out() {
+    let rt = runtime();
+    let db = store_with_a_kill_and_its_cancel(&rt, "failed");
+    let app = start(
+        Some(&as_ui_role(&db.url)),
+        "Open orders: the cancel FAILED (just now)",
+    );
+    assert!(app.shows("THE KILL SWITCH IS ENGAGED BUT NOT ENFORCED"));
+    assert!(app.shows("Open orders are NOT being cancelled"));
+    drop(app);
+    rt.block_on(db.drop_db()).unwrap();
 }

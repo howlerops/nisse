@@ -32,8 +32,11 @@ needs one new dependency in the app's Rust module.
 2. **Engine.** The host must be running the build that includes Phase 8, and its crontab
    must have the `kill-watch` line (re-install `deploy/crontab` after every rebuild of the
    host). Check `log/killwatch.log` gets "kill-watch: switch off" every minute, and that the
-   app's Status screen shows "Kill watcher: ran N s before this read" with a small N. That
-   log gains a line a minute: rotate it (for example with `logrotate`).
+   app's Status screen shows "Kill watcher: ran N s before this read" with a small N. The
+   watcher asks the broker for the account on every run, so it needs working Alpaca keys even
+   while the switch is off: after you regenerate keys, put the new ones on the host or the
+   watcher (rightly) reports itself as not running. That log gains a line a minute: rotate it
+   (for example with `logrotate`).
 3. **Native Shell.** Install it on your computer (`https://nsh.dev/docs/installation`), the
    same version as the `nsh-*` crates in `ui/ext/nisse-native/Cargo.toml` (0.7.2).
 4. **Check and run.** In `ui/`: `nsh check` (TypeScript types: this has never been run),
@@ -57,8 +60,9 @@ not send makes its reconciliation stop.
    "Kill switch ENGAGED" only after reading it back, and says whether the watcher is running.
    If it says "Open orders are NOT being cancelled", the watcher is not running: fix that
    first.
-3. Within about a minute, the app's Activity screen shows a new "kill  cancel: done, just now"
-   row (read the age: an old row is an old cancel),
+3. Within about a minute, the app's Status screen shows "Open orders: cancelled, broker listed
+   none left", Activity shows a new "kill  cancel: done, just now" row (read the age: an old
+   row is an old cancel),
    `log/killwatch.log` on the host has "switch ENGAGED; N open orders cancelled", and Alpaca
    shows no open orders. Repeat the test once in the evening, with the market closed and an
    order resting for the next open: that is the case the watcher exists for.

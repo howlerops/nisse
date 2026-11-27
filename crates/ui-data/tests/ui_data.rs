@@ -149,6 +149,7 @@ async fn status_of_an_empty_store() {
             last_heartbeat: None,
             heartbeat_age_seconds: None,
             watcher_age_seconds: None,
+            kill_cancel: None,
             rebalance_owed: false,
             limits_hash: None,
         }
@@ -631,6 +632,76 @@ async fn the_watcher_has_its_own_age_and_steps_carry_theirs() {
         include_str!("../../app/src/kill_watch.rs")
             .contains(&format!("\"{}\"", nisse_ui_data::WATCH_SOURCE))
     );
+
+    drop(client);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_cancel_for_the_current_kill_is_reported_and_an_older_one_is_not() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let step = |status: &'static str, ago: &'static str| {
+        let client = &client;
+        async move {
+            client
+                .execute(
+                    &format!(
+                        "INSERT INTO engine_step (run_key, step, status, detail, event_ts) \
+                         VALUES ('kill', 'cancel', '{status}', '{{}}', clock_timestamp() - interval '{ago}')"
+                    ),
+                    &[],
+                )
+                .await
+                .unwrap();
+        }
+    };
+    let switch = |engaged: bool, ago: &'static str| {
+        let client = &client;
+        async move {
+            client
+                .execute(
+                    &format!(
+                        "INSERT INTO risk_event (kind, detail, event_ts) VALUES \
+                         ('kill_switch', '{{\"engaged\": {engaged}, \"by\": \"t\"}}', \
+                          clock_timestamp() - interval '{ago}')"
+                    ),
+                    &[],
+                )
+                .await
+                .unwrap();
+        }
+    };
+
+    // An old kill and its cancel, released, then a new kill ten minutes ago.
+    switch(true, "3 days").await;
+    step("done", "3 days").await;
+    switch(false, "2 days").await;
+    switch(true, "10 minutes").await;
+
+    // Nothing has cancelled for THIS kill: the old "done" is not it.
+    assert_eq!(status(&client, SOURCE).await.unwrap().kill_cancel, None);
+
+    step("started", "9 minutes").await;
+    let (state, age) = status(&client, SOURCE).await.unwrap().kill_cancel.unwrap();
+    assert_eq!(state, "started");
+    assert!((540..=545).contains(&age), "{age}");
+
+    step("failed", "1 minute").await;
+    assert_eq!(
+        status(&client, SOURCE)
+            .await
+            .unwrap()
+            .kill_cancel
+            .unwrap()
+            .0,
+        "failed"
+    );
+
+    // The step names are the engine's own.
+    let engine = include_str!("../../app/src/kill_watch.rs");
+    assert!(engine.contains(&format!("\"{}\"", nisse_ui_data::KILL_RUN_KEY)));
+    assert!(engine.contains(&format!("\"{}\"", nisse_ui_data::KILL_CANCEL_STEP)));
 
     drop(client);
     db.drop_db().await.unwrap();

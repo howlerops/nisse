@@ -55,9 +55,9 @@ A kill switch engaged by a row from outside the engine (the phone) is enforced b
 function, `enforce_kill`, which needs only the store and the broker: no trader, no bar
 files, no signature, no engine lock.
 
-- It reads the switch. A newest switch row that cannot be understood counts as engaged. A
-  store that cannot be reached at all is an error and cancels nothing: a database outage
-  must not cancel orders every minute. Off: nothing else happens, and the broker is not
+- It reads the switch. A newest switch row that cannot be understood counts as engaged. Any
+  other failure to read it (the store unreachable, a connection lost mid-query) is an error
+  and cancels nothing: a database outage must not cancel orders every minute. Off: nothing else happens, and the broker is not
   contacted.
 - Engaged, with the limits' `flatten_on_kill` false (the switch halts): if the broker lists
   any open order, cancel everything. If the broker cannot even list its orders, cancel
@@ -65,12 +65,21 @@ files, no signature, no engine lock.
 - Engaged, with `flatten_on_kill` true (the switch means exit): cancel the open buys and
   leave the sells, which are the exits. A buy that cannot be cancelled is recorded and the
   run goes on; without the list nothing can be done safely, and that is a recorded failure.
-- A cancel is recorded as `engine_step` `kill` / `cancel` (`done`, or `failed` with the
-  error), with its time, so it can be seen from the phone's Activity screen.
-- The watcher writes a heartbeat under the source `kill-watch` after every run that did
-  its job. The phone shows its age, and the Kill screen says "open orders are NOT being
-  cancelled" when the watcher has not run for three minutes: a kill from the phone is only
-  as good as the watcher behind it.
+- A cancel is recorded as `engine_step` `kill` / `cancel`. The broker accepting a cancel is
+  not the orders being gone, so the row is `done` only when a listing made afterwards shows
+  none left; `started` when cancels were sent but orders remain or the broker could not be
+  asked (a later empty listing then records `done`); `failed` with the error otherwise.
+- The watcher writes a heartbeat under the source `kill-watch` only after a run in which it
+  could have cancelled: the store was read, the broker answered an authenticated request
+  (it is asked for the account even when the switch is off), and no cancel was refused.
+  Missing or rejected broker keys therefore show on the phone as a watcher that is not
+  running, which for its purpose it is not.
+- The phone's Status screen shows, while the switch is engaged, the state of the cancel for
+  *this* kill (only steps recorded since the switch was last set count): "cancelled" only
+  for `done`. If the cancel failed, or nothing has cancelled and the watcher has not run for
+  three minutes, it says in red that open orders are not being cancelled, with the
+  out-of-band steps. The Kill screen never claims a cancel: it says the cancel is not yet
+  confirmed and points to Status.
 
 It runs in three places:
 

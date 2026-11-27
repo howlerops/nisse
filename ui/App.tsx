@@ -182,6 +182,19 @@ function StatusScreen(props: { url: () => string | null }) {
     if (alive()) return { text: "Kill switch: off", color: GREEN };
     return { text: "Kill switch: off (engine not confirmed alive)", color: AMBER };
   };
+  // With the switch engaged: what is known about the cancel of open orders for THIS kill.
+  // Only "done" is good news, and only "done" is shown without a warning.
+  const cancel = () => {
+    const state = status.value()?.killCancelStatus;
+    const when = ago(status.value()?.killCancelAgeSeconds ?? 0);
+    if (state === "done") return { text: `Open orders: cancelled, broker listed none left (${when})`, color: GREEN, bad: false };
+    if (state === "failed") return { text: `Open orders: the cancel FAILED (${when})`, color: RED, bad: true };
+    if (state === "started") {
+      return { text: `Open orders: cancel sent, NOT yet confirmed (${when})`, color: AMBER, bad: !watching() };
+    }
+    if (watching()) return { text: "Open orders: no cancel recorded (none were open, or the watcher runs within a minute)", color: INK, bad: false };
+    return { text: "Open orders: no cancel recorded, and the kill watcher is not running", color: RED, bad: true };
+  };
   return (
     <View style={{ gap: 16 }}>
       <If when={!props.url()}>
@@ -190,9 +203,18 @@ function StatusScreen(props: { url: () => string | null }) {
       <If when={status.problem()}>
         <CannotConfirm what="the engine's state" error={status.problem()} />
       </If>
+      <If when={status.value()?.killSwitch && cancel().bad}>
+        <Card title="THE KILL SWITCH IS ENGAGED BUT NOT ENFORCED">
+          <Line color={RED} strong>Open orders are NOT being cancelled</Line>
+          <Line color={MUTED}>{OUT_OF_BAND}</Line>
+        </Card>
+      </If>
       <If when={status.value()}>
         <Card title="ENGINE">
           <Line color={switchLine().color} strong>{switchLine().text}</Line>
+          <If when={status.value()?.killSwitch}>
+            <Line color={cancel().color}>{cancel().text}</Line>
+          </If>
           <Line>{`Drawdown mode: ${status.value()?.drawdownMode ?? ""}`}</Line>
           <Line>{`Equity peak: ${status.value()?.equityPeak ?? "none yet"}`}</Line>
           <Line color={alive() ? INK : AMBER}>{heartbeat()}</Line>
@@ -245,6 +267,7 @@ function PositionsScreen(props: { url: () => string | null }) {
             This list changes when an engine run reconciles with the broker, not at the moment an order is
             cancelled. The broker's own dashboard is the live view.
           </Line>
+          <Line color={MUTED}>{`Read ${orders.ageSeconds()} s ago`}</Line>
         </Card>
       </If>
       <Button
@@ -289,6 +312,9 @@ function GatesScreen(props: { url: () => string | null }) {
       <Line color={MUTED}>
         A strategy is promoted on these gates over the whole trial history, never on recent results.
       </Line>
+      <If when={versions.value()}>
+        <Line color={MUTED}>{`Read ${versions.ageSeconds()} s ago`}</Line>
+      </If>
       <Button title="Refresh" onPress={versions.refetch} />
     </View>
   );
@@ -317,6 +343,7 @@ function ActivityScreen(props: { url: () => string | null }) {
               </Line>
             )}
           </Each>
+          <Line color={MUTED}>{`Ages are as of this read, ${steps.ageSeconds()} s ago`}</Line>
         </Card>
       </If>
       <Line color={MUTED}>
@@ -399,8 +426,9 @@ function KillScreen(props: { url: () => string | null }) {
           cancelling: true,
           at: Date.now(),
           text:
-            `${engaged} The kill watcher on the host ran ${Math.round(watcherAge ?? 0)} s ago and cancels open ` +
-            "orders within about a minute. Confirm it in Activity: a new \"kill  cancel\" row.",
+            `${engaged} The kill watcher on the host ran ${Math.round(watcherAge ?? 0)} s ago and should cancel ` +
+            "open orders within about a minute. That is NOT yet confirmed: read Status, which says " +
+            "\"Open orders: cancelled\" only once the broker lists none left.",
         });
       } else {
         result.set({
@@ -456,6 +484,9 @@ function KillScreen(props: { url: () => string | null }) {
         <Card title={current()?.ok ? "RESULT" : "NOT CONFIRMED"}>
           <If when={current()?.ok}>
             <Line color={RED} strong>Kill switch ENGAGED</Line>
+          </If>
+          <If when={current()?.ok && current()?.cancelling}>
+            <Line color={AMBER} strong>Cancel of open orders: not yet confirmed</Line>
           </If>
           <If when={current()?.ok && !current()?.cancelling}>
             <Line color={RED} strong>Open orders are NOT being cancelled</Line>

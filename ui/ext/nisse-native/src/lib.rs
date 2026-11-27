@@ -41,6 +41,12 @@ pub struct StatusView {
     /// Seconds since the kill watcher on the host last ran, by the database's clock, or null
     /// when it never has. The watcher is what cancels open orders after a kill from here.
     pub watcher_age_seconds: Option<f64>,
+    /// The newest cancel made for the kill switch since the switch was last set: "started"
+    /// (sent, not confirmed), "done" (the broker listed nothing left) or "failed"; null when
+    /// none has been recorded since.
+    pub kill_cancel_status: Option<String>,
+    /// How long ago that cancel was recorded, in seconds; null with no such cancel.
+    pub kill_cancel_age_seconds: Option<f64>,
     /// A rebalance is owed (a resize or an incomplete rebalance is pending).
     pub rebalance_owed: bool,
     /// The hash of the limits file the engine last loaded, or null.
@@ -117,6 +123,8 @@ impl Nisse {
                 // Seconds fit a JS number exactly far beyond any real age.
                 heartbeat_age_seconds: status.heartbeat_age_seconds.map(|age| age as f64),
                 watcher_age_seconds: status.watcher_age_seconds.map(|age| age as f64),
+                kill_cancel_status: status.kill_cancel.as_ref().map(|(state, _)| state.clone()),
+                kill_cancel_age_seconds: status.kill_cancel.as_ref().map(|(_, age)| *age as f64),
                 rebalance_owed: status.rebalance_owed,
                 limits_hash: status.limits_hash,
             })

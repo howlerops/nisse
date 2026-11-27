@@ -61,6 +61,11 @@ pub struct Status {
     /// phone: if it is not running, such a kill stops new orders but cancels nothing until an
     /// engine run does.
     pub watcher_age_seconds: Option<u64>,
+    /// The newest cancel made for the kill switch since the switch was last set, if any:
+    /// its status ("started": sent, not confirmed; "done": the broker listed nothing left;
+    /// "failed") and its age in seconds by the database's clock. `None` when no cancel has
+    /// been recorded since: either nothing was open, or nothing has acted yet.
+    pub kill_cancel: Option<(String, u64)>,
     pub rebalance_owed: bool,
     pub limits_hash: Option<String>,
 }
@@ -86,9 +91,42 @@ pub async fn status<C: GenericClient>(client: &C, source: &str) -> Result<Status
         last_heartbeat,
         heartbeat_age_seconds,
         watcher_age_seconds: heartbeat_age(client, WATCH_SOURCE).await?,
+        kill_cancel: kill_cancel(client).await?,
         rebalance_owed,
         limits_hash: risk_event::latest_limits_hash(client).await?,
     })
+}
+
+/// The run key and step of a cancel made for the kill switch: the same text as `KILL_RUN_KEY`
+/// and `KILL_CANCEL_STEP` in `crates/app/src/kill_watch.rs` (a test checks that file).
+pub const KILL_RUN_KEY: &str = "kill";
+pub const KILL_CANCEL_STEP: &str = "cancel";
+
+/// The newest `kill` / `cancel` step recorded at or after the newest `kill_switch` event:
+/// its status and its age by the database's clock. A cancel from before the switch was last
+/// set belongs to an earlier kill and is not this one's.
+async fn kill_cancel<C: GenericClient>(client: &C) -> Result<Option<(String, u64)>, UiError> {
+    let row = client
+        .query_opt(
+            "SELECT s.status, \
+                    greatest(extract(epoch FROM (clock_timestamp() - s.event_ts)), 0)::float8 AS age \
+             FROM engine_step s \
+             WHERE s.run_key = $1 AND s.step = $2 \
+               AND s.event_ts >= (SELECT event_ts FROM risk_event \
+                                  WHERE kind = 'kill_switch' ORDER BY id DESC LIMIT 1) \
+             ORDER BY s.id DESC LIMIT 1",
+            &[&KILL_RUN_KEY, &KILL_CANCEL_STEP],
+        )
+        .await?;
+    match row {
+        None => Ok(None),
+        Some(row) => {
+            let status: String = row.try_get("status")?;
+            // Non-negative by the query; whole seconds of any real age fit a u64.
+            let age = row.try_get::<_, f64>("age")?.floor() as u64;
+            Ok(Some((status, age)))
+        }
+    }
 }
 
 /// A heartbeat this far in the database's future is put down to rounding; further is an error.
