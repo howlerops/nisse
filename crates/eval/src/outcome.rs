@@ -11,11 +11,6 @@ pub const OUTCOME_HORIZONS: [u32; 3] = [1, 5, 21];
 /// Sessions in the mean the regime compares the benchmark's close with.
 pub const REGIME_WINDOW: usize = 200;
 
-/// The oldest base bar a decision may be scored from, in nanoseconds: a decision is scored from
-/// the bar it was made on, so a base bar a day or more older means the decision's own bar is
-/// missing.
-pub const MAX_BASE_AGE_NANOS: u64 = 86_400_000_000_000;
-
 /// One daily bar of one symbol, as the scores need it. Series are sorted by `ts`, strictly
 /// increasing.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -62,11 +57,17 @@ impl Regime {
     }
 }
 
-/// The outcome of a decision made at `decision_ts` over `horizon` sessions. `None` when it
-/// cannot be computed yet or at all: no symbol bar at or before the decision, a base bar (the
-/// last symbol bar at or before the decision) a day or more older than the decision
-/// ([`MAX_BASE_AGE_NANOS`]), fewer than `horizon` symbol bars after it, the benchmark lacking a
-/// bar at either end's timestamp, a non-positive or non-finite price, or `horizon == 0`.
+/// The outcome of a decision made at `decision_ts` over `horizon` sessions. The base bar is the
+/// last symbol bar at or before the decision. `None` when it cannot be computed yet or at all:
+/// no symbol bar at or before the decision, fewer than `horizon` symbol bars after the base
+/// bar, the benchmark lacking a bar at the base bar's timestamp, the benchmark having a later
+/// bar at or before the decision (the symbol is missing a session the benchmark has, so the
+/// decision waits for its bar), a non-positive or non-finite price, or `horizon == 0`.
+///
+/// Sessions, not hours: a weekend, a holiday or a half-day between the base bar and the decision
+/// changes nothing, because the benchmark has no bar there either. A session missing from both
+/// series is not detectable from the bars alone, so a decision stamped on that day is scored
+/// from the previous session.
 #[must_use]
 pub fn outcome(
     symbol_bars: &[BarPoint],
@@ -79,9 +80,6 @@ pub fn outcome(
     }
     let t = index_at_or_before(symbol_bars, decision_ts)?;
     let base_ts = symbol_bars.get(t)?.ts;
-    if decision_ts.as_u64().checked_sub(base_ts.as_u64())? >= MAX_BASE_AGE_NANOS {
-        return None;
-    }
     let sessions = usize::try_from(horizon).ok()?;
     let end = t.checked_add(sessions)?;
     if end >= symbol_bars.len() {
@@ -105,7 +103,13 @@ pub fn outcome(
         min_low = min_low.min(bar.low);
     }
 
-    let bench_start = benchmark_bars.get(index_at(benchmark_bars, symbol_bars.get(t)?.ts)?)?;
+    let bench_start = benchmark_bars.get(index_at(benchmark_bars, base_ts)?)?;
+    let newest_bench_ts = benchmark_bars
+        .get(index_at_or_before(benchmark_bars, decision_ts)?)?
+        .ts;
+    if newest_bench_ts > base_ts {
+        return None;
+    }
     let bench_end = benchmark_bars.get(index_at(benchmark_bars, symbol_bars.get(end)?.ts)?)?;
     if !is_usable_price(bench_start.close) || !is_usable_price(bench_end.close) {
         return None;
@@ -319,38 +323,103 @@ mod tests {
         assert!(outcome(&sym, &bench, at(0, 0), 1).is_none());
     }
 
+    /// A bar at `day` plus `hours`, closing at `close`, with 1% high and low.
+    fn point_at(day: u64, hours: u64, close: f64) -> BarPoint {
+        BarPoint {
+            ts: at(day, hours),
+            high: close * 1.01,
+            low: close * 0.99,
+            close,
+        }
+    }
+
     #[test]
-    fn base_bar_less_than_a_day_old_is_scored() {
+    fn decision_just_before_the_next_session_is_scored_from_the_earlier_bar() {
         let sym = symbol();
         let bench = bench();
 
-        // 23 hours 59 minutes after the day 0 bar: still the decision's own session.
+        // 23 hours 59 minutes after the day 0 bar, no benchmark bar since: still day 0's session.
         let just_under = UnixNanos::from(DAY_NANOS - 60_000_000_000);
         let result = outcome(&sym, &bench, just_under, 1).expect("23h59m");
         assert_close(result.fwd_ret, 0.02);
     }
 
     #[test]
-    fn base_bar_exactly_a_day_old_is_none() {
-        // Day 1 is missing, so a decision at day 1 00:00 is based on the day 0 bar, a day old.
+    fn a_decision_at_a_close_waits_for_the_symbols_own_bar() {
+        // Day 1 is missing for the symbol only; the benchmark has it. Decision at day 1's close.
         let mut sym = symbol();
         sym.remove(1);
         let bench = bench();
         assert!(outcome(&sym, &bench, at(1, 0), 1).is_none());
         assert!(outcome(&sym, &bench, at(1, 0), 2).is_none());
+
+        // Once the symbol's day 1 bar is present, the decision is measured from day 1's close
+        // (102) to day 2's close (101), against the benchmark's 202 → 204.
+        let full = symbol();
+        let result = outcome(&full, &bench, at(1, 0), 1).expect("day 1 bar present");
+        assert_close(result.fwd_ret, 101.0 / 102.0 - 1.0);
+        assert_close(result.bench_ret, 204.0 / 202.0 - 1.0);
     }
 
     #[test]
-    fn decision_day_missing_from_the_symbol_is_none() {
-        // Day 3 is missing, but days 4 and 5 exist: the decision must not be measured from day 2.
+    fn a_half_day_without_the_symbols_bar_waits() {
+        // The symbol has no bar on day 1; the benchmark closes early that day, at 18:00.
+        let sym = vec![point_at(0, 21, 100.0), point_at(2, 21, 103.0)];
+        let bench = vec![
+            point_at(0, 21, 200.0),
+            point_at(1, 18, 202.0),
+            point_at(2, 21, 204.0),
+        ];
+        // The newest symbol bar is 21 hours before the decision, but the benchmark's day 1 bar
+        // is later than it: the decision waits.
+        assert!(outcome(&sym, &bench, at(1, 18), 1).is_none());
+
+        // With the symbol's own day 1 bar, it is scored from that bar: 103 / 101 - 1.
+        let full = vec![
+            point_at(0, 21, 100.0),
+            point_at(1, 18, 101.0),
+            point_at(2, 21, 103.0),
+        ];
+        let result = outcome(&full, &bench, at(1, 18), 1).expect("day 1 bar present");
+        assert_close(result.fwd_ret, 103.0 / 101.0 - 1.0);
+        assert_close(result.bench_ret, 204.0 / 202.0 - 1.0);
+    }
+
+    #[test]
+    fn a_weekend_between_the_base_bar_and_the_decision_is_not_a_gap() {
+        // Friday close (day 0, 21:00), Monday pre-open (day 3, 09:00): 60 hours later. Neither
+        // series has a bar in between, so the decision is scored from Friday's bar.
+        let sym = vec![point_at(0, 21, 100.0), point_at(3, 21, 102.0)];
+        let bench = vec![point_at(0, 21, 200.0), point_at(3, 21, 202.0)];
+        let result = outcome(&sym, &bench, at(3, 9), 1).expect("weekend");
+        assert_close(result.fwd_ret, 0.02);
+        assert_close(result.bench_ret, 0.01);
+    }
+
+    #[test]
+    fn benchmark_bars_only_after_the_decision_do_not_hold_it_back() {
+        // The benchmark has days 1..=5 after the decision at day 0 12:00; none is at or before
+        // it, so the decision is scored from day 0 over five sessions.
+        let sym = symbol();
+        let bench = bench();
+        let result = outcome(&sym, &bench, at(0, 12), 5).expect("later benchmark bars");
+        assert_close(result.fwd_ret, 0.10);
+        assert_close(result.bench_ret, 0.05);
+    }
+
+    #[test]
+    fn a_session_missing_from_both_series_is_scored_from_the_previous_session() {
+        // Day 3 is a market holiday: neither series has a bar. The bars cannot tell a holiday
+        // from a missing bar, so a decision stamped on day 3 is scored from day 2, the last bar
+        // both series have. This is a documented limitation, not a bug.
         let mut sym = symbol();
         sym.remove(3);
-        let bench = bench();
-        assert!(outcome(&sym, &bench, at(3, 12), 1).is_none());
-        assert!(outcome(&sym, &bench, at(3, 12), 2).is_none());
-        // Once the decision's own bar exists, the same series is scored from it.
-        let full = symbol();
-        assert!(outcome(&full, &bench, at(3, 12), 1).is_some());
+        let mut bench = bench();
+        bench.remove(3);
+        let result = outcome(&sym, &bench, at(3, 12), 1).expect("holiday");
+        // Base day 2 (symbol 101, benchmark 204); end day 4 (symbol 103, benchmark 208).
+        assert_close(result.fwd_ret, 103.0 / 101.0 - 1.0);
+        assert_close(result.bench_ret, 208.0 / 204.0 - 1.0);
     }
 
     #[test]
