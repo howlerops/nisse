@@ -18,7 +18,7 @@ and published reference values, and the jobs against synthetic rows.
 | Normal distribution | Φ by Abramowitz and Stegun 26.2.17 (error < 7.5e-8), Φ⁻¹ by Acklam's rational approximation (no refinement step) | `std` has neither; accuracy is far below what the gates need. |
 | Return series per trial | Every backtest result stores its daily equity returns (`"returns"`, rounded to 10 decimal places) | The deflated Sharpe needs each trial's Sharpe; PBO needs each trial's returns over the same sessions. Rows cannot be amended later. |
 | Gate thresholds | `config/eval/gates.json`, validated like the risk limits: the code refuses thresholds looser than PLAN.md | Thresholds are pre-declared and reviewed, not chosen when a result is known. |
-| Holdout | The last part of the bar history, from `holdout_start` in the gates file. An ordinary backtest whose range reaches into it is refused. A holdout run is a trial marked `"holdout": true` and is refused once `holdout_max_looks` such trials exist. | "Queried once per candidate, logged as a trial, retired after about 10 looks." |
+| Holdout | The last part of the bar history, from `holdout_start` in the gates file. An ordinary backtest whose range reaches into it is refused. A holdout run is a trial marked `"holdout": true` and is refused once `holdout_max_looks` such trials exist. It must start before the holdout (its warm-up is ordinary history), and its look-count check and registration are done under a database lock. | "Queried once per candidate, logged as a trial, retired after about 10 looks." |
 | Decision holdout | New append-only table `decision_holdout` (one row per decision: hidden or visible, assigned by a keyed hash, 25% hidden), a view `agent_decision` that shows only visible decisions, and a role `nisse_agent` that can read only agent views | "A random 20 to 30% of live decisions held out and never shown to agents." The assignment is fixed when the decision is first scored and cannot change. **New table, view and role: owner can veto.** |
 | Outcome horizons | 1, 5 and 21 sessions, fixed in code (`OUTCOME_HORIZONS`); stored in `outcome_window.horizon` as that many days | "Horizons fixed before the trade." Changing them is a code change with a new `eval_version`. |
 | Benchmark | `SPY` (gates file field `benchmark`) | The plan names no benchmark; this is the default a reader expects. **Owner to confirm.** |
@@ -148,7 +148,7 @@ under another gates file cannot be judged as if it had not.
 | `trial_budget` | lifetime trial count | `≤ trial_budget` |
 | `deflated_sharpe` | as above, on the candidate | `≥ deflated_sharpe_min`. The trial Sharpes are those of usable trials, one per (strategy version, data snapshot, requested range), the newest. `not_evaluated` when the candidate is not usable, or, with more than one lifetime trial, when fewer than half the lifetime trials have a usable Sharpe or their variance is zero (nothing to deflate with). |
 | `pbo` | as above | `≤ pbo_max`, over at least `pbo_min_configs` configurations (else `not_evaluated`) |
-| `holdout` | annualised Sharpe of the version's newest holdout run over the holdout sessions only | looks `≤ holdout_max_looks` (else `fail`), and that Sharpe `≥ haircut_sharpe` of the candidate, over at least 20 holdout sessions, with the run not ending `flat`. No holdout run, or no usable candidate → `not_evaluated`. |
+| `holdout` | annualised Sharpe of the version's holdout run over the holdout sessions only | The holdout run judged is the version's **oldest** holdout run whose costs and symbols equal the candidate's: the first look counts, and a later look cannot rescue it. Looks `> holdout_max_looks` → `fail`. No such run → `not_evaluated`. The candidate must have been registered before that run (a candidate chosen after the look → `not_evaluated`). The run ended `flat` → `fail`. Otherwise `pass` when that Sharpe `≥` the haircut of the candidate's annualised Sharpe measured from its first non-zero return (the flat warm-up would understate it), over at least 60 holdout sessions. |
 | `replay` | decisions of this version whose newest `replay_match` score is 0 | `= 0` (no scored decision → `not_evaluated`) |
 | `risk_breaches` | orders of this version sent beyond the intent whose decision has a failed `risk_check` row or fewer than the eight rows the gate writes | `= 0` (no sent order → `not_evaluated`) |
 | `tracking` | tracking error and gap | inside the band (`not_evaluated` without live returns) |
@@ -166,7 +166,8 @@ could not be produced.
 ## Trade-level scores (nightly job `nisse-score`)
 
 Run after the close; idempotent (a decision already scored for a metric and `eval_version`
-is skipped).
+is skipped). One run at a time: the job takes a database advisory lock and refuses to start
+if another run holds it.
 
 - **Decision holdout**: every decision without a `decision_holdout` row gets one. Hidden when
   the first 8 bytes of `SHA-256(salt ‖ decision id as decimal text)`, read as a big-endian
@@ -177,7 +178,9 @@ is skipped).
   close[t+h] / close[t] − 1`, `bench_ret` the same for the benchmark, `mfe = max(high[t+1..=t+h])
   / close[t] − 1`, `mae = min(low[t+1..=t+h]) / close[t] − 1`, where `t` is the last bar at or
   before the decision time. A decision whose symbol or benchmark has no bar at `t` is left for
-  a later run. The base bar must be less than a day older than the decision. The decision-quality score
+  a later run. The base bar must be the benchmark's newest bar too: if the benchmark has a later bar at or
+  before the decision, the symbol's own bar for that session is missing and the decision
+  waits (sessions, not hours, so a weekend or a half-day changes nothing). The decision-quality score
   is not signed by action (an exit followed by a rally scores positive), so readers split it
   by action. The score (`eval_score` metric `decision_quality_<h>`) is
   `(fwd_ret − bench_ret) / (expected_vol · sqrt(h / periods_per_year))`, written only when the

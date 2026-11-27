@@ -22,6 +22,16 @@ use crate::stats::{cv, dsr, moments, pbo, tracking};
 /// The `eval_version` of the scores a report writes.
 pub const EVAL_VERSION: &str = "gate-v1";
 
+/// How many distinct rules the risk gate writes for every order: an order with fewer on
+/// record was sent without the full set of checks. Taken from the risk crate so it cannot
+/// drift from the gate.
+#[allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_possible_truncation,
+    reason = "a handful of rules"
+)]
+const GATE_RULES: i64 = nisse_risk::rule::ALL.len() as i64;
+
 /// The fewest holdout sessions a holdout run may be judged on.
 const MIN_HOLDOUT_SESSIONS: usize = 20;
 
@@ -307,7 +317,7 @@ pub async fn load_inputs<C: GenericClient>(
         .map(TrialSeries::from_stored)
         .collect();
     let (failed, scored) = scoring::replay_failures(client, version).await?;
-    let breaches = scoring::risk_breaches(client, version).await?;
+    let breaches = scoring::risk_breaches(client, version, GATE_RULES).await?;
     let sent = scoring::sent_orders(client, version).await?;
     Ok(ReportInputs {
         version,

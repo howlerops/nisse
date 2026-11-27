@@ -15,6 +15,7 @@ use nisse_eval::{
     gates::Gates,
     score_job::{assign_holdouts, score_outcomes},
 };
+use nisse_store::tables::scoring;
 
 const USAGE: &str = "usage: nisse-score <gates.json> <bars_dir>";
 
@@ -35,6 +36,11 @@ async fn main() -> anyhow::Result<()> {
     let url =
         std::env::var("DATABASE_URL").map_err(|_| anyhow::anyhow!("DATABASE_URL is not set"))?;
     let client = nisse_store::connect(&url).await?;
+    // One run at a time: two overlapping runs would both read the same pending decisions and
+    // write their scores twice. The lock is released when this process ends.
+    if !scoring::try_advisory_lock(&client, scoring::SCORE_JOB_LOCK).await? {
+        anyhow::bail!("another nisse-score run holds the job lock; nothing was done");
+    }
     let now = SystemClock.now();
 
     let holdout = assign_holdouts(&client, salt.as_bytes(), now).await?;

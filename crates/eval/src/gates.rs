@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use chrono::NaiveDate;
+use nisse_core::nautilus::UnixNanos;
 use serde_json::{Map, Value};
 
 use crate::EvalError;
@@ -96,6 +97,23 @@ impl Gates {
         };
         gates.validate()?;
         Ok(gates)
+    }
+
+    /// The first instant of the holdout: `holdout_start` at 00:00:00 UTC. `None` only for a
+    /// date outside the representable range.
+    #[must_use]
+    pub fn holdout_boundary(&self) -> Option<UnixNanos> {
+        self.holdout_start
+            .and_hms_opt(0, 0, 0)
+            .and_then(|at| at.and_utc().timestamp_nanos_opt())
+            .and_then(|nanos| u64::try_from(nanos).ok())
+            .map(UnixNanos::from)
+    }
+
+    /// `holdout_start` as it is written into a backtest result and compared by the report.
+    #[must_use]
+    pub fn holdout_start_text(&self) -> String {
+        self.holdout_start.format("%Y-%m-%d").to_string()
     }
 
     /// A gates file can tighten the thresholds, never loosen them past PLAN.md.
@@ -293,6 +311,17 @@ mod tests {
         for (name, value) in cases {
             rejects(&with(name, value), name);
         }
+    }
+
+    #[test]
+    fn the_holdout_boundary_is_midnight_utc_of_its_date() {
+        let gates = Gates::from_json(&default_json()).unwrap();
+        // 2023-01-01T00:00:00Z.
+        assert_eq!(
+            gates.holdout_boundary(),
+            Some(UnixNanos::from(1_672_531_200_000_000_000_u64))
+        );
+        assert_eq!(gates.holdout_start_text(), "2023-01-01");
     }
 
     #[test]

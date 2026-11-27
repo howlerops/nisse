@@ -296,19 +296,16 @@ pub async fn replay_failures<C: GenericClient>(
     Ok((row.try_get("failed")?, row.try_get("scored")?))
 }
 
-/// The number of distinct rules the risk gate checks every order against. Equal to the length of
-/// `nisse_risk::rule::ALL`; written here because this crate does not depend on the risk crate.
-const GATE_RULE_COUNT: i64 = 8;
-
 /// Orders of `version`'s decisions that went beyond the intent (have a row whose state is not
 /// `intent`) and are a breach: either one of the decision's `risk_check` rows has
-/// `passed = false`, or the decision has fewer than [`GATE_RULE_COUNT`] distinct `rule` values
+/// `passed = false`, or the decision has fewer than `expected_rules` distinct `rule` values
 /// (an order sent without the gate's full set of checks). Counted once per `client_order_id`.
 ///
 /// One statement.
 pub async fn risk_breaches<C: GenericClient>(
     client: &C,
     version: StrategyVersionId,
+    expected_rules: i64,
 ) -> Result<i64, StoreError> {
     let row = client
         .query_one(
@@ -327,7 +324,7 @@ pub async fn risk_breaches<C: GenericClient>(
                        WHERE r.decision_id = o.decision_id \
                    ) < $2 \
                )",
-            &[&version.0, &GATE_RULE_COUNT],
+            &[&version.0, &expected_rules],
         )
         .await?;
     Ok(row.try_get(0)?)
@@ -351,6 +348,30 @@ pub async fn sent_orders<C: GenericClient>(
         .await?;
     Ok(row.try_get(0)?)
 }
+
+/// Tries to take the session-level advisory lock `key` on this connection, without waiting.
+/// `true` when it was taken; it is held until [`advisory_unlock`] or until the connection
+/// closes. Used so that two runs of one job, or two holdout runs, cannot interleave their
+/// check-then-insert steps.
+pub async fn try_advisory_lock<C: GenericClient>(client: &C, key: i64) -> Result<bool, StoreError> {
+    let row = client
+        .query_one("SELECT pg_try_advisory_lock($1)", &[&key])
+        .await?;
+    Ok(row.try_get(0)?)
+}
+
+/// Releases the advisory lock `key` taken on this connection. `false` when it was not held.
+pub async fn advisory_unlock<C: GenericClient>(client: &C, key: i64) -> Result<bool, StoreError> {
+    let row = client
+        .query_one("SELECT pg_advisory_unlock($1)", &[&key])
+        .await?;
+    Ok(row.try_get(0)?)
+}
+
+/// Lock key of the nightly scoring job.
+pub const SCORE_JOB_LOCK: i64 = 0x6e69_7373_6501;
+/// Lock key of a holdout run's look-count check and trial registration.
+pub const HOLDOUT_LOCK: i64 = 0x6e69_7373_6502;
 
 /// Rebuilds a symbol from its stored text.
 fn parse_symbol(text: &str) -> Result<Symbol, StoreError> {

@@ -563,7 +563,7 @@ async fn risk_breaches_count_sent_orders_of_failed_decisions_once_each() {
     let d1 = spy_decision(&client, a).await;
     check(&client, d1, "max_position", dec("900"), false).await;
     order(&client, d1, "o-1", OrderSide::Buy, "5", &[]).await;
-    assert_eq!(scoring::risk_breaches(&client, a).await.unwrap(), 0);
+    assert_eq!(scoring::risk_breaches(&client, a, 8).await.unwrap(), 0);
 
     // A failed check and an order that reached accepted: one breach.
     let d2 = spy_decision(&client, a).await;
@@ -577,7 +577,7 @@ async fn risk_breaches_count_sent_orders_of_failed_decisions_once_each() {
         &[(OrderState::Accepted, "0")],
     )
     .await;
-    assert_eq!(scoring::risk_breaches(&client, a).await.unwrap(), 1);
+    assert_eq!(scoring::risk_breaches(&client, a, 8).await.unwrap(), 1);
 
     // All eight gate checks passed and the order was sent: not a breach. (Before the full-set
     // rule, one passed check was enough; a decision with fewer than eight distinct rules is now a
@@ -595,7 +595,7 @@ async fn risk_breaches_count_sent_orders_of_failed_decisions_once_each() {
         &[(OrderState::Accepted, "0")],
     )
     .await;
-    assert_eq!(scoring::risk_breaches(&client, a).await.unwrap(), 1);
+    assert_eq!(scoring::risk_breaches(&client, a, 8).await.unwrap(), 1);
 
     // Several failed checks and several rows per order: each order counts once.
     let d4 = spy_decision(&client, a).await;
@@ -619,7 +619,7 @@ async fn risk_breaches_count_sent_orders_of_failed_decisions_once_each() {
         &[(OrderState::Accepted, "0"), (OrderState::Filled, "5")],
     )
     .await;
-    assert_eq!(scoring::risk_breaches(&client, a).await.unwrap(), 3);
+    assert_eq!(scoring::risk_breaches(&client, a, 8).await.unwrap(), 3);
 
     // Another version's breach is not counted.
     let other = spy_decision(&client, b).await;
@@ -633,8 +633,8 @@ async fn risk_breaches_count_sent_orders_of_failed_decisions_once_each() {
         &[(OrderState::Accepted, "0")],
     )
     .await;
-    assert_eq!(scoring::risk_breaches(&client, a).await.unwrap(), 3);
-    assert_eq!(scoring::risk_breaches(&client, b).await.unwrap(), 1);
+    assert_eq!(scoring::risk_breaches(&client, a, 8).await.unwrap(), 3);
+    assert_eq!(scoring::risk_breaches(&client, b, 8).await.unwrap(), 1);
     db.drop_db().await.unwrap();
 }
 
@@ -769,7 +769,7 @@ async fn breaches_of(client: &Client, n: u8, checks: &[(&str, bool)], sent: bool
         &[]
     };
     order(client, d, &format!("o-v{n}"), OrderSide::Buy, "5", states).await;
-    scoring::risk_breaches(client, v).await.unwrap()
+    scoring::risk_breaches(client, v, 8).await.unwrap()
 }
 
 #[tokio::test]
@@ -800,5 +800,37 @@ async fn risk_breaches_need_all_eight_distinct_rules() {
 
     // Intent only, no checks: not sent, so not a breach.
     assert_eq!(breaches_of(&client, 8, &[], false).await, 0);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_advisory_lock_is_held_by_one_connection_at_a_time() {
+    let db = ScratchDb::create().await;
+    let first = db.client().await.unwrap();
+    let second = db.client().await.unwrap();
+    let key = scoring::SCORE_JOB_LOCK;
+
+    assert!(scoring::try_advisory_lock(&first, key).await.unwrap());
+    assert!(!scoring::try_advisory_lock(&second, key).await.unwrap());
+    // Another key is independent.
+    assert!(
+        scoring::try_advisory_lock(&second, scoring::HOLDOUT_LOCK)
+            .await
+            .unwrap()
+    );
+    // The second connection never held the first key, so it cannot release it.
+    assert!(!scoring::advisory_unlock(&second, key).await.unwrap());
+    assert!(scoring::advisory_unlock(&first, key).await.unwrap());
+    assert!(scoring::try_advisory_lock(&second, key).await.unwrap());
+
+    // A connection that goes away gives its locks back.
+    drop(second);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(scoring::try_advisory_lock(&first, key).await.unwrap());
+    assert!(
+        scoring::try_advisory_lock(&first, scoring::HOLDOUT_LOCK)
+            .await
+            .unwrap()
+    );
     db.drop_db().await.unwrap();
 }
