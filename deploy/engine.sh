@@ -21,13 +21,14 @@ shift
 
 cd "$(dirname "$0")/.."
 env_file="${NISSE_ENV:-/etc/nisse/nisse.env}"
-if [[ -r "$env_file" ]]; then
-  set -a
-  # shellcheck disable=SC1090
-  . "$env_file"
-  set +a
-else
-  # Carry on: `kill` does whatever half it can with the variables already exported.
-  echo "deploy/engine.sh: cannot read $env_file (run as the engine user); using the current environment" >&2
+if [[ ! -r "$env_file" ]]; then
+  # Never fall back to whatever this shell happens to export: a kill recorded in the wrong
+  # database would report success while the engine carried on.
+  echo "deploy/engine.sh: cannot read $env_file; run this as the engine user" >&2
+  exit 1
 fi
+set -a
+# shellcheck disable=SC1090
+. "$env_file"
+set +a
 exec target/release/nisse-engine "$command" "${NISSE_CONFIG:-config/engine/paper.json}" "$@"

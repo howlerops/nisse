@@ -120,6 +120,10 @@ async fn run_kill(by: &str) -> ExitCode {
     let trading = alpaca_http().map(|http| {
         AlpacaTrading::new(http, &AlpacaConfig::paper(nisse_alpaca_adapter::Feed::Iex))
     });
+    // Said at once: the rest can take a minute, and this is when to go out of band.
+    if let Err(err) = &trading {
+        eprintln!("nisse-engine: kill: no broker client, open orders will NOT be cancelled: {err}");
+    }
     let connect = async { connect_store().await.map_err(|err| err.to_string()) };
     let outcome = commands::kill(
         connect,
@@ -129,9 +133,6 @@ async fn run_kill(by: &str) -> ExitCode {
         KILL_LOCK_WAIT,
     )
     .await;
-    if let Err(err) = &trading {
-        eprintln!("nisse-engine: kill: no broker client: {err}");
-    }
     for line in &outcome.errors {
         eprintln!("nisse-engine: kill: {line}");
     }

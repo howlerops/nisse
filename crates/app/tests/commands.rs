@@ -399,3 +399,33 @@ async fn kill_without_a_store_still_cancels_and_confirms() {
 
     f.db.drop_db().await.unwrap();
 }
+
+#[tokio::test]
+async fn kill_with_a_store_that_never_answers_still_cancels() {
+    let f = fixture().await;
+    let sim = broker();
+    month_end_with_open_orders(&f.store, f.sink.clone(), &f.config, &f.market, &sim).await;
+
+    let clock = ManualClock::new(plus_minutes(close_at(date(2025, 12, 31)), 20));
+    // A connection attempt that hangs: `kill` gives it ten seconds and no more.
+    let started = std::time::Instant::now();
+    let outcome = kill(
+        std::future::pending::<Result<&Store, String>>(),
+        Some(&sim),
+        &clock,
+        "ana",
+        SHORT_WAIT,
+    )
+    .await;
+
+    assert!(started.elapsed() < Duration::from_secs(20));
+    assert!(outcome.orders_cancelled, "{outcome:?}");
+    assert!(!outcome.switch_recorded && !outcome.engine_idle);
+    assert!(sim.open_orders().await.unwrap().orders.is_empty());
+    assert!(
+        outcome.errors[0].contains("the store did not answer"),
+        "{outcome:?}"
+    );
+
+    f.db.drop_db().await.unwrap();
+}
