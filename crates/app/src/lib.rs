@@ -6,6 +6,7 @@
 //! anywhere here, and the broker credentials are read from the environment by the binary
 //! only.
 
+pub mod commands;
 pub mod config;
 mod error;
 pub mod ingest;

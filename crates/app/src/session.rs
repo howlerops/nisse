@@ -1,5 +1,4 @@
 //! The `tick` and `session-close` commands.
-//! What every command does first: rebuild the trader's state from the store and the bar files.
 //!
 //! `tick` runs every few minutes while the market is open: it reconciles with the broker,
 //! observes the account equity and rebalances only when a drawdown step-down or a flatten is

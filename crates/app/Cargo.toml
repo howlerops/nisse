@@ -30,3 +30,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 nisse-store = { workspace = true, features = ["test-support"] }
+
+[[bin]]
+name = "nisse-engine"
+path = "src/bin/nisse-engine.rs"
