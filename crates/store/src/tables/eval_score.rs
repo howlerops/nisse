@@ -1,6 +1,6 @@
 //! `eval_score`: one metric value for a decision or strategy version.
 
-use nisse_core::EvalScore;
+use nisse_core::{EvalScore, SubjectType};
 use tokio_postgres::GenericClient;
 
 use crate::{StoreError, db::to_ts};
@@ -45,4 +45,29 @@ pub async fn insert_many<C: GenericClient>(
         )
         .await?;
     Ok(())
+}
+
+/// The subject ids of `subject_type` that already have a score for `metric` computed by
+/// `eval_version`, in ascending order, deduplicated (so a job can skip them).
+pub async fn scored_subjects<C: GenericClient>(
+    client: &C,
+    subject_type: SubjectType,
+    metric: &str,
+    eval_version: &str,
+) -> Result<Vec<i64>, StoreError> {
+    let subject_type: &'static str = subject_type.into();
+    let rows = client
+        .query(
+            "SELECT DISTINCT subject_id FROM eval_score \
+             WHERE subject_type = $1 AND metric = $2 AND eval_version = $3 \
+             ORDER BY subject_id",
+            &[&subject_type, &metric, &eval_version],
+        )
+        .await?;
+    let mut ids = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let id: i64 = row.try_get(0)?;
+        ids.push(id);
+    }
+    Ok(ids)
 }

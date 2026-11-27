@@ -6,7 +6,7 @@ A deterministic Rust engine (built on NautilusTrader crates) trades through Alpa
 
 ## Status
 
-**Phase 4 (risk gate and kill switch).** The workspace, CI, store schema, Alpaca adapter, decision store, replay job, a first strategy (monthly ETF trend with volatility targeting; rationale in [`docs/research/trend-v1-rationale.md`](docs/research/trend-v1-rationale.md)), a backtest that runs through the same trading loop as live, and the risk gate exist. Every order passes eight recorded checks (kill switch, drawdown step-down, stale data, per-trade risk, exposure cap and others; see [`docs/phases/phase-4.md`](docs/phases/phase-4.md)) under the limits in `config/limits/limits.json`, in backtests as in live trading. Every backtest registers a trial. The adapter is tested against a local mock server and the store against a real Postgres; the adapter's paper round-trip tests and the bar download (`nisse-ingest`) need Alpaca credentials and are run by the owner (see [`docs/runbooks/paper-tests.md`](docs/runbooks/paper-tests.md)). How to stop trading is in [`docs/runbooks/kill-switch.md`](docs/runbooks/kill-switch.md). No backtest on real data has been run yet and there is no running engine process. See [PLAN.md](PLAN.md) for the build plan and the GitHub issues for per-phase work.
+**Phase 5 (evals).** The workspace, CI, store schema, Alpaca adapter, decision store, replay job, a first strategy (monthly ETF trend with volatility targeting; rationale in [`docs/research/trend-v1-rationale.md`](docs/research/trend-v1-rationale.md)), a backtest that runs through the same trading loop as live, the risk gate, and the evaluation jobs exist. Every order passes eight recorded checks under the limits in `config/limits/limits.json` (see [`docs/phases/phase-4.md`](docs/phases/phase-4.md)). Every backtest registers a trial and stores its daily returns. `nisse-score` scores decisions nightly (outcome windows, execution, exits) and `nisse-gate-report` states, per strategy version, whether each promotion gate passes, fails or could not be evaluated, against the thresholds in `config/eval/gates.json` (see [`docs/phases/phase-5.md`](docs/phases/phase-5.md)); it promotes nothing. The adapter is tested against a local mock server and the store against a real Postgres; the adapter's paper round-trip tests and the bar download (`nisse-ingest`) need Alpaca credentials and are run by the owner (see [`docs/runbooks/paper-tests.md`](docs/runbooks/paper-tests.md)). How to stop trading is in [`docs/runbooks/kill-switch.md`](docs/runbooks/kill-switch.md). No backtest on real data has been run yet and there is no running engine process. See [PLAN.md](PLAN.md) for the build plan and the GitHub issues for per-phase work.
 
 ## Layout
 
@@ -18,8 +18,9 @@ A deterministic Rust engine (built on NautilusTrader crates) trades through Alpa
 | `crates/alpaca-adapter` | Alpaca data and execution adapter |
 | `crates/store` | Append-only Postgres decision store |
 | `crates/bars` | Daily bars in Parquet files, written and read through DuckDB |
-| `crates/eval` | Replay and backtest jobs; nightly evaluation and promotion gates later |
+| `crates/eval` | Replay, backtest and nightly scoring jobs; the statistics and the promotion gate report |
 | `config/limits/` | The reviewed risk limits file |
+| `config/eval/` | The reviewed promotion gate thresholds |
 | `migrations/` | Store schema as plain SQL, with tests in `migrations/tests/` |
 
 ## Development

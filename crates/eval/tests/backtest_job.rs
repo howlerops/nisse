@@ -21,12 +21,12 @@ use nisse_core::{
 use nisse_engine::CostModel;
 use nisse_eval::{
     EvalError,
-    backtest_job::{BacktestJob, run_backtest_job},
+    backtest_job::{BacktestJob, RunOptions, run_backtest_job},
 };
 use nisse_risk::Limits;
 use nisse_store::{
     Store,
-    tables::{trial_registry, trial_result},
+    tables::{scoring, trial_registry, trial_result},
     testing::ScratchDb,
 };
 use rust_decimal::Decimal;
@@ -36,7 +36,7 @@ use tokio_postgres::Client;
 /// 2026-01-05T09:46:40.123456Z: the `now` every job is given.
 const NOW: u64 = 1_767_600_000_123_456_000;
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
-/// Weekday closes from 2 January 2023 to 30 June 2023.
+/// Weekday closes from 4 January 2021 to 2 July 2021, well before the 2023 holdout.
 const SESSIONS: usize = 130;
 
 static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -81,9 +81,9 @@ fn utc(y: i32, m: u32, d: u32, h: u32, min: u32, s: u32, ns: u32) -> UnixNanos {
     UnixNanos::from(u64::try_from(at.and_utc().timestamp_nanos_opt().unwrap()).unwrap())
 }
 
-/// `SESSIONS` weekday closes at 21:00 UTC, starting on Monday 2 January 2023.
+/// `SESSIONS` weekday closes at 21:00 UTC, starting on Monday 4 January 2021.
 fn closes() -> Vec<UnixNanos> {
-    let mut day = NaiveDate::from_ymd_opt(2023, 1, 2).unwrap();
+    let mut day = NaiveDate::from_ymd_opt(2021, 1, 4).unwrap();
     let mut out = Vec::with_capacity(SESSIONS);
     while out.len() < SESSIONS {
         if day.weekday().num_days_from_monday() < 5 {
@@ -189,13 +189,27 @@ fn strategy_params() -> Value {
     })
 }
 
-/// A job over FALL and RISE for the whole synthetic range, reading from `dir`.
+/// The repository's gates file with its holdout boundary and look limit replaced, written to
+/// `path`.
+fn write_gates(path: &Path, holdout_start: &str, max_looks: u32) {
+    let repo = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/eval/gates.json");
+    let mut gates: Value = serde_json::from_str(&std::fs::read_to_string(repo).unwrap()).unwrap();
+    gates["holdout_start"] = json!(holdout_start);
+    gates["holdout_max_looks"] = json!(max_looks);
+    std::fs::write(path, gates.to_string()).unwrap();
+}
+
+/// A job over FALL and RISE for the whole synthetic range, reading from `dir`. Its gates file
+/// keeps the default holdout boundary (2023-01-01), after the data, so an ordinary run is allowed.
+/// Call `set_holdout` after the last `job` of a test, since jobs in one directory share the file.
 fn job(dir: &Path, strategy: Value) -> BacktestJob {
+    let gates_path = dir.join("gates.json");
+    write_gates(&gates_path, "2023-01-01", 10);
     BacktestJob {
         strategy_params: strategy,
         symbols: vec!["FALL".to_owned(), "RISE".to_owned()],
-        start: utc(2023, 1, 1, 0, 0, 0, 0),
-        end: utc(2023, 6, 30, 23, 59, 59, 999_999_999),
+        start: utc(2021, 1, 1, 0, 0, 0, 0),
+        end: utc(2021, 7, 31, 23, 59, 59, 999_999_999),
         starting_cash: dec("100000"),
         costs: CostModel::new(dec("2"), dec("0.0001")).unwrap(),
         bars_dir: dir.to_path_buf(),
@@ -203,7 +217,21 @@ fn job(dir: &Path, strategy: Value) -> BacktestJob {
             env!("CARGO_MANIFEST_DIR"),
             "/../../config/limits/limits.json"
         )),
+        gates_path,
         seed: 7,
+    }
+}
+
+/// Moves the holdout boundary and the look limit of the job's gates file.
+fn set_holdout(job: &BacktestJob, holdout_start: &str, max_looks: u32) {
+    write_gates(&job.gates_path, holdout_start, max_looks);
+}
+
+fn options(replayable: bool, allow_dirty: bool, holdout: bool) -> RunOptions {
+    RunOptions {
+        replayable,
+        allow_dirty,
+        holdout,
     }
 }
 
@@ -239,7 +267,12 @@ fn error_text<T>(result: Result<T, EvalError>) -> String {
     result.err().expect("an error").to_string()
 }
 
-const RESULT_FIELDS: [&str; 22] = [
+const RESULT_FIELDS: [&str; 28] = [
+    "returns",
+    "returns_complete",
+    "holdout",
+    "holdout_start",
+    "holdout_sessions",
     "final_drawdown_mode",
     "orders_blocked",
     "risk_events",
@@ -248,6 +281,7 @@ const RESULT_FIELDS: [&str; 22] = [
     "bars_file",
     "requested_start",
     "requested_end",
+    "data_end",
     "costs",
     "summary_includes_warm_up",
     "summary",
@@ -275,7 +309,7 @@ async fn a_backtest_registers_runs_and_stores_its_result() {
     let job = job(dir.path(), strategy_params());
     let before = trial_count(&client).await;
 
-    let outcome = run_backtest_job(&store, &job, true, false, now())
+    let outcome = run_backtest_job(&store, &job, options(true, false, false), now())
         .await
         .unwrap();
 
@@ -335,6 +369,11 @@ async fn a_backtest_registers_runs_and_stores_its_result() {
         json!(bars_snapshot_id(&read_back))
     );
 
+    // The last bar read back, and an ordinary run has no sessions in the holdout.
+    let last_read = read_back.last().unwrap().ts_event;
+    assert_eq!(result["data_end"], json!(last_read.as_u64()));
+    assert_eq!(result["holdout_sessions"], json!(0));
+
     db.drop_db().await.unwrap();
 }
 
@@ -349,7 +388,7 @@ async fn a_missing_limits_file_is_a_risk_error_and_writes_nothing() {
     let trials_before = trial_count(&client).await;
     let versions_before = version_count(&client).await;
 
-    let err = run_backtest_job(&store, &missing, true, false, now())
+    let err = run_backtest_job(&store, &missing, options(true, false, false), now())
         .await
         .unwrap_err();
 
@@ -382,7 +421,7 @@ async fn limits_looser_than_the_ceilings_are_a_risk_error_and_write_nothing() {
     let trials_before = trial_count(&client).await;
     let versions_before = version_count(&client).await;
 
-    let err = run_backtest_job(&store, &looser, true, false, now())
+    let err = run_backtest_job(&store, &looser, options(true, false, false), now())
         .await
         .unwrap_err();
 
@@ -403,10 +442,10 @@ async fn running_the_same_job_twice_gives_two_trials_and_equal_results() {
     let trials_before = trial_count(&client).await;
     let versions_before = version_count(&client).await;
 
-    let first = run_backtest_job(&store, &job, true, false, now())
+    let first = run_backtest_job(&store, &job, options(true, false, false), now())
         .await
         .unwrap();
-    let second = run_backtest_job(&store, &job, true, false, now())
+    let second = run_backtest_job(&store, &job, options(true, false, false), now())
         .await
         .unwrap();
 
@@ -428,7 +467,7 @@ async fn a_dirty_build_is_refused_before_anything_is_written() {
     let trials_before = trial_count(&client).await;
     let versions_before = version_count(&client).await;
 
-    let err = run_backtest_job(&store, &job, false, false, now())
+    let err = run_backtest_job(&store, &job, options(false, false, false), now())
         .await
         .unwrap_err();
 
@@ -447,7 +486,7 @@ async fn a_dirty_build_with_allow_dirty_runs_and_says_so() {
     let job = job(dir.path(), strategy_params());
     let before = trial_count(&client).await;
 
-    let outcome = run_backtest_job(&store, &job, false, true, now())
+    let outcome = run_backtest_job(&store, &job, options(false, true, false), now())
         .await
         .unwrap();
 
@@ -473,7 +512,7 @@ async fn a_failed_run_leaves_its_trial_registered_without_a_result() {
     failing.symbols = vec!["ZERO".to_owned()];
     let before = trial_count(&client).await;
 
-    let err = run_backtest_job(&store, &failing, true, false, now())
+    let err = run_backtest_job(&store, &failing, options(true, false, false), now())
         .await
         .unwrap_err();
 
@@ -494,7 +533,7 @@ async fn an_unknown_strategy_writes_nothing() {
     let trials_before = trial_count(&client).await;
     let versions_before = version_count(&client).await;
 
-    let err = run_backtest_job(&store, &unknown, true, false, now())
+    let err = run_backtest_job(&store, &unknown, options(true, false, false), now())
         .await
         .unwrap_err();
 
@@ -516,7 +555,7 @@ async fn no_bars_in_range_is_an_invalid_job_and_writes_nothing() {
     let trials_before = trial_count(&client).await;
     let versions_before = version_count(&client).await;
 
-    let err = run_backtest_job(&store, &outside, true, false, now())
+    let err = run_backtest_job(&store, &outside, options(true, false, false), now())
         .await
         .unwrap_err();
 
@@ -540,7 +579,7 @@ async fn a_requested_symbol_without_bars_is_an_invalid_job_and_writes_nothing() 
     let trials_before = trial_count(&client).await;
     let versions_before = version_count(&client).await;
 
-    let err = run_backtest_job(&store, &with_typo, true, false, now())
+    let err = run_backtest_job(&store, &with_typo, options(true, false, false), now())
         .await
         .unwrap_err();
 
@@ -567,7 +606,7 @@ async fn a_symbol_whose_bars_stop_early_is_an_invalid_job_and_writes_nothing() {
     let trials_before = trial_count(&client).await;
     let versions_before = version_count(&client).await;
 
-    let err = run_backtest_job(&store, &job, true, false, now())
+    let err = run_backtest_job(&store, &job, options(true, false, false), now())
         .await
         .unwrap_err();
 
@@ -575,6 +614,468 @@ async fn a_symbol_whose_bars_stop_early_is_an_invalid_job_and_writes_nothing() {
         matches!(err, EvalError::InvalidJob(ref m) if m.contains("RISE") && m.contains("stop")),
         "got {err:?}"
     );
+    assert_eq!(trial_count(&client).await, trials_before);
+    assert_eq!(version_count(&client).await, versions_before);
+    db.drop_db().await.unwrap();
+}
+
+// ---- returns and holdout acceptance ---------------------------------------------------------
+
+#[tokio::test]
+async fn a_backtest_stores_its_daily_returns() {
+    let db = ScratchDb::create().await;
+    let store = Store::new(db.client().await.unwrap());
+    let dir = bars_dir("returns", &market());
+    let job = job(dir.path(), strategy_params());
+
+    let outcome = run_backtest_job(&store, &job, options(true, false, false), now())
+        .await
+        .unwrap();
+
+    let result = &outcome.result;
+    let returns = result["returns"].as_array().unwrap();
+    assert_eq!(returns.len(), SESSIONS - 1);
+    assert!(returns.iter().all(Value::is_number), "{returns:?}");
+    assert_eq!(result["returns_complete"], json!(true));
+
+    let compounded: f64 = returns.iter().map(|r| 1.0 + r.as_f64().unwrap()).product();
+    let final_equity = dec(result["final_equity"].as_str().unwrap());
+    let ratio = (final_equity / job.starting_cash)
+        .to_string()
+        .parse::<f64>()
+        .unwrap();
+    assert!(
+        (compounded - ratio).abs() < 1e-6,
+        "compounded {compounded} vs ratio {ratio}"
+    );
+
+    // The account is flat through the warm-up, before the first trade.
+    for r in &returns[..5] {
+        assert_eq!(r.as_f64(), Some(0.0));
+    }
+
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_ordinary_run_that_reaches_the_holdout_is_refused_and_writes_nothing() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let store = Store::new(db.client().await.unwrap());
+    let dir = bars_dir("touched", &market());
+    let job = job(dir.path(), strategy_params());
+    set_holdout(&job, "2021-05-03", 10);
+    let trials_before = trial_count(&client).await;
+    let versions_before = version_count(&client).await;
+    let holdout_before = trial_registry::holdout_count(&client).await.unwrap();
+
+    let err = run_backtest_job(&store, &job, options(true, false, false), now())
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, EvalError::HoldoutTouched(ref m) if m.contains("2021-05-03") && m.contains("2021-07-02")),
+        "got {err:?}"
+    );
+    assert_eq!(trial_count(&client).await, trials_before);
+    assert_eq!(version_count(&client).await, versions_before);
+    assert_eq!(
+        trial_registry::holdout_count(&client).await.unwrap(),
+        holdout_before
+    );
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_holdout_run_is_counted_and_marked_and_an_ordinary_run_before_it_is_not() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let store = Store::new(db.client().await.unwrap());
+    let dir = bars_dir("holdout-marked", &market());
+    let full = job(dir.path(), strategy_params());
+    let mut early = job(dir.path(), strategy_params());
+    early.end = utc(2021, 4, 28, 23, 59, 59, 999_999_999);
+    set_holdout(&full, "2021-05-03", 10);
+    let trials_before = trial_count(&client).await;
+    let holdout_before = trial_registry::holdout_count(&client).await.unwrap();
+
+    let outcome = run_backtest_job(&store, &full, options(true, false, true), now())
+        .await
+        .unwrap();
+
+    assert_eq!(trial_count(&client).await, trials_before + 1);
+    assert_eq!(
+        trial_registry::holdout_count(&client).await.unwrap(),
+        holdout_before + 1
+    );
+    assert_eq!(outcome.result["holdout"], json!(true));
+    assert_eq!(outcome.result["holdout_start"], json!("2021-05-03"));
+    // The sessions on or after the boundary, counted from the synthetic closes.
+    let boundary = utc(2021, 5, 3, 0, 0, 0, 0).as_u64();
+    let holdout_sessions = closes().iter().filter(|ts| ts.as_u64() >= boundary).count();
+    assert!(holdout_sessions > 0);
+    assert_eq!(outcome.result["holdout_sessions"], json!(holdout_sessions));
+    assert_eq!(
+        trial_result::get(&client, outcome.trial_id).await.unwrap(),
+        Some(outcome.result.clone())
+    );
+
+    let before_holdout = run_backtest_job(&store, &early, options(true, false, false), now())
+        .await
+        .unwrap();
+
+    assert_eq!(before_holdout.result["holdout"], json!(false));
+    assert_eq!(before_holdout.result["holdout_start"], json!("2021-05-03"));
+    assert_eq!(before_holdout.result["holdout_sessions"], json!(0));
+    assert_eq!(
+        trial_registry::holdout_count(&client).await.unwrap(),
+        holdout_before + 1
+    );
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_holdout_run_whose_data_ends_before_the_holdout_is_an_invalid_job_and_writes_nothing() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let store = Store::new(db.client().await.unwrap());
+    let dir = bars_dir("holdout-short", &market());
+    // The default boundary (2023-01-01) is after the data.
+    let job = job(dir.path(), strategy_params());
+    let trials_before = trial_count(&client).await;
+    let versions_before = version_count(&client).await;
+    let holdout_before = trial_registry::holdout_count(&client).await.unwrap();
+
+    let err = run_backtest_job(&store, &job, options(true, false, true), now())
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, EvalError::InvalidJob(ref m) if m == "a holdout run must reach into the holdout period"),
+        "got {err:?}"
+    );
+    assert_eq!(trial_count(&client).await, trials_before);
+    assert_eq!(version_count(&client).await, versions_before);
+    assert_eq!(
+        trial_registry::holdout_count(&client).await.unwrap(),
+        holdout_before
+    );
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_holdout_is_retired_after_its_allowed_looks_and_the_refused_run_writes_nothing() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let store = Store::new(db.client().await.unwrap());
+    let dir = bars_dir("retired", &market());
+    let job = job(dir.path(), strategy_params());
+    set_holdout(&job, "2021-05-03", 2);
+
+    for _ in 0..2 {
+        run_backtest_job(&store, &job, options(true, false, true), now())
+            .await
+            .unwrap();
+    }
+    let trials_before = trial_count(&client).await;
+
+    let err = run_backtest_job(&store, &job, options(true, false, true), now())
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, EvalError::HoldoutRetired { looks: 2, max: 2 }),
+        "got {err:?}"
+    );
+    assert_eq!(trial_count(&client).await, trials_before);
+    assert_eq!(trial_registry::holdout_count(&client).await.unwrap(), 2);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_holdout_run_that_fails_after_registration_still_counts_as_a_look() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let store = Store::new(db.client().await.unwrap());
+    let zero: Vec<Bar> = series("ZERO", &closes(), dec("0"), dec("0"));
+    let dir = bars_dir("holdout-failing", &zero);
+    let mut failing = job(dir.path(), strategy_params());
+    failing.symbols = vec!["ZERO".to_owned()];
+    set_holdout(&failing, "2021-05-03", 10);
+    let holdout_before = trial_registry::holdout_count(&client).await.unwrap();
+
+    let err = run_backtest_job(&store, &failing, options(true, false, true), now())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, EvalError::Engine(_)), "got {err:?}");
+    assert_eq!(
+        trial_registry::holdout_count(&client).await.unwrap(),
+        holdout_before + 1
+    );
+    let newest = newest_trial(&client).await;
+    assert_eq!(trial_result::get(&client, newest).await.unwrap(), None);
+    db.drop_db().await.unwrap();
+}
+
+/// Whether the holdout lock can be taken from a fresh connection now. Takes and releases it.
+async fn holdout_lock_is_free(db: &ScratchDb) -> bool {
+    let other = db.client().await.unwrap();
+    let free = scoring::try_advisory_lock(&other, scoring::HOLDOUT_LOCK)
+        .await
+        .unwrap();
+    if free {
+        assert!(
+            scoring::advisory_unlock(&other, scoring::HOLDOUT_LOCK)
+                .await
+                .unwrap()
+        );
+    }
+    free
+}
+
+#[tokio::test]
+async fn a_holdout_run_that_starts_in_the_holdout_is_refused_and_writes_nothing() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let store = Store::new(db.client().await.unwrap());
+    let dir = bars_dir("holdout-start-late", &market());
+    let mut late = job(dir.path(), strategy_params());
+    // The first bar is the 2021-05-03 close: the boundary is 00:00 that day, so the warm-up
+    // would be inside the holdout.
+    late.start = utc(2021, 5, 3, 0, 0, 0, 0);
+    set_holdout(&late, "2021-05-03", 10);
+    let trials_before = trial_count(&client).await;
+    let versions_before = version_count(&client).await;
+    let holdout_before = trial_registry::holdout_count(&client).await.unwrap();
+
+    let err = run_backtest_job(&store, &late, options(true, false, true), now())
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, EvalError::InvalidJob(ref m) if m.contains("start before the holdout")),
+        "got {err:?}"
+    );
+    assert_eq!(trial_count(&client).await, trials_before);
+    assert_eq!(version_count(&client).await, versions_before);
+    assert_eq!(
+        trial_registry::holdout_count(&client).await.unwrap(),
+        holdout_before
+    );
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_holdout_run_has_no_more_holdout_sessions_than_returns_to_judge() {
+    let db = ScratchDb::create().await;
+    let store = Store::new(db.client().await.unwrap());
+    let dir = bars_dir("holdout-tail", &market());
+    let job = job(dir.path(), strategy_params());
+    // The boundary moves from the second session (every session but the first is held out) to
+    // the last session (one session is held out). The first session is always before it, so
+    // the holdout sessions are at most the returns, `SESSIONS - 1`.
+    for (boundary, y, m, d) in [
+        ("2021-01-05", 2021, 1, 5),
+        ("2021-05-03", 2021, 5, 3),
+        ("2021-07-02", 2021, 7, 2),
+    ] {
+        set_holdout(&job, boundary, 10);
+        let outcome = run_backtest_job(&store, &job, options(true, false, true), now())
+            .await
+            .unwrap();
+
+        let from = utc(y, m, d, 0, 0, 0, 0).as_u64();
+        let expected = closes().iter().filter(|ts| ts.as_u64() >= from).count();
+        let returns = outcome.result["returns"].as_array().unwrap().len();
+        let holdout_sessions = outcome.result["holdout_sessions"].as_u64().unwrap();
+        assert_eq!(
+            holdout_sessions,
+            u64::try_from(expected).unwrap(),
+            "{boundary}"
+        );
+        assert!(holdout_sessions >= 1, "{boundary}: {holdout_sessions}");
+        assert!(
+            holdout_sessions <= u64::try_from(returns).unwrap(),
+            "{boundary}: {holdout_sessions} sessions, {returns} returns"
+        );
+    }
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_held_holdout_lock_refuses_a_holdout_run_and_writes_nothing_until_it_is_released() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let store = Store::new(db.client().await.unwrap());
+    let dir = bars_dir("holdout-locked", &market());
+    let job = job(dir.path(), strategy_params());
+    set_holdout(&job, "2021-05-03", 10);
+    let holder = db.client().await.unwrap();
+    assert!(
+        scoring::try_advisory_lock(&holder, scoring::HOLDOUT_LOCK)
+            .await
+            .unwrap()
+    );
+    let trials_before = trial_count(&client).await;
+    let versions_before = version_count(&client).await;
+    let holdout_before = trial_registry::holdout_count(&client).await.unwrap();
+
+    let err = run_backtest_job(&store, &job, options(true, false, true), now())
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, EvalError::InvalidJob(ref m) if m.contains("another holdout run")),
+        "got {err:?}"
+    );
+    assert_eq!(trial_count(&client).await, trials_before);
+    assert_eq!(version_count(&client).await, versions_before);
+    assert_eq!(
+        trial_registry::holdout_count(&client).await.unwrap(),
+        holdout_before
+    );
+
+    assert!(
+        scoring::advisory_unlock(&holder, scoring::HOLDOUT_LOCK)
+            .await
+            .unwrap()
+    );
+    let outcome = run_backtest_job(&store, &job, options(true, false, true), now())
+        .await
+        .unwrap();
+    assert_eq!(outcome.result["holdout"], json!(true));
+    assert_eq!(
+        trial_registry::holdout_count(&client).await.unwrap(),
+        holdout_before + 1
+    );
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_holdout_lock_is_released_after_a_successful_holdout_run() {
+    let db = ScratchDb::create().await;
+    let store = Store::new(db.client().await.unwrap());
+    let dir = bars_dir("lock-success", &market());
+    let job = job(dir.path(), strategy_params());
+    set_holdout(&job, "2021-05-03", 10);
+
+    run_backtest_job(&store, &job, options(true, false, true), now())
+        .await
+        .unwrap();
+
+    assert!(holdout_lock_is_free(&db).await);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_holdout_lock_is_released_after_a_refused_retired_holdout_run() {
+    let db = ScratchDb::create().await;
+    let store = Store::new(db.client().await.unwrap());
+    let dir = bars_dir("lock-retired", &market());
+    let job = job(dir.path(), strategy_params());
+    set_holdout(&job, "2021-05-03", 1);
+
+    run_backtest_job(&store, &job, options(true, false, true), now())
+        .await
+        .unwrap();
+    let err = run_backtest_job(&store, &job, options(true, false, true), now())
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, EvalError::HoldoutRetired { looks: 1, max: 1 }),
+        "got {err:?}"
+    );
+    assert!(holdout_lock_is_free(&db).await);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_holdout_lock_is_released_after_a_holdout_run_that_fails_after_registration() {
+    let db = ScratchDb::create().await;
+    let store = Store::new(db.client().await.unwrap());
+    let zero: Vec<Bar> = series("ZERO", &closes(), dec("0"), dec("0"));
+    let dir = bars_dir("lock-failing", &zero);
+    let mut failing = job(dir.path(), strategy_params());
+    failing.symbols = vec!["ZERO".to_owned()];
+    set_holdout(&failing, "2021-05-03", 10);
+
+    let err = run_backtest_job(&store, &failing, options(true, false, true), now())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, EvalError::Engine(_)), "got {err:?}");
+    assert!(holdout_lock_is_free(&db).await);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_ordinary_run_is_not_blocked_by_a_held_holdout_lock() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let store = Store::new(db.client().await.unwrap());
+    let dir = bars_dir("ordinary-under-lock", &market());
+    let job = job(dir.path(), strategy_params());
+    let holder = db.client().await.unwrap();
+    assert!(
+        scoring::try_advisory_lock(&holder, scoring::HOLDOUT_LOCK)
+            .await
+            .unwrap()
+    );
+    let before = trial_count(&client).await;
+
+    let outcome = run_backtest_job(&store, &job, options(true, false, false), now())
+        .await
+        .unwrap();
+
+    assert_eq!(trial_count(&client).await, before + 1);
+    assert_eq!(outcome.result["holdout"], json!(false));
+    assert!(
+        scoring::advisory_unlock(&holder, scoring::HOLDOUT_LOCK)
+            .await
+            .unwrap()
+    );
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_missing_gates_file_is_an_invalid_gates_error_and_writes_nothing() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let store = Store::new(db.client().await.unwrap());
+    let dir = bars_dir("missing-gates", &market());
+    let mut missing = job(dir.path(), strategy_params());
+    missing.gates_path = dir.path().join("no-such-gates.json");
+    let trials_before = trial_count(&client).await;
+    let versions_before = version_count(&client).await;
+
+    let err = run_backtest_job(&store, &missing, options(true, false, false), now())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, EvalError::InvalidGates(_)), "got {err:?}");
+    assert_eq!(trial_count(&client).await, trials_before);
+    assert_eq!(version_count(&client).await, versions_before);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_holdout_boundary_after_2023_is_an_invalid_gates_error_and_writes_nothing() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let store = Store::new(db.client().await.unwrap());
+    let dir = bars_dir("late-holdout", &market());
+    let job = job(dir.path(), strategy_params());
+    set_holdout(&job, "2023-01-02", 10);
+    let trials_before = trial_count(&client).await;
+    let versions_before = version_count(&client).await;
+
+    let err = run_backtest_job(&store, &job, options(true, false, false), now())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, EvalError::InvalidGates(_)), "got {err:?}");
     assert_eq!(trial_count(&client).await, trials_before);
     assert_eq!(version_count(&client).await, versions_before);
     db.drop_db().await.unwrap();
@@ -593,6 +1094,7 @@ fn example() -> Value {
         "costs": {"slippage_bps": "2", "fee_per_share": "0.0001"},
         "bars_dir": "data/bars",
         "limits_path": "config/limits/limits.json",
+        "gates_path": "config/eval/gates.json",
         "seed": 0
     })
 }
@@ -624,6 +1126,7 @@ fn the_documented_example_parses_to_the_expected_job() {
     assert_eq!(job.costs, CostModel::new(dec("2"), dec("0.0001")).unwrap());
     assert_eq!(job.bars_dir, PathBuf::from("data/bars"));
     assert_eq!(job.limits_path, PathBuf::from("config/limits/limits.json"));
+    assert_eq!(job.gates_path, PathBuf::from("config/eval/gates.json"));
     assert_eq!(job.seed, 0);
 }
 
@@ -665,6 +1168,7 @@ fn a_missing_field_is_an_error_naming_it() {
         "costs",
         "bars_dir",
         "limits_path",
+        "gates_path",
     ] {
         let text = error_text(BacktestJob::from_json(&without(example(), field)));
         assert!(text.contains(field), "{field}: {text}");
@@ -734,4 +1238,118 @@ fn the_end_bound_includes_the_last_nanosecond_of_its_day_only() {
     // The 2024-12-31 close is inside the range; the first instant of 2025 is not.
     assert!(utc(2024, 12, 31, 21, 0, 0, 0).as_u64() <= job.end.as_u64());
     assert!(utc(2025, 1, 1, 0, 0, 0, 0).as_u64() > job.end.as_u64());
+}
+
+/// The link between the two halves: what a real backtest stores is what the gate report
+/// accepts as a usable trial. If a result field is renamed on one side only, this fails.
+#[tokio::test]
+async fn a_stored_backtest_result_is_a_usable_trial_for_the_gate_report() {
+    use nisse_eval::{gate_report::TrialSeries, gates::Gates};
+
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let store = Store::new(db.client().await.unwrap());
+    let dir = bars_dir("usable", &market());
+    let job = job(dir.path(), strategy_params());
+    let gates = Gates::load(&job.gates_path).unwrap();
+
+    // A clean build is usable.
+    let clean = run_backtest_job(&store, &job, options(true, false, false), now())
+        .await
+        .unwrap();
+    // A dirty build ran, but may not be judged.
+    let dirty = run_backtest_job(&store, &job, options(false, true, false), now())
+        .await
+        .unwrap();
+
+    let stored = scoring::backtest_results(&client).await.unwrap();
+    let series = |trial_id: i64| {
+        let trial = stored.iter().find(|t| t.trial_id == trial_id).unwrap();
+        TrialSeries::from_stored(trial)
+    };
+    let clean_series = series(clean.trial_id);
+    assert_eq!(clean_series.usable(&gates), Ok(()));
+    assert_eq!(
+        clean_series.returns.as_ref().map(Vec::len),
+        Some(SESSIONS - 1)
+    );
+    assert!(series(dirty.trial_id).usable(&gates).is_err());
+
+    // The same clean result judged under an earlier holdout boundary is not usable: it was
+    // run under another one, and its data reaches past the earlier date.
+    let earlier = dir.path().join("earlier-gates.json");
+    write_gates(&earlier, "2021-05-03", 10);
+    assert!(
+        clean_series
+            .usable(&Gates::load(&earlier).unwrap())
+            .is_err()
+    );
+    db.drop_db().await.unwrap();
+}
+
+/// The link from a real holdout look to the gate report: an ordinary backtest, then a holdout look
+/// made on it with the same inputs and the same bar file, both read back through the store and
+/// judged by the report. Reaching the holdout gate's "fewer than 252 sessions" note means every
+/// stored key the earlier checks need is present and matches on both sides: the inputs, the
+/// usability of both runs, the holdout sessions, the bar file, the requested start and the returns
+/// prefix (the look's returns begin with the ordinary run's). A missing or differing key gives
+/// another note, so this test fails if a result field is renamed or the engine's returns differ.
+#[tokio::test]
+async fn a_real_holdout_look_is_judged_against_the_ordinary_run_it_extends() {
+    use nisse_eval::gate_report::{GateStatus, ReportInputs, TrialSeries, build_report};
+    use nisse_eval::gates::Gates;
+
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let store = Store::new(db.client().await.unwrap());
+    let dir = bars_dir("e2e-holdout", &market());
+    // The boundary 2021-04-01 leaves 67 synthetic sessions after it (at least 60). The ordinary
+    // run ends on 2021-03-31, the last session of March, as a real baseline ends on the last
+    // session of a month (the default holdout starts on 1 January). That is the hard case for
+    // the prefix rule: the ordinary run cannot know its final session is a month end and does
+    // not rebalance there, while the look does. The returns still agree session for session,
+    // because equity is recorded before the rebalance and its orders fill at the next open.
+    let mut early = job(dir.path(), strategy_params());
+    early.end = utc(2021, 3, 31, 23, 59, 59, 999_999_999);
+    // Jobs in one directory share the gates file, so the boundary is set after the last `job`.
+    let full = job(dir.path(), strategy_params());
+    set_holdout(&full, "2021-04-01", 10);
+
+    let ordinary = run_backtest_job(&store, &early, options(true, false, false), now())
+        .await
+        .unwrap();
+    let look = run_backtest_job(&store, &full, options(true, false, true), now())
+        .await
+        .unwrap();
+
+    let stored = scoring::backtest_results(&client).await.unwrap();
+    let series = |trial_id: i64| {
+        let trial = stored.iter().find(|t| t.trial_id == trial_id).unwrap();
+        TrialSeries::from_stored(trial)
+    };
+    let inputs = ReportInputs {
+        version: ordinary.strategy_version_id,
+        gates: Gates::load(&full.gates_path).unwrap(),
+        lifetime_trials: 2,
+        holdout_looks: 1,
+        trials: vec![series(ordinary.trial_id), series(look.trial_id)],
+        replay: (0, 0),
+        risk_breaches: 0,
+        sent_orders: 0,
+        live: None,
+    };
+    let report = build_report(&inputs);
+
+    let holdout = report.gates.iter().find(|g| g.name == "holdout").unwrap();
+    assert_eq!(holdout.status, GateStatus::NotEvaluated, "{}", holdout.note);
+    assert_eq!(
+        holdout.note,
+        "the holdout baseline has fewer than 252 sessions with a non-zero return"
+    );
+    assert_eq!(
+        report.info["holdout_run"]["baseline_trial_id"],
+        json!(ordinary.trial_id)
+    );
+    assert_eq!(report.info["holdout_run"]["trial_id"], json!(look.trial_id));
+    db.drop_db().await.unwrap();
 }

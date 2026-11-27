@@ -1,0 +1,16 @@
+{
+  "deflated_sharpe_min": 0.95,
+  "pbo_max": 0.2,
+  "pbo_min_configs": 10,
+  "trial_budget": 100,
+  "sharpe_haircut": 0.5,
+  "cv_folds": 8,
+  "cv_embargo_sessions": 21,
+  "holdout_start": "2023-01-01",
+  "holdout_max_looks": 10,
+  "tracking_error_max": 0.05,
+  "tracking_gap_max": 0.05,
+  "benchmark": "SPY",
+  "periods_per_year": 252,
+  "bootstrap_seed": 20261126
+}
