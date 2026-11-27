@@ -10,7 +10,6 @@
 
 mod support;
 
-use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::NaiveDate;
@@ -25,10 +24,9 @@ use nisse_store::{
     Store,
     tables::scoring::{self, ENGINE_LOCK},
 };
-use serde_json::json;
 use support::{
-    FakeMarket, Scratch, broker, close_at, plus_minutes, repo_limits, session_bars, setup,
-    weekday_calendar,
+    FakeMarket, Scratch, broker, close_at, count, plus_minutes, session_bars, session_config,
+    setup, weekday_calendar,
 };
 
 /// The universe of the paper config, in its order (the price path follows this order).
@@ -38,35 +36,6 @@ const SHORT_WAIT: Duration = Duration::from_secs(1);
 
 fn date(year: i32, month: u32, day: u32) -> NaiveDate {
     NaiveDate::from_ymd_opt(year, month, day).unwrap()
-}
-
-/// The paper config, with the strategy's windows shortened so that the sessions of the fake
-/// market are enough to decide. The paper universe, benchmark and limits are kept.
-///
-/// The same shape as `session.rs`'s `session_config`, which is private to that test binary.
-fn session_config(bars_dir: PathBuf) -> EngineConfig {
-    let paper = Path::new(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../config/engine/paper.json"
-    ));
-    let mut config = EngineConfig::load(paper).unwrap();
-    config.strategy["lookback_days"] = json!(20);
-    config.strategy["skip_days"] = json!(5);
-    config.strategy["vol_window"] = json!(10);
-    config.bars_dir = bars_dir;
-    config.limits_path = repo_limits();
-    config
-}
-
-/// `SELECT count(*)` of `table`.
-async fn count(store: &Store, table: &str) -> i64 {
-    let sql = format!("SELECT count(*) FROM {table}");
-    store
-        .client()
-        .query_one(sql.as_str(), &[])
-        .await
-        .unwrap()
-        .get(0)
 }
 
 /// The number of `kill_switch` rows of `risk_event`.

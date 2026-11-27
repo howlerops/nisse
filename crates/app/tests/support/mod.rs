@@ -275,3 +275,31 @@ impl Market for FakeMarket {
         Ok(out)
     }
 }
+
+/// The paper config, with the strategy's windows shortened so that the ~40 sessions of history
+/// in the fake market are enough to decide: `lookback_days` 20 (above `skip_days` 5),
+/// `vol_window` 10. The paper universe, benchmark and limits are kept.
+pub fn session_config(bars_dir: PathBuf) -> EngineConfig {
+    let paper = Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../config/engine/paper.json"
+    ));
+    let mut config = EngineConfig::load(paper).unwrap();
+    config.strategy["lookback_days"] = serde_json::json!(20);
+    config.strategy["skip_days"] = serde_json::json!(5);
+    config.strategy["vol_window"] = serde_json::json!(10);
+    config.bars_dir = bars_dir;
+    config.limits_path = repo_limits();
+    config
+}
+
+/// `SELECT count(*)` of `table`.
+pub async fn count(store: &Store, table: &str) -> i64 {
+    let sql = format!("SELECT count(*) FROM {table}");
+    store
+        .client()
+        .query_one(sql.as_str(), &[])
+        .await
+        .unwrap()
+        .get(0)
+}

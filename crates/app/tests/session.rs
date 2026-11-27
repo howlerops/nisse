@@ -10,8 +10,6 @@
 
 mod support;
 
-use std::path::{Path, PathBuf};
-
 use chrono::NaiveDate;
 use nisse_app::{
     AppError,
@@ -32,8 +30,8 @@ use nisse_store::{
 };
 use serde_json::{Value, json};
 use support::{
-    FakeMarket, Scratch, broker, close_at, plus_minutes, repo_limits, session_bars, setup,
-    weekday_calendar,
+    FakeMarket, Scratch, broker, close_at, count, plus_minutes, session_bars, session_config,
+    setup, weekday_calendar,
 };
 
 /// The universe of the paper config, in its order (the price path follows this order).
@@ -46,23 +44,6 @@ fn date(year: i32, month: u32, day: u32) -> NaiveDate {
 /// `hour:00` UTC on `day`.
 fn at(day: NaiveDate, hour: u32) -> UnixNanos {
     support::utc_at(day, hour, 0)
-}
-
-/// The paper config, with the strategy's windows shortened so that the ~40 sessions of history
-/// in the fake market are enough to decide: `lookback_days` 20 (above `skip_days` 5),
-/// `vol_window` 10. The paper universe, benchmark and limits are kept.
-fn session_config(bars_dir: PathBuf) -> EngineConfig {
-    let paper = Path::new(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../config/engine/paper.json"
-    ));
-    let mut config = EngineConfig::load(paper).unwrap();
-    config.strategy["lookback_days"] = json!(20);
-    config.strategy["skip_days"] = json!(5);
-    config.strategy["vol_window"] = json!(10);
-    config.bars_dir = bars_dir;
-    config.limits_path = repo_limits();
-    config
 }
 
 /// Everything a test needs. The bars are the session bars, minus those `keep` rejects.
@@ -99,17 +80,6 @@ async fn fixture_with(keep: impl Fn(&Bar) -> bool) -> Fixture {
 
 async fn fixture() -> Fixture {
     fixture_with(|_| true).await
-}
-
-/// `SELECT count(*)` of `table`.
-async fn count(store: &Store, table: &str) -> i64 {
-    let sql = format!("SELECT count(*) FROM {table}");
-    store
-        .client()
-        .query_one(sql.as_str(), &[])
-        .await
-        .unwrap()
-        .get(0)
 }
 
 /// The run key of the `session-close` run for `day`.
