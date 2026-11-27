@@ -8,107 +8,41 @@
 //! Acceptance tests P6: the start-up restore against a real Postgres (`TEST_DATABASE_URL`),
 //! with the simulated broker, a manual clock and synthetic daily bar files.
 
-use std::{
-    path::{Path, PathBuf},
-    process,
-    sync::atomic::{AtomicUsize, Ordering},
-};
+mod support;
+
+use std::path::Path;
 
 use chrono::NaiveDate;
-use nisse_alpaca_adapter::{Feed, VENUE};
 use nisse_app::{
     AppError,
-    config::EngineConfig,
     ingest::bar_file_path,
     restore::{Restored, restore, take_engine_lock},
 };
 use nisse_bars::write_bars;
-use nisse_core::nautilus::{
-    AggregationSource, Bar, BarAggregation, BarSpecification, BarType, InstrumentId, Price,
-    PriceType, Quantity, Symbol, UnixNanos, Venue,
-};
+use nisse_core::nautilus::UnixNanos;
 use nisse_core::{ManualClock, PositionEvent, RiskEvent, RiskEventKind};
-use nisse_engine::{CostModel, SimBroker};
 use nisse_store::{
-    Store, StoreWriter, WriterConfig,
+    Store,
     tables::{position_event, risk_event},
     testing::ScratchDb,
 };
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
+use support::{
+    BENCHMARK, Scratch, UNIVERSE, bar, broker, close_at, config, repo_limits, setup, symbol,
+};
 
 const SECOND: u64 = 1_000_000_000;
-const UNIVERSE: [&str; 3] = ["AAPL", "MSFT", "NVDA"];
-const BENCHMARK: &str = "SPY";
 /// Weekday sessions of January 2026 (Monday to Friday).
 const SESSION_DAYS: [u32; 5] = [5, 6, 7, 8, 9];
 
-/// Removes its directory when dropped, including on a failed assertion.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    /// A path under the system temp dir, unique to this process and call. Not created.
-    fn new() -> Self {
-        static COUNTER: AtomicUsize = AtomicUsize::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let path =
-            std::env::temp_dir().join(format!("nisse-app-restore-test-{}-{n}", process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        Self(path)
-    }
-
-    /// The same path, created as an empty directory.
-    fn new_dir() -> Self {
-        let scratch = Self::new();
-        std::fs::create_dir_all(&scratch.0).unwrap();
-        scratch
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-fn symbol(text: &str) -> Symbol {
-    Symbol::new_checked(text).unwrap()
-}
-
 /// 21:00 UTC on `day` of January 2026: the close of that session, in nanoseconds.
 fn close_of(day: u32) -> UnixNanos {
-    let secs = NaiveDate::from_ymd_opt(2026, 1, day)
-        .unwrap()
-        .and_hms_opt(21, 0, 0)
-        .unwrap()
-        .and_utc()
-        .timestamp();
-    UnixNanos::from(u64::try_from(secs).unwrap() * SECOND)
+    close_at(date_of(day))
 }
 
 fn date_of(day: u32) -> NaiveDate {
     NaiveDate::from_ymd_opt(2026, 1, day).unwrap()
-}
-
-/// A daily bar for `symbol_text` stamped at `ts` (event and init time).
-fn bar(symbol_text: &str, ts: UnixNanos) -> Bar {
-    let instrument_id = InstrumentId::new(symbol(symbol_text), Venue::new(VENUE));
-    let spec = BarSpecification::new(1, BarAggregation::Day, PriceType::Last);
-    let bar_type = BarType::new(instrument_id, spec, AggregationSource::External);
-    Bar::new(
-        bar_type,
-        Price::from("10.00"),
-        Price::from("11.00"),
-        Price::from("9.00"),
-        Price::from("10.50"),
-        Quantity::from("1000"),
-        ts,
-        ts,
-    )
 }
 
 /// Writes one bar file holding every session in `days` for the universe and the benchmark.
@@ -125,47 +59,6 @@ fn write_session_bars(dir: &Path, days: &[u32]) {
     }
     let last = *days.last().unwrap();
     write_bars(&bar_file_path(dir, date_of(last)), &bars).unwrap();
-}
-
-/// The engine config the tests run with: the paper strategy, three symbols and the benchmark.
-fn config(bars_dir: PathBuf, limits_path: PathBuf) -> EngineConfig {
-    let paper: Value =
-        serde_json::from_str(include_str!("../../../config/engine/paper.json")).unwrap();
-    EngineConfig {
-        strategy: paper["strategy"].clone(),
-        symbols: UNIVERSE.iter().map(|text| symbol(text)).collect(),
-        benchmark: symbol(BENCHMARK),
-        feed: Feed::Iex,
-        history_start: NaiveDate::from_ymd_opt(2015, 1, 1).unwrap(),
-        bars_dir,
-        limits_path,
-        seed: 0,
-        source: "engine".to_owned(),
-    }
-}
-
-/// The repository's limits file.
-fn repo_limits() -> PathBuf {
-    PathBuf::from(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../config/limits/limits.json"
-    ))
-}
-
-/// A simulated broker with no costs.
-fn broker() -> SimBroker {
-    SimBroker::new(
-        Decimal::from(100_000),
-        CostModel::new(Decimal::ZERO, Decimal::ZERO).unwrap(),
-    )
-}
-
-/// A database with a store on one connection and a record writer on another.
-async fn setup() -> (ScratchDb, Store, StoreWriter) {
-    let db = ScratchDb::create().await;
-    let store = Store::new(db.client().await.unwrap());
-    let (sink, _handle) = StoreWriter::spawn(db.client().await.unwrap(), WriterConfig::default());
-    (db, store, sink)
 }
 
 fn risk(kind: RiskEventKind, detail: Value, ts: UnixNanos) -> RiskEvent {
