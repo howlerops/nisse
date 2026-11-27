@@ -1018,3 +1018,51 @@ fn the_end_bound_includes_the_last_nanosecond_of_its_day_only() {
     assert!(utc(2024, 12, 31, 21, 0, 0, 0).as_u64() <= job.end.as_u64());
     assert!(utc(2025, 1, 1, 0, 0, 0, 0).as_u64() > job.end.as_u64());
 }
+
+/// The link between the two halves: what a real backtest stores is what the gate report
+/// accepts as a usable trial. If a result field is renamed on one side only, this fails.
+#[tokio::test]
+async fn a_stored_backtest_result_is_a_usable_trial_for_the_gate_report() {
+    use nisse_eval::{gate_report::TrialSeries, gates::Gates};
+    use nisse_store::tables::scoring;
+
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let store = Store::new(db.client().await.unwrap());
+    let dir = bars_dir("usable", &market());
+    let job = job(dir.path(), strategy_params());
+    let gates = Gates::load(&job.gates_path).unwrap();
+
+    // A clean build is usable.
+    let clean = run_backtest_job(&store, &job, options(true, false, false), now())
+        .await
+        .unwrap();
+    // A dirty build ran, but may not be judged.
+    let dirty = run_backtest_job(&store, &job, options(false, true, false), now())
+        .await
+        .unwrap();
+
+    let stored = scoring::backtest_results(&client).await.unwrap();
+    let series = |trial_id: i64| {
+        let trial = stored.iter().find(|t| t.trial_id == trial_id).unwrap();
+        TrialSeries::from_stored(trial)
+    };
+    let clean_series = series(clean.trial_id);
+    assert_eq!(clean_series.usable(&gates), Ok(()));
+    assert_eq!(
+        clean_series.returns.as_ref().map(Vec::len),
+        Some(SESSIONS - 1)
+    );
+    assert!(series(dirty.trial_id).usable(&gates).is_err());
+
+    // The same clean result judged under an earlier holdout boundary is not usable: it was
+    // run under another one, and its data reaches past the earlier date.
+    let earlier = dir.path().join("earlier-gates.json");
+    write_gates(&earlier, "2021-05-03", 10);
+    assert!(
+        clean_series
+            .usable(&Gates::load(&earlier).unwrap())
+            .is_err()
+    );
+    db.drop_db().await.unwrap();
+}
