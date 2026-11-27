@@ -502,7 +502,7 @@ fn status_says_cancelled_only_for_a_confirmed_cancel() {
     let db = store_with_a_kill_and_its_cancel(&rt, "done");
     let app = start(
         Some(&as_ui_role(&db.url)),
-        "Open orders: cancelled, broker listed none left (just now)",
+        "Open orders: cancel confirmed by the broker's own list (just now)",
     );
     assert!(app.shows("Kill switch: ENGAGED"));
     assert!(!app.shows("THE KILL SWITCH IS ENGAGED BUT NOT ENFORCED"));
@@ -514,7 +514,7 @@ fn status_says_cancelled_only_for_a_confirmed_cancel() {
         Some(&as_ui_role(&db.url)),
         "Open orders: cancel sent, NOT yet confirmed (just now)",
     );
-    assert!(!app.shows("Open orders: cancelled, broker listed none left (just now)"));
+    assert!(!app.shows("Open orders: cancel confirmed by the broker's own list (just now)"));
     drop(app);
     rt.block_on(db.drop_db()).unwrap();
 }

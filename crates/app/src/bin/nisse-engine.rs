@@ -13,12 +13,13 @@
 //! Environment variables (none of them is ever printed):
 //! - `DATABASE_URL`: the Postgres store. Read by every command.
 //! - `APCA_API_KEY_ID` and `APCA_API_SECRET_KEY`: the Alpaca paper keys. Read by `session-close`,
-//!   `tick`, `kill` and `kill-watch` only (`kill-watch` only when the switch is engaged);
+//!   `tick`, `kill` and `kill-watch` only;
 //!   `status` and `release-kill` need neither.
 //! - `NISSE_SIGNING_KEY`: the signing key as hex. Read by `session-close` and `tick` only, and
 //!   only when the config requires a signature (`signature.required`).
 //!
-//! `kill-watch` runs every minute: with the switch off it reads one row and exits; engaged, it
+//! `kill-watch` runs every minute: with the switch off it reads one row and asks the broker for
+//! the account (to show it could cancel); engaged, it
 //! cancels what rests at the broker (see `kill_watch`). It takes no engine lock and does not
 //! need a valid config beyond `limits_path` (a broken config still enforces, as a halt).
 //!
@@ -201,11 +202,12 @@ async fn run_kill(by: &str) -> ExitCode {
     }
 }
 
-/// `kill-watch`. Reads the switch from the store first: off, it prints that and exits 0 with
-/// no broker client (missing Alpaca keys are no error then). Engaged, it builds the trading
-/// client and enforces the switch with it. No engine lock, no signature check, no record
-/// writer. The config is read only for `limits_path`; if it cannot be read, the switch halts
-/// (no flatten) and everything is cancelled, and that is said on stderr.
+/// `kill-watch`: one run of the watcher (`watch_once`). It builds the trading client on
+/// every run and asks the broker for the account even when the switch is off, so that missing
+/// or rejected keys show as a failing watcher; engaged, it enforces the switch. No engine
+/// lock, no signature check, no record writer. The config is read only for `limits_path`; if
+/// it cannot be read, the switch halts (no flatten) and everything is cancelled, and that is
+/// said on stderr.
 async fn run_kill_watch(config_path: &std::path::Path) -> ExitCode {
     let flatten = match EngineConfig::load(config_path) {
         Ok(config) => flatten_on_kill(&config.limits_path),

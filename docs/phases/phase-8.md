@@ -75,8 +75,8 @@ files, no signature, no engine lock.
   Missing or rejected broker keys therefore show on the phone as a watcher that is not
   running, which for its purpose it is not.
 - The phone's Status screen shows, while the switch is engaged, the state of the cancel for
-  *this* kill (only steps recorded since the switch was last set count): "cancelled" only
-  for `done`. If the cancel failed, or nothing has cancelled and the watcher has not run for
+  *this* kill (only steps recorded since the switch was last set count): "cancel
+  confirmed" only for `done`. If the cancel failed, or nothing has cancelled and the watcher has not run for
   three minutes, it says in red that open orders are not being cancelled, with the
   out-of-band steps. The Kill screen never claims a cancel: it says the cancel is not yet
   confirmed and points to Status.
@@ -86,7 +86,7 @@ It runs in three places:
 1. **`nisse-engine kill-watch`, from cron every minute, around the clock.** Orders sent after
    a close rest until the next open, and nothing else runs overnight; without the watcher a
    kill from the phone in the evening would not cancel them before they filled. With the
-   switch off it costs one query.
+   switch off it costs one query and one request to the broker.
 2. First thing in `tick` and `session-close`, before the signature check, the lock and the
    restore, so it does not depend on any of them succeeding.
 3. The switch is read again immediately before a rebalance sends orders, so a row written

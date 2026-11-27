@@ -104,7 +104,9 @@ pub const KILL_CANCEL_STEP: &str = "cancel";
 
 /// The newest `kill` / `cancel` step recorded at or after the newest `kill_switch` event:
 /// its status and its age by the database's clock. A cancel from before the switch was last
-/// set belongs to an earlier kill and is not this one's.
+/// set belongs to an earlier kill and is not this one's. "Before" is judged on `ingest_ts`,
+/// which the database stamps on both rows, not on `event_ts`, which the engine's host stamps
+/// on one and the database on the other.
 async fn kill_cancel<C: GenericClient>(client: &C) -> Result<Option<(String, u64)>, UiError> {
     let row = client
         .query_opt(
@@ -112,7 +114,7 @@ async fn kill_cancel<C: GenericClient>(client: &C) -> Result<Option<(String, u64
                     greatest(extract(epoch FROM (clock_timestamp() - s.event_ts)), 0)::float8 AS age \
              FROM engine_step s \
              WHERE s.run_key = $1 AND s.step = $2 \
-               AND s.event_ts >= (SELECT event_ts FROM risk_event \
+               AND s.ingest_ts >= (SELECT ingest_ts FROM risk_event \
                                   WHERE kind = 'kill_switch' ORDER BY id DESC LIMIT 1) \
              ORDER BY s.id DESC LIMIT 1",
             &[&KILL_RUN_KEY, &KILL_CANCEL_STEP],

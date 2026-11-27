@@ -60,11 +60,11 @@ not send makes its reconciliation stop.
    "Kill switch ENGAGED" only after reading it back, and says whether the watcher is running.
    If it says "Open orders are NOT being cancelled", the watcher is not running: fix that
    first.
-3. Within about a minute, the app's Status screen shows "Open orders: cancelled, broker listed
-   none left", Activity shows a new "kill  cancel: done, just now" row (read the age: an old
+3. Within about a minute, the app's Status screen shows "Open orders: cancel confirmed by the
+   broker's own list", Activity shows a new "kill  cancel: done, just now" row (read the age: an old
    row is an old cancel),
-   `log/killwatch.log` on the host has "switch ENGAGED; N open orders cancelled", and Alpaca
-   shows no open orders. Repeat the test once in the evening, with the market closed and an
+   `log/killwatch.log` on the host has "switch ENGAGED; cancel sent for N open orders" and
+   then "switch ENGAGED; nothing open", and Alpaca shows no open orders. Repeat the test once in the evening, with the market closed and an
    order resting for the next open: that is the case the watcher exists for.
 4. Status on the phone shows "Kill switch: ENGAGED".
 5. Turn the phone's network off and open the app: it shows "CANNOT CONFIRM", never a state.

@@ -522,11 +522,17 @@ pub fn describe_tick(outcome: &TickOutcome) -> String {
 pub fn describe_kill_watch(outcome: &KillEnforcement) -> String {
     if !outcome.engaged {
         "kill-watch: switch off".to_owned()
+    } else if outcome.cancelled && outcome.open_orders == 0 {
+        // The broker could not list its orders, so everything was cancelled blind.
+        "kill-watch: switch ENGAGED; orders could not be listed, cancel of everything sent"
+            .to_owned()
     } else if outcome.open_orders == 0 {
         "kill-watch: switch ENGAGED; nothing open".to_owned()
     } else if outcome.cancelled {
+        // Sent, not confirmed here: the kill/cancel step says whether the broker then
+        // listed none left.
         format!(
-            "kill-watch: switch ENGAGED; {} open orders cancelled",
+            "kill-watch: switch ENGAGED; cancel sent for {} open orders",
             outcome.open_orders
         )
     } else {

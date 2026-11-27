@@ -546,7 +546,7 @@ fn describe_kill_watch_lines() {
     );
     assert_eq!(
         line(true, 3, true),
-        "kill-watch: switch ENGAGED; 3 open orders cancelled"
+        "kill-watch: switch ENGAGED; cancel sent for 3 open orders"
     );
     assert_eq!(
         line(true, 2, false),
@@ -799,5 +799,43 @@ async fn a_lost_store_connection_is_an_error_and_cancels_nothing() {
     assert_eq!(sim.open_orders().await.unwrap().orders.len(), resting);
 
     drop(other);
+    f.db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_failed_cancel_is_settled_once_the_broker_lists_nothing() {
+    let f = fixture().await;
+    let sim = broker();
+    month_end_orders_resting(&f, &sim).await;
+    engage_kill_switch(&f.store, &ManualClock::new(now()), "phone")
+        .await
+        .unwrap();
+
+    // The cancel is refused: recorded as failed.
+    enforce_kill(&f.store, &CancelFails(&sim), false, now())
+        .await
+        .unwrap_err();
+    let failed = f
+        .store
+        .step_status(KILL_RUN_KEY, KILL_CANCEL_STEP)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(failed.0, StepStatus::Failed);
+
+    // The orders go away some other way (the owner cancels at the broker). The next run
+    // finds nothing open: the row must not stay "failed".
+    sim.cancel_all().await.unwrap();
+    let outcome = enforce_kill(&f.store, &sim, false, now()).await.unwrap();
+    assert!(!outcome.cancelled, "{outcome:?}");
+    let (status, detail) = f
+        .store
+        .step_status(KILL_RUN_KEY, KILL_CANCEL_STEP)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status, StepStatus::Done);
+    assert_eq!(detail["confirmed_empty"], json!(true));
+
     f.db.drop_db().await.unwrap();
 }

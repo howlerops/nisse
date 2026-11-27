@@ -98,11 +98,13 @@ pub async fn enforce_kill<B: Broker>(
         .len()
         .saturating_add(usize::try_from(open.unrepresentable).unwrap_or(usize::MAX));
     if targets(&open, flatten_on_kill) == 0 {
-        // Nothing left to cancel. If the last cancel was sent but never confirmed, this
-        // listing is the confirmation.
+        // Nothing left to cancel. If the last cancel was sent but never confirmed, or was
+        // recorded as failed (a time-out on a cancel that went through; keys that have since
+        // been replaced), this listing settles it: the row must not stay "failed" while the
+        // broker lists nothing.
         if matches!(
             store.step_status(KILL_RUN_KEY, KILL_CANCEL_STEP).await?,
-            Some((StepStatus::Started, _))
+            Some((StepStatus::Started | StepStatus::Failed, _))
         ) {
             record(
                 store,

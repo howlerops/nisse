@@ -187,7 +187,7 @@ function StatusScreen(props: { url: () => string | null }) {
   const cancel = () => {
     const state = status.value()?.killCancelStatus;
     const when = ago(status.value()?.killCancelAgeSeconds ?? 0);
-    if (state === "done") return { text: `Open orders: cancelled, broker listed none left (${when})`, color: GREEN, bad: false };
+    if (state === "done") return { text: `Open orders: cancel confirmed by the broker's own list (${when})`, color: GREEN, bad: false };
     if (state === "failed") return { text: `Open orders: the cancel FAILED (${when})`, color: RED, bad: true };
     if (state === "started") {
       return { text: `Open orders: cancel sent, NOT yet confirmed (${when})`, color: AMBER, bad: !watching() };
