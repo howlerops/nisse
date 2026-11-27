@@ -148,7 +148,7 @@ under another gates file cannot be judged as if it had not.
 | `trial_budget` | lifetime trial count | `≤ trial_budget` |
 | `deflated_sharpe` | as above, on the candidate | `≥ deflated_sharpe_min`. The trial Sharpes are those of usable trials, one per (strategy version, data snapshot, requested range), the newest. `not_evaluated` when the candidate is not usable, or, with more than one lifetime trial, when fewer than half the lifetime trials have a usable Sharpe or their variance is zero (nothing to deflate with). |
 | `pbo` | as above | `≤ pbo_max`, over at least `pbo_min_configs` configurations (else `not_evaluated`) |
-| `holdout` | annualised Sharpe of the version's holdout run over the holdout sessions only | The holdout run judged is the version's **oldest** holdout run whose costs and symbols equal the candidate's: the first look counts, and a later look cannot rescue it. Looks `> holdout_max_looks` → `fail`. No such run → `not_evaluated`. The candidate must have been registered before that run (a candidate chosen after the look → `not_evaluated`). The run ended `flat` → `fail`. Otherwise `pass` when that Sharpe `≥` the haircut of the candidate's annualised Sharpe measured from its first non-zero return (the flat warm-up would understate it), over at least 60 holdout sessions. |
+| `holdout` | annualised Sharpe of the version's first holdout run over the holdout sessions only | The run judged is the version's **oldest** holdout run with a stored result, whatever its inputs: the first look counts and no later look, re-run or change of costs can replace it. It is compared with the **holdout baseline**: the newest usable ordinary run of the version registered before that look whose costs (as decimals) and symbols (as a set) equal the holdout run's. Looks `> holdout_max_looks` → `fail`. No holdout run, or no baseline → `not_evaluated`. The report's candidate must have the same costs and symbols as the judged run (else `not_evaluated`: the candidate is not what the holdout was looked at with). The run ended `flat` → `fail`. Otherwise `pass` when its Sharpe `≥` the haircut of the baseline's annualised Sharpe measured from its first non-zero return (the flat warm-up would understate it), over at least 60 holdout sessions. A later identical ordinary re-run does not disturb a judged holdout. |
 | `replay` | decisions of this version whose newest `replay_match` score is 0 | `= 0` (no scored decision → `not_evaluated`) |
 | `risk_breaches` | orders of this version sent beyond the intent whose decision has a failed `risk_check` row or fewer than the eight rows the gate writes | `= 0` (no sent order → `not_evaluated`) |
 | `tracking` | tracking error and gap | inside the band (`not_evaluated` without live returns) |
@@ -178,9 +178,13 @@ if another run holds it.
   close[t+h] / close[t] − 1`, `bench_ret` the same for the benchmark, `mfe = max(high[t+1..=t+h])
   / close[t] − 1`, `mae = min(low[t+1..=t+h]) / close[t] − 1`, where `t` is the last bar at or
   before the decision time. A decision whose symbol or benchmark has no bar at `t` is left for
-  a later run. The base bar must be the benchmark's newest bar too: if the benchmark has a later bar at or
-  before the decision, the symbol's own bar for that session is missing and the decision
-  waits (sessions, not hours, so a weekend or a half-day changes nothing). The decision-quality score
+  a later run. Two rules keep a decision from being scored off the wrong bar. The base bar must be the
+  benchmark's newest bar too (if the benchmark has a later bar at or before the decision, the
+  symbol's own bar for that session is missing). And the base bar must be less than 20 hours
+  older than the decision: the engine decides at a session's close, and no two closes are
+  less than 21 hours apart, so an older base bar means the decision's session is missing
+  from the file for every symbol. A decision made off-session (more than 20 hours after its
+  bar) is therefore left unscored until the job is given the exchange calendar. The decision-quality score
   is not signed by action (an exit followed by a rally scores positive), so readers split it
   by action. The score (`eval_score` metric `decision_quality_<h>`) is
   `(fwd_ret − bench_ret) / (expected_vol · sqrt(h / periods_per_year))`, written only when the
