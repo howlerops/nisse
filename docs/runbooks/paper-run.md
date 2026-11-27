@@ -40,7 +40,7 @@ runs the engine against Alpaca.
 
 ## Stopping
 
-`deploy/engine.sh kill --by <your name>` cancels every
+As the engine user: `deploy/engine.sh kill --by <your name>` cancels every
 open order, engages the kill switch, waits for any engine run in flight to end and cancels
 once more. It prints which of those were done; if any was not, it exits 1: run it again. `release-kill` with the same
 arguments lowers the switch; nothing else does. If the host is unreachable, use the

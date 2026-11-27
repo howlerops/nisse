@@ -32,13 +32,13 @@ Paper is a plumbing test, not a promotion signal. This phase has two halves:
 - `nisse-engine tick <config.json>`: every few minutes while the market is open, and once after
   the open.
 - `nisse-engine kill <config.json> --by <name>` and `nisse-engine release-kill <config.json>
-  --by <name>`. `kill` cancels every open order and records the switch at the same time,
-  waits up to a minute for a run in flight to end, cancels again and checks that the
-  broker lists no open order. It does not read the config file, the
-  cancel goes out before the store is contacted, and the store is given ten seconds per
-  step: with the store unreachable it still cancels, with the broker keys missing it still
-  records the switch. It prints which of the three (orders cancelled, switch recorded,
-  engine idle) were done and exits 1 unless all were.
+  --by <name>`. `kill` does two things at the same time, neither waiting for the other: it asks
+  the broker to cancel every open order, and it connects to the store and records the
+  switch (ten seconds allowed for each store step). Then it waits up to a minute for a run
+  in flight to end, cancels again, and checks that the broker lists no open order. It does
+  not read the config file. With the store unreachable it still cancels and checks; with
+  the broker keys missing it still records the switch. It prints which of the three (orders
+  cancelled, switch recorded, engine idle) were done and exits 1 unless all were.
 - `nisse-engine status <config.json>`: prints the risk state, open orders and positions the
   engine would start from. Reads only.
 

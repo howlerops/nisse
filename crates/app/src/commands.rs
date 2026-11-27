@@ -1,7 +1,9 @@
 //! The `nisse-engine` command line: argument parsing and the `kill`, `release-kill` and
 //! `status` commands. `tick` and `session-close` are in [`crate::session`].
 
+use std::borrow::Borrow;
 use std::fmt;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -125,6 +127,8 @@ fn require_by(by: Option<String>) -> Result<String, String> {
 /// How long `kill` waits for one store statement before giving up on it. The broker half
 /// never waits for the store.
 pub const KILL_STORE_TIMEOUT: Duration = Duration::from_secs(10);
+/// The line for a store that did not answer in time.
+const STORE_SILENT: &str = "the switch was NOT recorded: the store did not answer";
 /// How many times `kill` looks for open orders after its last cancel.
 const OPEN_ORDER_CHECKS: u32 = 5;
 
@@ -158,65 +162,91 @@ impl KillOutcome {
 /// error return: the outcome says what was done.
 ///
 /// 1. At the same time: `broker.cancel_all()` (`broker` is `None` when the broker client
-///    could not be built, for example missing keys), and record a `kill_switch` risk event
-///    (`engaged: true`, `by`), giving the store [`KILL_STORE_TIMEOUT`]. Neither waits for the
-///    other.
+///    could not be built, for example missing keys), and on the store side await `connect`
+///    and then record a `kill_switch` risk event (`engaged: true`, `by`), giving each of the
+///    two [`KILL_STORE_TIMEOUT`]. Neither side waits for the other. `connect` is a future so
+///    that a caller which still has to open the connection does not delay the cancel; a
+///    caller that already has a store passes `async { Ok(&store) }`.
 /// 2. Try to take the engine lock, retrying until `lock_wait` has passed. Once taken, no
 ///    engine run is in flight and any later run will read the switch as engaged: cancel
 ///    again and report `engine_idle: true`.
-/// 3. Ask the broker for its open orders and report any that remain.
-pub async fn kill<B: Broker, C: Clock>(
-    store: &Store,
+/// 3. Ask the broker for its open orders and report any that remain. This does not need the
+///    store.
+pub async fn kill<S, F, B, C>(
+    connect: F,
     broker: Option<&B>,
     clock: &C,
     by: &str,
     lock_wait: Duration,
-) -> KillOutcome {
+) -> KillOutcome
+where
+    S: Borrow<Store>,
+    F: Future<Output = Result<S, String>>,
+    B: Broker,
+    C: Clock,
+{
     let mut errors = Vec::new();
     // Together: the switch must not wait for a slow broker, nor the cancel for a slow store.
-    let (cancelled, recorded) = tokio::join!(
-        cancel_for_kill(broker),
-        tokio::time::timeout(KILL_STORE_TIMEOUT, engage_kill_switch(store, clock, by)),
-    );
+    // The store side is "connect, then record", each step bounded.
+    let (cancelled, connected) = tokio::join!(cancel_for_kill(broker), async {
+        let store = match tokio::time::timeout(KILL_STORE_TIMEOUT, connect).await {
+            Ok(Ok(store)) => store,
+            Ok(Err(err)) => return Err(format!("the switch was NOT recorded: {err}")),
+            Err(_) => return Err(STORE_SILENT.to_owned()),
+        };
+        let recorded = match tokio::time::timeout(
+            KILL_STORE_TIMEOUT,
+            engage_kill_switch(store.borrow(), clock, by),
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => Err(format!("the switch was NOT recorded: {err}")),
+            Err(_) => Err(STORE_SILENT.to_owned()),
+        };
+        Ok((store, recorded))
+    });
     let mut orders_cancelled = note(cancelled, &mut errors);
-    let switch_recorded = match recorded {
-        Ok(Ok(())) => true,
-        Ok(Err(err)) => {
-            errors.push(format!("the switch was NOT recorded: {err}"));
-            false
-        }
-        Err(_) => {
-            errors.push("the switch was NOT recorded: the store did not answer".to_owned());
-            false
+    let (store, switch_recorded) = match connected {
+        Ok((store, recorded)) => (Some(store), note(recorded, &mut errors)),
+        Err(line) => {
+            errors.push(line);
+            (None, false)
         }
     };
 
-    // The lock wait is itself bounded: each try is one statement, given the same timeout.
-    let waited = tokio::time::timeout(
-        lock_wait.saturating_add(KILL_STORE_TIMEOUT),
-        wait_for_engine_lock(store, lock_wait),
-    )
-    .await;
-    let engine_idle = match waited {
-        Ok(Ok(idle)) => {
-            if !idle {
-                errors.push("an engine run is still in flight; run kill again".to_owned());
+    let engine_idle = match &store {
+        None => {
+            errors.push("could not tell whether an engine run is in flight: no store".to_owned());
+            false
+        }
+        // The lock wait is itself bounded: each try is one statement.
+        Some(store) => match tokio::time::timeout(
+            lock_wait.saturating_add(KILL_STORE_TIMEOUT),
+            wait_for_engine_lock(store.borrow(), lock_wait),
+        )
+        .await
+        {
+            Ok(Ok(idle)) => {
+                if !idle {
+                    errors.push("an engine run is still in flight; run kill again".to_owned());
+                }
+                idle
             }
-            idle
-        }
-        Ok(Err(err)) => {
-            errors.push(format!(
-                "could not tell whether an engine run is in flight: {err}"
-            ));
-            false
-        }
-        Err(_) => {
-            errors.push(
-                "could not tell whether an engine run is in flight: the store did not answer"
-                    .to_owned(),
-            );
-            false
-        }
+            Ok(Err(err)) => {
+                errors.push(format!(
+                    "could not tell whether an engine run is in flight: {err}"
+                ));
+                false
+            }
+            Err(_) => {
+                errors.push(
+                    "could not tell whether an engine run is in flight: the store did not answer"
+                        .to_owned(),
+                );
+                false
+            }
+        },
     };
     // The lock is held by this connection from here on, so no run is in flight. Cancel what
     // a run placed before it could see the switch. The lock goes with the process.

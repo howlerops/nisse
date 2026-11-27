@@ -38,6 +38,11 @@ fn date(year: i32, month: u32, day: u32) -> NaiveDate {
     NaiveDate::from_ymd_opt(year, month, day).unwrap()
 }
 
+/// A store that is already connected, in the form `kill` takes.
+async fn have(store: &Store) -> Result<&Store, String> {
+    Ok(store)
+}
+
 /// The number of `kill_switch` rows of `risk_event`.
 async fn kill_switch_rows(store: &Store) -> i64 {
     store
@@ -117,7 +122,7 @@ async fn kill_records_the_switch_and_cancels_open_orders() {
     month_end_with_open_orders(&f.store, f.sink.clone(), &f.config, &f.market, &sim).await;
 
     let clock = ManualClock::new(plus_minutes(close_at(date(2025, 12, 31)), 20));
-    let outcome = kill(&f.store, Some(&sim), &clock, "ana", SHORT_WAIT).await;
+    let outcome = kill(have(&f.store), Some(&sim), &clock, "ana", SHORT_WAIT).await;
 
     assert!(outcome.complete(), "{outcome:?}");
     assert!(outcome.errors.is_empty());
@@ -156,7 +161,7 @@ async fn kill_with_an_engine_in_flight_still_engages() {
     );
 
     let clock = ManualClock::new(plus_minutes(close_at(date(2025, 12, 31)), 20));
-    let outcome = kill(&f.store, Some(&sim), &clock, "ana", SHORT_WAIT).await;
+    let outcome = kill(have(&f.store), Some(&sim), &clock, "ana", SHORT_WAIT).await;
 
     assert!(!outcome.engine_idle);
     assert!(
@@ -184,7 +189,7 @@ async fn release_kill_lowers_the_switch() {
     let sim = broker();
     let clock = ManualClock::new(plus_minutes(close_at(date(2025, 12, 31)), 20));
 
-    kill(&f.store, Some(&sim), &clock, "ana", SHORT_WAIT).await;
+    kill(have(&f.store), Some(&sim), &clock, "ana", SHORT_WAIT).await;
     release_kill(&f.store, &clock, "ana").await.unwrap();
 
     assert!(
@@ -272,8 +277,14 @@ async fn kill_without_a_broker_still_records_the_switch() {
     let f = fixture().await;
     let clock = ManualClock::new(plus_minutes(close_at(date(2025, 12, 31)), 20));
 
-    let outcome =
-        kill::<nisse_engine::SimBroker, _>(&f.store, None, &clock, "ana", SHORT_WAIT).await;
+    let outcome = kill(
+        have(&f.store),
+        None::<&nisse_engine::SimBroker>,
+        &clock,
+        "ana",
+        SHORT_WAIT,
+    )
+    .await;
 
     assert!(
         outcome.switch_recorded && outcome.engine_idle,
@@ -288,6 +299,103 @@ async fn kill_without_a_broker_still_records_the_switch() {
             .unwrap()
             .kill_switch
     );
+
+    f.db.drop_db().await.unwrap();
+}
+
+/// A broker that accepts a cancel of everything and then cancels nothing: what a per-order
+/// failure inside a "207 Multi-Status" answer looks like from outside.
+struct Sticky<'a>(&'a nisse_engine::SimBroker);
+
+impl Broker for Sticky<'_> {
+    type Error = <nisse_engine::SimBroker as Broker>::Error;
+
+    async fn submit(
+        &self,
+        intent: &nisse_core::OrderIntent,
+    ) -> Result<nisse_core::BrokerOrder, nisse_core::SubmitError<Self::Error>> {
+        self.0.submit(intent).await
+    }
+
+    async fn cancel(
+        &self,
+        venue_order_id: nisse_core::nautilus::VenueOrderId,
+    ) -> Result<(), Self::Error> {
+        self.0.cancel(venue_order_id).await
+    }
+
+    async fn cancel_all(&self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    async fn replace(
+        &self,
+        venue_order_id: nisse_core::nautilus::VenueOrderId,
+        request: &nisse_core::ReplaceRequest,
+    ) -> Result<nisse_core::BrokerOrder, nisse_core::SubmitError<Self::Error>> {
+        self.0.replace(venue_order_id, request).await
+    }
+
+    async fn order_by_client_id(
+        &self,
+        client_order_id: nisse_core::nautilus::ClientOrderId,
+    ) -> Result<Option<nisse_core::BrokerOrder>, Self::Error> {
+        self.0.order_by_client_id(client_order_id).await
+    }
+
+    async fn open_orders(&self) -> Result<nisse_core::OpenOrders, Self::Error> {
+        self.0.open_orders().await
+    }
+
+    async fn positions(&self) -> Result<Vec<nisse_core::BrokerPosition>, Self::Error> {
+        self.0.positions().await
+    }
+
+    async fn account(&self) -> Result<nisse_core::AccountSnapshot, Self::Error> {
+        self.0.account().await
+    }
+}
+
+#[tokio::test]
+async fn kill_reports_orders_the_cancel_left_open() {
+    let f = fixture().await;
+    let sim = broker();
+    month_end_with_open_orders(&f.store, f.sink.clone(), &f.config, &f.market, &sim).await;
+    let left = sim.open_orders().await.unwrap().orders.len();
+
+    let clock = ManualClock::new(plus_minutes(close_at(date(2025, 12, 31)), 20));
+    let sticky = Sticky(&sim);
+    let outcome = kill(have(&f.store), Some(&sticky), &clock, "ana", SHORT_WAIT).await;
+
+    assert!(
+        outcome.switch_recorded && outcome.engine_idle,
+        "{outcome:?}"
+    );
+    assert!(!outcome.orders_cancelled, "{outcome:?}");
+    assert!(!outcome.complete());
+    assert_eq!(
+        outcome.errors,
+        vec![format!("{left} orders are still open after the cancel")]
+    );
+
+    f.db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn kill_without_a_store_still_cancels_and_confirms() {
+    let f = fixture().await;
+    let sim = broker();
+    month_end_with_open_orders(&f.store, f.sink.clone(), &f.config, &f.market, &sim).await;
+
+    let clock = ManualClock::new(plus_minutes(close_at(date(2025, 12, 31)), 20));
+    let no_store = async { Err::<&Store, String>("connection refused".to_owned()) };
+    let outcome = kill(no_store, Some(&sim), &clock, "ana", SHORT_WAIT).await;
+
+    assert!(outcome.orders_cancelled, "{outcome:?}");
+    assert!(!outcome.switch_recorded && !outcome.engine_idle);
+    assert!(sim.open_orders().await.unwrap().orders.is_empty());
+    assert_eq!(kill_switch_rows(&f.store).await, 0);
+    assert_eq!(outcome.errors.len(), 2, "{outcome:?}");
 
     f.db.drop_db().await.unwrap();
 }

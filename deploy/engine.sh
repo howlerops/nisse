@@ -8,7 +8,8 @@
 #   deploy/engine.sh release-kill --by ana
 #
 # The config file is config/engine/paper.json unless $NISSE_CONFIG names another. The
-# environment is read from $NISSE_ENV, default /etc/nisse/nisse.env; nothing from it is printed.
+# environment is read from $NISSE_ENV, default /etc/nisse/nisse.env, which only the engine user
+# can read: run this as that user. Nothing from the file is printed.
 set -euo pipefail
 
 if (( $# < 1 )); then
@@ -19,8 +20,14 @@ command="$1"
 shift
 
 cd "$(dirname "$0")/.."
-set -a
-# shellcheck disable=SC1090
-. "${NISSE_ENV:-/etc/nisse/nisse.env}"
-set +a
+env_file="${NISSE_ENV:-/etc/nisse/nisse.env}"
+if [[ -r "$env_file" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$env_file"
+  set +a
+else
+  # Carry on: `kill` does whatever half it can with the variables already exported.
+  echo "deploy/engine.sh: cannot read $env_file (run as the engine user); using the current environment" >&2
+fi
 exec target/release/nisse-engine "$command" "${NISSE_CONFIG:-config/engine/paper.json}" "$@"

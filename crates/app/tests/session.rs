@@ -721,3 +721,132 @@ async fn an_attempt_that_failed_this_hour_is_tried_again() {
 
     f.db.drop_db().await.unwrap();
 }
+
+/// The repository limits with `flatten_on_kill` on, written into `dir`.
+fn flattening_limits(dir: &std::path::Path) -> std::path::PathBuf {
+    let mut limits: Value =
+        serde_json::from_str(&std::fs::read_to_string(support::repo_limits()).unwrap()).unwrap();
+    limits["flatten_on_kill"] = json!(true);
+    let path = dir.join("limits.json");
+    std::fs::write(&path, limits.to_string()).unwrap();
+    path
+}
+
+#[tokio::test]
+async fn a_flattening_kill_is_acted_on_within_the_hour_and_then_not_repeated() {
+    let mut f = fixture().await;
+    let limits_dir = Scratch::new_dir();
+    f.config.limits_path = flattening_limits(limits_dir.path());
+    let sim = broker();
+    let day = date(2025, 12, 15);
+    let close = ManualClock::new(plus_minutes(close_at(day), 10));
+    session_close(&f.config, &f.market, &f.store, f.sink.clone(), &sim, &close)
+        .await
+        .unwrap();
+
+    // An owed rebalance at 15:00 enters positions: this hour's attempt, at full scale.
+    let next = date(2025, 12, 16);
+    owe(&f.store, close.now()).await;
+    let first = ManualClock::new(at(next, 15));
+    let outcome = tick(&f.config, &f.market, &f.store, f.sink.clone(), &sim, &first)
+        .await
+        .unwrap();
+    let entered = outcome.rebalance.expect("the owed rebalance runs");
+    assert!(entered.orders_submitted > 0, "{entered:?}");
+    let decided = count(&f.store, "decision").await;
+
+    // The switch is engaged four minutes later. The limits flatten on a kill, so the scale is
+    // now zero with orders working: the next tick acts although one has tried this hour.
+    engage_kill_switch(&f.store, &first, "test").await.unwrap();
+    let second = ManualClock::new(plus_minutes(at(next, 15), 6));
+    let outcome = tick(
+        &f.config,
+        &f.market,
+        &f.store,
+        f.sink.clone(),
+        &sim,
+        &second,
+    )
+    .await
+    .unwrap();
+    assert!(outcome.rebalance.is_some(), "{outcome:?}");
+    let after_kill = count(&f.store, "decision").await;
+    assert!(after_kill > decided);
+
+    // Same hour, same (zero) scale: whatever is still held, it is not decided again.
+    let third = ManualClock::new(plus_minutes(at(next, 15), 8));
+    let outcome = tick(&f.config, &f.market, &f.store, f.sink.clone(), &sim, &third)
+        .await
+        .unwrap();
+    assert!(outcome.rebalance.is_none(), "{outcome:?}");
+    assert_eq!(count(&f.store, "decision").await, after_kill);
+
+    f.db.drop_db().await.unwrap();
+}
+
+/// A market whose calendar stops at `last`, so that whether `last` ends its month is unknown.
+fn market_ending_on(f: &Fixture, last: NaiveDate) -> FakeMarket {
+    let sessions = f
+        .calendar
+        .sessions()
+        .iter()
+        .copied()
+        .filter(|session| session.date <= last)
+        .collect();
+    FakeMarket::new(
+        MarketCalendar::new(sessions).unwrap(),
+        session_bars(&f.calendar, &SYMBOLS),
+    )
+}
+
+#[tokio::test]
+async fn an_unknown_month_end_fails_the_rebalance_step() {
+    let f = fixture().await;
+    let sim = broker();
+    let day = date(2025, 12, 15);
+    let market = market_ending_on(&f, day);
+    let clock = ManualClock::new(plus_minutes(close_at(day), 10));
+
+    let err = session_close(&f.config, &market, &f.store, f.sink.clone(), &sim, &clock)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AppError::Market(_)), "{err:?}");
+    let (status, detail) = f
+        .store
+        .step_status(&run_key(day), "rebalance")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status, StepStatus::Failed);
+    assert!(detail["error"].as_str().unwrap().contains("ends its month"));
+    assert_eq!(count(&f.store, "decision").await, 0);
+    assert_eq!(count(&f.store, "heartbeat").await, 0);
+
+    f.db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_unknown_month_end_does_not_hold_back_an_owed_rebalance() {
+    let f = fixture().await;
+    let sim = broker();
+    let day = date(2025, 12, 15);
+    let market = market_ending_on(&f, day);
+    owe(&f.store, close_at(day)).await;
+    let clock = ManualClock::new(plus_minutes(close_at(day), 10));
+
+    let outcome = session_close(&f.config, &market, &f.store, f.sink.clone(), &sim, &clock)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            outcome,
+            SessionCloseOutcome::Ran {
+                rebalance: RebalanceStep::Ran(_),
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+
+    f.db.drop_db().await.unwrap();
+}

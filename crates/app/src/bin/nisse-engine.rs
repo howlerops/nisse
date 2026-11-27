@@ -111,50 +111,27 @@ async fn execute(command: &Command, config: &EngineConfig) -> Result<(), RunErro
     }
 }
 
-/// `kill`. A first cancel goes to the broker while the store is given a bounded time to
-/// connect; then the library's `kill` records the switch (cancelling again alongside), waits
-/// for a run in flight, cancels once more and checks that no order is left open. Whatever
-/// could not be done is printed, one line each, and makes the exit code 1.
+/// `kill`. The library's `kill` cancels at the broker while it connects to the store and
+/// records the switch, waits for a run in flight, cancels once more and checks that no order
+/// is left open. Whatever could not be done is printed, one line each, and makes the exit
+/// code 1.
 async fn run_kill(by: &str) -> ExitCode {
     // The feed only matters to market data, which `kill` never reads.
     let trading = alpaca_http().map(|http| {
         AlpacaTrading::new(http, &AlpacaConfig::paper(nisse_alpaca_adapter::Feed::Iex))
     });
-    // The first cancel goes out while the store connects: neither waits for the other.
-    let (first_cancel, store) = tokio::join!(
-        async {
-            match &trading {
-                Ok(trading) => commands::cancel_open_orders(trading)
-                    .await
-                    .map_err(|err| err.to_string()),
-                Err(err) => Err(format!("no broker client: {err}")),
-            }
-        },
-        tokio::time::timeout(commands::KILL_STORE_TIMEOUT, connect_store()),
-    );
-    match &first_cancel {
-        Ok(()) => println!("kill: cancel of every open order sent"),
-        Err(err) => eprintln!("nisse-engine: kill: open orders were NOT cancelled: {err}"),
-    }
-    let store = match store {
-        Ok(Ok(store)) => store,
-        Ok(Err(err)) => {
-            eprintln!("nisse-engine: kill: the switch was NOT recorded: {err}");
-            return ExitCode::FAILURE;
-        }
-        Err(_) => {
-            eprintln!("nisse-engine: kill: the switch was NOT recorded: the store did not answer");
-            return ExitCode::FAILURE;
-        }
-    };
+    let connect = async { connect_store().await.map_err(|err| err.to_string()) };
     let outcome = commands::kill(
-        &store,
+        connect,
         trading.as_ref().ok(),
         &SystemClock,
         by,
         KILL_LOCK_WAIT,
     )
     .await;
+    if let Err(err) = &trading {
+        eprintln!("nisse-engine: kill: no broker client: {err}");
+    }
     for line in &outcome.errors {
         eprintln!("nisse-engine: kill: {line}");
     }

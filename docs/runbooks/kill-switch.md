@@ -18,7 +18,7 @@ The flag is stored as `kill_switch` rows in the append-only `risk_event` table; 
 row wins. If the engine cannot read the flag, it treats it as engaged. Releasing it is a new
 row written by a person. Nothing in the engine releases it.
 
-On the engine host (Phase 6):
+On the engine host, as the user the engine runs as (Phase 6):
 
 ```
 cd /opt/nisse
