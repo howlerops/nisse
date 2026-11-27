@@ -13,6 +13,7 @@ mod support;
 use chrono::NaiveDate;
 use nisse_app::{
     AppError,
+    commands::{engage_kill_switch, release_kill},
     config::EngineConfig,
     ingest::bar_file_path,
     restore::take_engine_lock,
@@ -21,7 +22,7 @@ use nisse_app::{
     },
 };
 use nisse_core::nautilus::{Bar, UnixNanos};
-use nisse_core::{Broker, ManualClock, MarketCalendar, RiskEvent, RiskEventKind};
+use nisse_core::{Broker, Clock, ManualClock, MarketCalendar, RiskEvent, RiskEventKind};
 use nisse_risk::DrawdownMode;
 use nisse_store::{
     Store,
@@ -461,6 +462,186 @@ async fn an_owed_resize_makes_a_mid_month_close_rebalance() {
         .unwrap()
         .unwrap();
     assert_eq!(status, StepStatus::Done);
+
+    f.db.drop_db().await.unwrap();
+}
+
+/// The newest status of the owed-rebalance step.
+async fn owed_status(store: &Store) -> Option<StepStatus> {
+    store
+        .step_status(RESIZE_RUN_KEY, RESIZE_STEP)
+        .await
+        .unwrap()
+        .map(|(status, _)| status)
+}
+
+/// Marks a rebalance as owed, as a step-down would.
+async fn owe(store: &Store, ts: UnixNanos) {
+    store
+        .record_step(
+            RESIZE_RUN_KEY,
+            RESIZE_STEP,
+            StepStatus::Started,
+            &json!({"from": "normal", "to": "halved"}),
+            ts,
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_rerun_after_a_crash_mid_rebalance_orders_nothing_twice() {
+    let f = fixture().await;
+    let sim = broker();
+    let day = date(2025, 12, 31);
+    let clock = ManualClock::new(plus_minutes(close_at(day), 10));
+    session_close(&f.config, &f.market, &f.store, f.sink.clone(), &sim, &clock)
+        .await
+        .unwrap();
+    let sent = sim.open_orders().await.unwrap().orders.len();
+    assert!(sent > 0);
+
+    // As if the process had died after sending the orders and before recording `done`: the
+    // newest row of the step is `started`.
+    f.store
+        .record_step(
+            &run_key(day),
+            "rebalance",
+            StepStatus::Started,
+            &json!({}),
+            clock.now(),
+        )
+        .await
+        .unwrap();
+
+    let later = ManualClock::new(plus_minutes(close_at(day), 40));
+    let outcome = session_close(&f.config, &f.market, &f.store, f.sink.clone(), &sim, &later)
+        .await
+        .unwrap();
+
+    let report = match outcome {
+        SessionCloseOutcome::Ran {
+            rebalance: RebalanceStep::Ran(report),
+            ..
+        } => report,
+        other => panic!("expected the rebalance to run again, got {other:?}"),
+    };
+    // The orders of the first run are working, so the second run wants nothing more.
+    assert_eq!(report.orders_submitted, 0, "{report:?}");
+    assert_eq!(sim.open_orders().await.unwrap().orders.len(), sent);
+
+    f.db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_owed_rebalance_waits_out_the_kill_switch_and_is_tried_once_an_hour() {
+    let f = fixture().await;
+    let sim = broker();
+    let day = date(2025, 12, 15);
+    let close = ManualClock::new(plus_minutes(close_at(day), 10));
+    session_close(&f.config, &f.market, &f.store, f.sink.clone(), &sim, &close)
+        .await
+        .unwrap();
+    owe(&f.store, close.now()).await;
+    engage_kill_switch(&f.store, &close, "test").await.unwrap();
+
+    // Market open, a rebalance owed, but the switch is engaged without `flatten_on_kill`:
+    // nothing is decided and the rebalance stays owed.
+    let next = date(2025, 12, 16);
+    let halted = ManualClock::new(at(next, 15));
+    let outcome = tick(
+        &f.config,
+        &f.market,
+        &f.store,
+        f.sink.clone(),
+        &sim,
+        &halted,
+    )
+    .await
+    .unwrap();
+    assert!(outcome.market_open);
+    assert!(outcome.rebalance.is_none(), "{outcome:?}");
+    assert_eq!(count(&f.store, "decision").await, 0);
+    assert_eq!(owed_status(&f.store).await, Some(StepStatus::Started));
+
+    // Released: the next tick makes the rebalance and settles it.
+    release_kill(&f.store, &halted, "test").await.unwrap();
+    let free = ManualClock::new(plus_minutes(at(next, 15), 5));
+    let outcome = tick(&f.config, &f.market, &f.store, f.sink.clone(), &sim, &free)
+        .await
+        .unwrap();
+    let report = outcome.rebalance.expect("the owed rebalance runs");
+    assert_eq!(report.orders_blocked, 0, "{report:?}");
+    assert_eq!(owed_status(&f.store).await, Some(StepStatus::Done));
+    let decided = count(&f.store, "decision").await;
+    assert_eq!(decided, SYMBOLS.len() as i64);
+
+    // Owed again within the same hour: a tick has already tried this hour, so it waits.
+    owe(&f.store, free.now()).await;
+    let same_hour = ManualClock::new(plus_minutes(at(next, 15), 10));
+    let outcome = tick(
+        &f.config,
+        &f.market,
+        &f.store,
+        f.sink.clone(),
+        &sim,
+        &same_hour,
+    )
+    .await
+    .unwrap();
+    assert!(outcome.rebalance.is_none(), "{outcome:?}");
+    assert_eq!(count(&f.store, "decision").await, decided);
+
+    let next_hour = ManualClock::new(at(next, 16));
+    let outcome = tick(
+        &f.config,
+        &f.market,
+        &f.store,
+        f.sink.clone(),
+        &sim,
+        &next_hour,
+    )
+    .await
+    .unwrap();
+    assert!(outcome.rebalance.is_some(), "{outcome:?}");
+
+    f.db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_month_end_close_under_the_kill_switch_is_owed_not_lost() {
+    let f = fixture().await;
+    let sim = broker();
+    let day = date(2025, 12, 31);
+    let clock = ManualClock::new(plus_minutes(close_at(day), 10));
+    engage_kill_switch(&f.store, &clock, "test").await.unwrap();
+
+    let outcome = session_close(&f.config, &f.market, &f.store, f.sink.clone(), &sim, &clock)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            outcome,
+            SessionCloseOutcome::Ran {
+                rebalance: RebalanceStep::Halted,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(count(&f.store, "decision").await, 0);
+    assert_eq!(owed_status(&f.store).await, Some(StepStatus::Started));
+
+    release_kill(&f.store, &clock, "test").await.unwrap();
+    let open = ManualClock::new(at(date(2026, 1, 1), 15));
+    let outcome = tick(&f.config, &f.market, &f.store, f.sink.clone(), &sim, &open)
+        .await
+        .unwrap();
+    let report = outcome
+        .rebalance
+        .expect("the month-end rebalance is made up");
+    assert!(report.orders_submitted > 0, "{report:?}");
+    assert_eq!(owed_status(&f.store).await, Some(StepStatus::Done));
 
     f.db.drop_db().await.unwrap();
 }

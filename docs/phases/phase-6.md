@@ -32,7 +32,10 @@ Paper is a plumbing test, not a promotion signal. This phase has two halves:
 - `nisse-engine tick <config.json>`: every few minutes while the market is open, and once after
   the open.
 - `nisse-engine kill <config.json> --by <name>` and `nisse-engine release-kill <config.json>
-  --by <name>`.
+  --by <name>`. `kill` records the switch, cancels every open order, waits up to a minute
+  for a run in flight to end and cancels again. It sets up the store and the broker
+  independently: with the store unreachable it still cancels, with the broker keys missing
+  it still records the switch (either way it exits 1 and says which half was not done).
 - `nisse-engine status <config.json>`: prints the risk state, open orders and positions the
   engine would start from. Reads only.
 
@@ -78,23 +81,41 @@ one of them.
    A pass that is not fully reconciled, or that finds orders the engine did not send, is
    logged as an error and the tick ends there (exit code 1): nothing is decided.
 3. Observe the account equity (drawdown state).
-4. If the market is open now (the calendar says so; a weekday holiday is not a session) and
-   a resize is owed (below), or the risk scale is zero and something is still held
-   (`needs_flatten`): rebalance. With the market closed a tick never decides; the next
-   session-close or the next open tick does.
+4. If a rebalance is owed (below), or the risk scale is zero and something is still held
+   (`needs_flatten`), and the market is open now (the calendar says so; a weekday holiday
+   is not a session), and trading is not halted, and no tick has tried in this hour:
+   rebalance. With the market closed a tick never decides.
 5. Flush the store queue; write a heartbeat. A tick that failed writes no heartbeat, so a
    tick that keeps failing trips the dead-man check.
 
-### An owed resize
+### An owed rebalance
 
-A drawdown step-down must be followed by a rebalance even if the process dies between seeing
-it and acting on it, or the market is closed when it is seen. So the step-down is itself a
-step: `engine_step` run key `resize`, step `pending`, recorded `started` right after the
-equity observation reports it and `done` after the next completed rebalance. While it is
-`started`, a rebalance is due: at the next tick with the market open, or at the next
-session-close. (The two writes, the mode change and the `started` row, are not one
-transaction; a crash exactly between them loses the resize until the month end. The window
-is one statement wide.)
+A rebalance that should happen must survive the process dying before it does, the market
+being closed, and orders being refused. So "a rebalance is owed" is itself a step:
+`engine_step` run key `resize`, step `pending`, recorded `started` when
+
+- the equity observation reports a drawdown step-down;
+- a rebalance ran but some of its orders were blocked by the gate or refused by the broker
+  (the book is not at its target);
+- a session-close rebalance was due but trading was halted (below);
+
+and `done` after a rebalance in which every order went out. While it is `started`, a
+rebalance is due: at the next tick that may decide, or at the next session-close. (The mode
+change and the `started` row are two statements, not one transaction; a crash exactly
+between them loses the resize until the month end.)
+
+Trading is *halted* when no order could go out anyway: the kill switch is engaged and the
+limits do not let exits through it (`flatten_on_kill` false), or the broker has blocked the
+account. A halted run decides nothing, since every decision's order would be refused, and
+the rebalance stays owed. After `release-kill` the first tick that may decide makes it.
+
+A tick tries an owed rebalance at most once an hour (its attempt is the step `rebalance`
+under run key `tick/<UTC date>T<hour>`), so orders that stay blocked for another reason cost
+one set of decisions an hour, not one every five minutes.
+
+Not covered: orders that were sent by a completed rebalance and then cancelled by `kill` are
+not re-sent after `release-kill`; the book stays as it is until the next month end or owed
+rebalance. Whether a release should owe a rebalance is the owner's call (open question).
 
 A decision made by a tick uses the previous session's closing bars. After about noon those
 are older than the 20 hours outcome scoring allows for a base bar (Phase 5), so such a
@@ -116,12 +137,13 @@ then `done` (with a detail) or `failed` (with the error text):
 2. `restore` (as above, now including the session's bars). Not a recorded step.
 3. `reconcile`, as in `tick` step 2.
 4. `observe`.
-5. `rebalance`: when the session is the last of its month, or a resize is owed, or
+5. `rebalance`: when the session is the last of its month, or a rebalance is owed, or
    `needs_flatten`. If `engine_step` already has `rebalance` `done` for this run key, it is
    skipped, so a re-run of the command after a completed rebalance sends nothing. A re-run
    after a crash in the middle of a rebalance runs it again: orders already sent count as
    working (Phase 3), so nothing is ordered twice. When no rebalance is due the step is
-   recorded `done` with `"due": false`.
+   recorded `done` with `"due": false`; when one is due but trading is halted, `done` with
+   `"halted": true`, and the rebalance is owed.
 6. Flush; heartbeat.
 
 The calendar is fetched from `history_start` to ten days past today, so "last session of its
@@ -132,10 +154,13 @@ Exit codes: 0 done or nothing to do; 1 a step failed (re-run the command); 2 bad
 
 ## Deployment (files in `deploy/`)
 
-- `deploy/crontab`: the schedule, in the exchange's time zone (`CRON_TZ=America/New_York`):
-  `tick` every 5 minutes from 09:35 to 16:00 on weekdays, `session-close` at 16:10 and again
-  at 16:40 (the second is a no-op when the first succeeded), `nisse-score` at 18:00,
-  `scripts/replay.sh` at 18:30.
+- `deploy/crontab`: the schedule, in UTC (the host's time zone must be UTC; nothing depends
+  on `CRON_TZ`). It covers both halves of the year by running a little too often: `tick`
+  every 5 minutes from 13:30 to 21:00 on weekdays, `session-close` at 20:10, 20:40, 21:10
+  and 21:40 (early and repeated runs do nothing), `nisse-score` at 23:00,
+  `scripts/replay.sh` at 23:30.
+- `deploy/run.sh`: what every cron line runs: reads the environment file, appends the
+  command's output to `log/<name>.log`.
 - `deploy/nisse.env.example`: the variable names the host needs, with no values.
 - `docs/runbooks/paper-run.md`: provisioning, the first start, what to watch for two weeks,
   and the write-up template.

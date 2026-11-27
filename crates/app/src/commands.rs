@@ -1,6 +1,5 @@
 //! The `nisse-engine` command line: argument parsing and the `kill`, `release-kill` and
 //! `status` commands. `tick` and `session-close` are in [`crate::session`].
-//! `nisse-engine`: the engine process. See `docs/phases/phase-6.md`.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -156,19 +155,14 @@ pub async fn kill<B: Broker, C: Clock>(
     by: &str,
     lock_wait: Duration,
 ) -> Result<KillOutcome, AppError> {
-    let event = RiskEvent {
-        kind: RiskEventKind::KillSwitch,
-        detail: json!({ "engaged": true, "by": by }),
-        ts: clock.now(),
-    };
-    let recorded = store.record_risk_event(&event).await;
-    let cancelled = cancel_all(broker).await;
+    let recorded = engage_kill_switch(store, clock, by).await;
+    let cancelled = cancel_open_orders(broker).await;
 
     let engine_idle = wait_for_engine_lock(store, lock_wait).await?;
     // The lock is held by this connection from here on, so no run is in flight. Cancel what
     // a run placed before it could see the switch. The lock goes with the process.
     let final_cancelled = if engine_idle {
-        cancel_all(broker).await
+        cancel_open_orders(broker).await
     } else {
         Ok(())
     };
@@ -179,12 +173,30 @@ pub async fn kill<B: Broker, C: Clock>(
     Ok(KillOutcome { engine_idle })
 }
 
-/// `cancel_all` with the broker error wrapped the way the trader wraps it.
-async fn cancel_all<B: Broker>(broker: &B) -> Result<(), EngineError> {
+/// Records the kill switch as engaged: the first half of [`kill`], on its own for when the
+/// broker cannot be reached. Every engine run reads the switch when it starts.
+pub async fn engage_kill_switch<C: Clock>(
+    store: &Store,
+    clock: &C,
+    by: &str,
+) -> Result<(), AppError> {
+    let event = RiskEvent {
+        kind: RiskEventKind::KillSwitch,
+        detail: json!({ "engaged": true, "by": by }),
+        ts: clock.now(),
+    };
+    store.record_risk_event(&event).await?;
+    Ok(())
+}
+
+/// Asks the broker to cancel every open order: the second half of [`kill`], on its own for
+/// when the store cannot be reached.
+pub async fn cancel_open_orders<B: Broker>(broker: &B) -> Result<(), AppError> {
     broker
         .cancel_all()
         .await
-        .map_err(|err| EngineError::Broker(Box::new(err)))
+        .map_err(|err| EngineError::Broker(Box::new(err)))?;
+    Ok(())
 }
 
 /// Tries the engine lock every `LOCK_RETRY` until `lock_wait` has passed. `true` when taken.
@@ -392,6 +404,9 @@ pub fn describe_session_close(outcome: &SessionCloseOutcome) -> String {
             let rebalance_text = match rebalance {
                 RebalanceStep::NotDue => "rebalance not due".to_owned(),
                 RebalanceStep::AlreadyDone => "rebalance already done".to_owned(),
+                RebalanceStep::Halted => {
+                    "rebalance due but trading is halted; it is owed".to_owned()
+                }
                 RebalanceStep::Ran(report) => rebalance_text(report),
             };
             let mut parts = vec![ingest_text, counted(*fills, "fill"), rebalance_text];

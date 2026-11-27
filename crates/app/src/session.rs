@@ -27,8 +27,13 @@ pub const MAX_CLOSE_AGE_NANOS: u64 = 6 * 3_600 * 1_000_000_000;
 /// The run key of the owed resize. A resize is owed while the newest status of
 /// [`RESIZE_STEP`] under this key is `started`.
 pub const RESIZE_RUN_KEY: &str = "resize";
-/// The step recording an owed drawdown resize.
+/// The step recording an owed rebalance (a drawdown resize, or a rebalance that could not
+/// be completed).
 pub const RESIZE_STEP: &str = "pending";
+/// The step under which a tick records its attempt at an owed rebalance. The run key is
+/// `tick/<UTC date>T<hour>`, so a tick tries at most once an hour: orders that stay blocked
+/// do not turn into a set of decisions every five minutes.
+pub const TICK_ATTEMPT_STEP: &str = "rebalance";
 
 /// The step names of a `session-close` run.
 const INGEST_STEP: &str = "ingest";
@@ -49,7 +54,8 @@ pub struct TickOutcome {
     /// The drawdown mode change this run observed, if any.
     pub mode_change: Option<(DrawdownMode, DrawdownMode)>,
     pub market_open: bool,
-    /// The rebalance this tick ran, if one was due and the market was open.
+    /// The rebalance this tick ran: one was owed, the market was open, orders could go out,
+    /// and no tick had tried in this hour.
     pub rebalance: Option<RebalanceReport>,
 }
 
@@ -60,7 +66,11 @@ pub enum RebalanceStep {
     NotDue,
     /// The step was already `done` for this session (an earlier run): nothing was decided now.
     AlreadyDone,
-    /// The rebalance ran in this call.
+    /// A rebalance was due but no order could go out (the kill switch without
+    /// `flatten_on_kill`, or the account is blocked from trading). Nothing was decided; the
+    /// rebalance is owed.
+    Halted,
+    /// The rebalance ran in this call. If any order was blocked or refused, it is still owed.
     Ran(RebalanceReport),
 }
 
@@ -101,9 +111,26 @@ pub async fn tick<M: Market, B: Broker, C: Clock>(
         .await?;
     let market_open = calendar.is_open(now);
 
-    let rebalance = if market_open && (resize_owed(store).await? || trader.needs_flatten()) {
-        let report = rebalance_pass(&mut trader).await?;
-        settle_resize(store, now).await?;
+    let due = resize_owed(store).await? || trader.needs_flatten();
+    let attempt_key = format!("tick/{}T{:02}", today, utc_hour(now));
+    let rebalance = if due
+        && market_open
+        && !halted(&trader, &observed)
+        && store
+            .step_status(&attempt_key, TICK_ATTEMPT_STEP)
+            .await?
+            .is_none()
+    {
+        let report = step(
+            store,
+            &attempt_key,
+            TICK_ATTEMPT_STEP,
+            now,
+            rebalance_pass(&mut trader),
+            rebalance_detail,
+        )
+        .await?;
+        settle_or_owe(store, &report, now).await?;
         Some(report)
     } else {
         None
@@ -201,7 +228,17 @@ pub async fn session_close<M: Market, B: Broker, C: Clock>(
     )
     .await?;
 
-    let rebalance = rebalance_step(&mut trader, store, &calendar, &session, &run_key, now).await?;
+    let halted = halted(&trader, &observed);
+    let rebalance = rebalance_step(
+        &mut trader,
+        store,
+        &calendar,
+        &session,
+        &run_key,
+        halted,
+        now,
+    )
+    .await?;
 
     finish(store, &sink, config, now).await?;
     Ok(SessionCloseOutcome::Ran {
@@ -214,13 +251,15 @@ pub async fn session_close<M: Market, B: Broker, C: Clock>(
 }
 
 /// The rebalance step of a session-close run: skipped when already `done`, recorded `done`
-/// with `"due": false` when nothing is owed, otherwise run as a recorded step.
+/// with `"due": false` when nothing is owed, recorded `done` with `"halted": true` (and the
+/// rebalance marked as owed) when no order could go out, otherwise run as a recorded step.
 async fn rebalance_step<B: Broker, C: Clock>(
     trader: &mut EngineTrader<'_, B, C>,
     store: &Store,
     calendar: &MarketCalendar,
     session: &Session,
     run_key: &str,
+    halted: bool,
     now: UnixNanos,
 ) -> Result<RebalanceStep, AppError> {
     if matches!(
@@ -244,6 +283,21 @@ async fn rebalance_step<B: Broker, C: Clock>(
             .await?;
         return Ok(RebalanceStep::NotDue);
     }
+    if halted {
+        // Deciding now would only write decisions whose orders are all refused. The
+        // rebalance stays owed and is made by the first open tick that can trade.
+        owe_rebalance(store, json!({"reason": "halted at the close"}), now).await?;
+        store
+            .record_step(
+                run_key,
+                REBALANCE_STEP,
+                StepStatus::Done,
+                &json!({"due": true, "halted": true}),
+                now,
+            )
+            .await?;
+        return Ok(RebalanceStep::Halted);
+    }
 
     let report = step(
         store,
@@ -251,19 +305,34 @@ async fn rebalance_step<B: Broker, C: Clock>(
         REBALANCE_STEP,
         now,
         rebalance_pass(trader),
-        |report| {
-            json!({
-                "due": true,
-                "decisions": report.decisions.len(),
-                "orders_submitted": report.orders_submitted,
-                "orders_failed": report.orders_failed,
-                "orders_blocked": report.orders_blocked,
-            })
-        },
+        rebalance_detail,
     )
     .await?;
-    settle_resize(store, now).await?;
+    settle_or_owe(store, &report, now).await?;
     Ok(RebalanceStep::Ran(report))
+}
+
+/// The detail recorded with a rebalance that ran.
+fn rebalance_detail(report: &RebalanceReport) -> Value {
+    json!({
+        "due": true,
+        "decisions": report.decisions.len(),
+        "orders_submitted": report.orders_submitted,
+        "orders_failed": report.orders_failed,
+        "orders_blocked": report.orders_blocked,
+    })
+}
+
+/// Whether no order could go out now: the kill switch is engaged and the limits do not let
+/// exits through it, or the broker has blocked the account.
+fn halted<B: Broker, C: Clock>(trader: &EngineTrader<'_, B, C>, observed: &Observed) -> bool {
+    let gate = trader.risk();
+    (gate.state().kill_switch_engaged && !gate.limits().flatten_on_kill) || observed.trading_blocked
+}
+
+/// The UTC hour of `now`.
+fn utc_hour(now: UnixNanos) -> u64 {
+    now.as_u64() / NANOS_PER_SECOND / 3_600 % 24
 }
 
 /// The newest session whose close is at or before `now`, if it closed no more than
@@ -309,6 +378,8 @@ async fn reconcile_pass<B: Broker, C: Clock>(
 /// The equity observed, the mode change it caused and whether that was a step down.
 struct Observed {
     equity: Decimal,
+    /// The broker will not accept orders for the account.
+    trading_blocked: bool,
     mode_change: Option<(DrawdownMode, DrawdownMode)>,
     stepped_down: bool,
 }
@@ -321,28 +392,25 @@ async fn observe_pass<B: Broker, C: Clock>(
     store: &Store,
     now: UnixNanos,
 ) -> Result<Observed, AppError> {
-    let equity = trader
+    let account = trader
         .broker()
         .account()
         .await
-        .map_err(|e| EngineError::Broker(Box::new(e)))?
-        .equity
-        .as_decimal();
+        .map_err(|e| EngineError::Broker(Box::new(e)))?;
+    let equity = account.equity.as_decimal();
     let mode_change = trader.observe_equity(equity).await?;
     let step_down = mode_change.filter(|(from, to)| to.scale() < from.scale());
     if let Some((from, to)) = step_down {
-        store
-            .record_step(
-                RESIZE_RUN_KEY,
-                RESIZE_STEP,
-                StepStatus::Started,
-                &json!({"from": from.as_str(), "to": to.as_str()}),
-                now,
-            )
-            .await?;
+        owe_rebalance(
+            store,
+            json!({"from": from.as_str(), "to": to.as_str()}),
+            now,
+        )
+        .await?;
     }
     Ok(Observed {
         equity,
+        trading_blocked: account.trading_blocked,
         mode_change,
         stepped_down: step_down.is_some(),
     })
@@ -363,18 +431,53 @@ async fn resize_owed(store: &Store) -> Result<bool, AppError> {
     ))
 }
 
-/// Records the owed resize as done, if one is owed. Call after every successful rebalance.
-async fn settle_resize(store: &Store, now: UnixNanos) -> Result<(), AppError> {
-    if resize_owed(store).await? {
-        store
-            .record_step(
-                RESIZE_RUN_KEY,
-                RESIZE_STEP,
-                StepStatus::Done,
-                &json!({}),
-                now,
-            )
-            .await?;
+/// Records that a rebalance is owed (`started`), with why. A second reason while one is
+/// already owed is recorded too: the newest row is still `started`.
+async fn owe_rebalance(store: &Store, detail: Value, now: UnixNanos) -> Result<(), AppError> {
+    store
+        .record_step(
+            RESIZE_RUN_KEY,
+            RESIZE_STEP,
+            StepStatus::Started,
+            &detail,
+            now,
+        )
+        .await?;
+    Ok(())
+}
+
+/// After a rebalance: if every order it wanted went out, an owed rebalance is settled
+/// (`done`). If any order was blocked by the gate or refused by the broker, the book is not
+/// at its target, so the rebalance is owed (again).
+async fn settle_or_owe(
+    store: &Store,
+    report: &RebalanceReport,
+    now: UnixNanos,
+) -> Result<(), AppError> {
+    let owed = resize_owed(store).await?;
+    if report.orders_blocked == 0 && report.orders_failed == 0 {
+        if owed {
+            store
+                .record_step(
+                    RESIZE_RUN_KEY,
+                    RESIZE_STEP,
+                    StepStatus::Done,
+                    &json!({}),
+                    now,
+                )
+                .await?;
+        }
+    } else if !owed {
+        owe_rebalance(
+            store,
+            json!({
+                "reason": "orders blocked or refused",
+                "orders_blocked": report.orders_blocked,
+                "orders_failed": report.orders_failed,
+            }),
+            now,
+        )
+        .await?;
     }
     Ok(())
 }

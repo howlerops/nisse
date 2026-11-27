@@ -53,7 +53,11 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match execute(&command, &config).await {
+    let outcome = match &command {
+        Command::Kill { by, .. } => run_kill(&config, by).await,
+        _ => execute(&command, &config).await,
+    };
+    match outcome {
         Ok(Done::Yes) => ExitCode::SUCCESS,
         Ok(Done::EngineStillRunning) => {
             println!("kill: engaged; an engine run is still in flight; run kill again");
@@ -112,6 +116,45 @@ async fn execute(command: &Command, config: &EngineConfig) -> Result<Done, RunEr
     }
 }
 
+/// `kill`. The store and the broker are set up independently, so that whichever can be
+/// reached is used: with the store down the open orders are still cancelled, and with the
+/// broker keys missing the switch is still recorded. Either half failing is exit 1.
+async fn run_kill(config: &EngineConfig, by: &str) -> Result<Done, RunError> {
+    let store = connect_store().await;
+    let trading =
+        alpaca_http().map(|http| AlpacaTrading::new(http, &AlpacaConfig::paper(config.feed)));
+    match (store, trading) {
+        (Ok(store), Ok(trading)) => {
+            let outcome =
+                commands::kill(&store, &trading, &SystemClock, by, KILL_LOCK_WAIT).await?;
+            if outcome.engine_idle {
+                println!("kill: engaged; engine idle");
+                Ok(Done::Yes)
+            } else {
+                Ok(Done::EngineStillRunning)
+            }
+        }
+        (Ok(store), Err(err)) => {
+            commands::engage_kill_switch(&store, &SystemClock, by).await?;
+            println!("kill: engaged, but open orders were NOT cancelled (broker not reachable)");
+            Err(err.into())
+        }
+        (Err(err), Ok(trading)) => {
+            commands::cancel_open_orders(&trading).await?;
+            println!("kill: open orders cancelled, but the switch was NOT recorded (no store)");
+            Err(err)
+        }
+        (Err(err), Err(_)) => Err(err),
+    }
+}
+
+/// Connects to the store named by `DATABASE_URL`, which is never printed (it may hold a
+/// password).
+async fn connect_store() -> Result<Store, RunError> {
+    let url = std::env::var("DATABASE_URL").map_err(|_| RunError::Env("DATABASE_URL"))?;
+    Ok(Store::new(nisse_store::connect(&url).await?))
+}
+
 /// Runs one command and prints its outcome line.
 async fn dispatch(
     command: &Command,
@@ -130,18 +173,8 @@ async fn dispatch(
             println!("release-kill: released by {by}");
             Ok(Done::Yes)
         }
-        Command::Kill { by, .. } => {
-            let http = alpaca_http()?;
-            let alpaca = AlpacaConfig::paper(config.feed);
-            let trading = AlpacaTrading::new(http, &alpaca);
-            let outcome = commands::kill(store, &trading, &SystemClock, by, KILL_LOCK_WAIT).await?;
-            if outcome.engine_idle {
-                println!("kill: engaged; engine idle");
-                Ok(Done::Yes)
-            } else {
-                Ok(Done::EngineStillRunning)
-            }
-        }
+        // Handled by `run_kill`, which must work with only one of the store and the broker.
+        Command::Kill { by, .. } => run_kill(config, by).await,
         Command::Tick { .. } => {
             let (trading, market) = alpaca_trading_and_market(config)?;
             let outcome = tick(config, &market, store, sink, trading, SystemClock).await?;

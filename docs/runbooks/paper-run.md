@@ -11,7 +11,8 @@ runs the engine against Alpaca.
 
 1. **Decide the feed** (`"feed"` in `config/engine/paper.json`): `iex` is free, `sip` needs the
    paid data subscription.
-2. **Provision one small Linux VM** with Postgres 16 on it or reachable from it. Create a
+2. **Provision one small Linux VM** with its time zone set to UTC
+   (`timedatectl set-timezone UTC`; the schedule is written in UTC), with Postgres 16 on it or reachable from it. Create a
    database, a login role that is a member of `nisse_writer`, and run `scripts/migrate.sh`
    against it as the database owner.
 3. **Check out and build** on the host: clone the repository to `/opt/nisse` at the commit
@@ -30,7 +31,9 @@ runs the engine against Alpaca.
    needs no Alpaca keys), then `target/release/nisse-engine tick config/engine/paper.json` by
    hand during market hours. The first
    `session-close` downloads the whole bar history.
-8. **Schedule**: `crontab deploy/crontab`.
+8. **Schedule**: `crontab deploy/crontab`. On the first day check `log/tick.log` gets a line
+   every five minutes between 13:30 and 21:00 UTC and `log/session.log` gets its lines
+   after the close; if not, cron is not running the lines (wrong user, wrong time zone).
 9. **Dead-man check** on another machine: `nisse-deadman config/limits/limits.json` from cron
    every few minutes during market hours; a non-zero exit is the alert.
 
@@ -61,7 +64,12 @@ Write down, with the date, any of:
 - a reconciliation finding of an order the engine did not send, or a position mismatch;
 - a replay failure;
 - a fill whose `shortfall_bps` (from `nisse-score`) is outside the cost model's slippage;
-- a missed heartbeat during market hours.
+- a missed heartbeat during market hours;
+- a `session-close` whose `ingest` step failed on every run of the evening (a symbol had no
+  bar at the close, which the free `iex` feed can do for a thinly traded fund). The close is
+  not made up later; on a month end that skips the monthly rebalance, so say so in the
+  write-up and consider the feed decision;
+- a rebalance left owed for more than a day (`nisse-engine status` shows `resize owed: yes`).
 
 The exit criterion is two consecutive weeks with none.
 
