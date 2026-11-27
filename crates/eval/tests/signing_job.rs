@@ -53,6 +53,14 @@ impl Tree {
         fs::write(file, text).unwrap();
     }
 
+    /// Makes `rel` a symbolic link to `target`.
+    #[cfg(unix)]
+    fn link(&self, rel: &str, target: &str) {
+        let file = self.root.join(rel);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(target, file).unwrap();
+    }
+
     /// A tree holding the repository's valid config and note at their usual places.
     fn valid() -> Self {
         let tree = Self::new();
@@ -325,4 +333,64 @@ fn the_signed_hash_ignores_symbol_order() {
     );
     assert_ne!(reordered, CONFIG);
     assert_eq!(signed_hash_of(&reordered), signed_hash_of(CONFIG));
+}
+
+/// The repository config with its name, family and `created` date changed, and its rationale
+/// pointing at its own note.
+fn other_config(name: &str, family: &str, created: &str) -> String {
+    CONFIG
+        .replace("\"name\": \"trend-v1\"", &format!("\"name\": \"{name}\""))
+        .replace(
+            "\"family\": \"trend\"",
+            &format!("\"family\": \"{family}\""),
+        )
+        .replace(
+            "\"created\": \"2026-11-27\"",
+            &format!("\"created\": \"{created}\""),
+        )
+        .replace(
+            "research/notes/trend-v1.md",
+            &format!("research/notes/{name}.md"),
+        )
+}
+
+#[test]
+fn refuses_when_another_config_shares_the_change_budget() {
+    let tree = Tree::valid();
+    // Same family as trend-v1 and created the same day: two proposals opened together.
+    tree.write(
+        "research/configs/trend-old.json",
+        &other_config("trend-old", "trendb", "2026-11-27"),
+    );
+    assert_invalid_proposal(sign_valid(tree.path()), "trend-old");
+}
+
+#[test]
+fn signs_when_no_other_config_shares_the_change_budget() {
+    let tree = Tree::valid();
+    tree.write(
+        "research/configs/trend-old.json",
+        &other_config("trend-old", "rates", "2026-06-01"),
+    );
+    sign_valid(tree.path()).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn refuses_a_symlinked_config() {
+    let tree = Tree::new();
+    tree.write("research/elsewhere/trend-v1.json", CONFIG);
+    tree.write("research/notes/trend-v1.md", NOTE);
+    tree.link(CONFIG_PATH, "../elsewhere/trend-v1.json");
+    assert_invalid_proposal(sign_valid(tree.path()), "is not a regular file");
+}
+
+#[cfg(unix)]
+#[test]
+fn refuses_a_symlinked_note() {
+    let tree = Tree::new();
+    tree.write(CONFIG_PATH, CONFIG);
+    tree.write("research/elsewhere/note.md", NOTE);
+    tree.link("research/notes/trend-v1.md", "../elsewhere/note.md");
+    assert_invalid_proposal(sign_valid(tree.path()), "is not a regular file");
 }

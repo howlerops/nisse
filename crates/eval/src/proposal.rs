@@ -4,12 +4,12 @@
 //! A config is parsed through a private raw struct and then checked field by field; every
 //! failure is an [`EvalError::InvalidProposal`] whose message names the field. The proposal
 //! check runs on the list of changed paths and on two checkouts (base and head), and collects
-//! every failure rather than stopping at the first. It reads only inside the two checkout
-//! directories: a changed path is never joined onto them when it contains `..` or starts with
-//! `/`.
+//! every failure rather than stopping at the first. It reads only regular files inside the two
+//! checkout directories: a changed path is never joined onto them unless it is a plain path
+//! ([`is_plain_path`]), and no symbolic link is followed ([`read_regular`]).
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use chrono::NaiveDate;
 use serde_json::Value;
@@ -24,7 +24,7 @@ pub const NOTES_DIR: &str = "research/notes";
 pub const LABELS_DIR: &str = "research/labels";
 /// The research directory. Changes under it are the only ones a proposal may make.
 pub const RESEARCH_DIR: &str = "research";
-/// Days that must pass between two configs of one family.
+/// Days that must pass between two configs of one family, or of one strategy kind.
 pub const CHANGE_BUDGET_DAYS: i64 = 30;
 /// The headings every note must have, in this order, each with text under it.
 pub const NOTE_HEADINGS: [&str; 3] = [
@@ -32,6 +32,8 @@ pub const NOTE_HEADINGS: [&str; 3] = [
     "## Expected effect",
     "## What would change my mind",
 ];
+/// The extension every config file has, with its dot. Signing refuses any other name too.
+pub const JSON_SUFFIX: &str = ".json";
 
 /// The longest `name`.
 const MAX_NAME_LEN: usize = 48;
@@ -44,10 +46,6 @@ const MIN_EFFECT_LEN: usize = 20;
 const MAX_EFFECT_LEN: usize = 600;
 /// The length of a `YYYY-MM-DD` date.
 const DATE_LEN: usize = 10;
-/// The extension every config file has, with its dot.
-const JSON_SUFFIX: &str = ".json";
-/// The same extension without its dot, as `Path::extension` reports it.
-const JSON_EXT: &str = "json";
 
 /// One research config, parsed and checked.
 #[derive(Debug, Clone, PartialEq)]
@@ -206,6 +204,16 @@ impl ResearchConfig {
     }
 }
 
+/// The strategy kind of a config: the `strategy` string of its strategy object. `parse` has
+/// already checked that the kind builds, so this is never empty for a parsed config.
+fn strategy_kind(config: &ResearchConfig) -> &str {
+    config
+        .strategy
+        .get("strategy")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+}
+
 /// Checks a note's text: each of [`NOTE_HEADINGS`] appears as a line of its own, in that order,
 /// and has at least one non-blank line that is not a heading before the next `## ` heading or
 /// the end.
@@ -247,58 +255,81 @@ pub fn check_note(text: &str) -> Result<(), EvalError> {
     Ok(())
 }
 
-/// How one path changed, as `git diff --name-status` reports it.
+/// How one path changed, as `git diff -z --name-status` reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Change {
     Added(String),
     Modified(String),
     Deleted(String),
-    Renamed { from: String, to: String },
-    Other { status: String, path: String },
+    /// A rename (`R<score>`): `from` goes away, `to` is new.
+    Renamed {
+        from: String,
+        to: String,
+    },
+    /// A copy (`C<score>`): `from` stays and `to` is new. Both paths are kept, so both are
+    /// checked; `to` is the destination.
+    Copied {
+        from: String,
+        to: String,
+    },
+    /// Any other single-letter status, such as a type change (`T`). `path` is the only path.
+    Other {
+        status: String,
+        path: String,
+    },
 }
 
-/// Parses `git diff --name-status` output. A line is `STATUS<TAB>PATH`, or
-/// `RSCORE<TAB>FROM<TAB>TO` for a rename. Blank lines are skipped. A line without a tab, an
-/// empty path, or the wrong number of paths for its status is an error.
+/// The next field of a record, which must be a non-empty path.
+fn take_path<'a>(
+    fields: &mut impl Iterator<Item = &'a str>,
+    status: &str,
+) -> Result<&'a str, EvalError> {
+    match fields.next() {
+        None => Err(invalid(format!("diff record {status:?} is missing a path"))),
+        Some("") => Err(invalid(format!("diff record {status:?} has an empty path"))),
+        Some(path) => Ok(path),
+    }
+}
+
+/// Parses the output of `git diff -z --name-status`. The fields are NUL-separated. A record is
+/// a status letter and one path, or `R<score>` or `C<score>` and two paths (from, then to). One
+/// trailing NUL is allowed, and empty input is no changes. A missing or empty path, an empty
+/// status, or a status that is not a letter or `R`/`C` with a score is an error. Paths are kept
+/// exactly as git wrote them; [`check_proposal`] decides which of them are acceptable.
 pub fn parse_changes(text: &str) -> Result<Vec<Change>, EvalError> {
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+    let body = text.strip_suffix('\0').unwrap_or(text);
+    let mut fields = body.split('\0');
     let mut changes = Vec::new();
-    for line in text.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if !line.contains('\t') {
-            return Err(invalid(format!("diff line has no tab: {line:?}")));
-        }
-        let mut fields = line.split('\t');
-        let status = fields.next().unwrap_or_default();
-        let paths: Vec<&str> = fields.collect();
-        if paths.iter().any(|p| p.is_empty()) {
-            return Err(invalid(format!("diff line has an empty path: {line:?}")));
-        }
-        let one_path = |paths: &[&str]| match paths {
-            [path] => Ok((*path).to_owned()),
-            _ => Err(invalid(format!("diff line needs one path: {line:?}"))),
-        };
-        let change = match status {
-            "A" => Change::Added(one_path(&paths)?),
-            "M" => Change::Modified(one_path(&paths)?),
-            "D" => Change::Deleted(one_path(&paths)?),
-            _ if status.starts_with('R')
-                && status.len() > 1
-                && status[1..].bytes().all(|b| b.is_ascii_digit()) =>
+    while let Some(status) = fields.next() {
+        let change = match status.as_bytes() {
+            [] => return Err(invalid("diff record has an empty status")),
+            [b'R' | b'C', digits @ ..]
+                if !digits.is_empty() && digits.iter().all(u8::is_ascii_digit) =>
             {
-                match paths.as_slice() {
-                    [from, to] => Change::Renamed {
-                        from: (*from).to_owned(),
-                        to: (*to).to_owned(),
-                    },
-                    _ => return Err(invalid(format!("rename line needs two paths: {line:?}"))),
+                let from = take_path(&mut fields, status)?.to_owned();
+                let to = take_path(&mut fields, status)?.to_owned();
+                if status.starts_with('R') {
+                    Change::Renamed { from, to }
+                } else {
+                    Change::Copied { from, to }
                 }
             }
-            _ => Change::Other {
-                status: status.to_owned(),
-                path: one_path(&paths)?,
-            },
+            [letter] if letter.is_ascii_alphabetic() && !matches!(*letter, b'R' | b'C') => {
+                let path = take_path(&mut fields, status)?.to_owned();
+                match *letter {
+                    b'A' => Change::Added(path),
+                    b'M' => Change::Modified(path),
+                    b'D' => Change::Deleted(path),
+                    _ => Change::Other {
+                        status: status.to_owned(),
+                        path,
+                    },
+                }
+            }
+            _ => return Err(invalid(format!("unknown diff status {status:?}"))),
         };
         changes.push(change);
     }
@@ -314,15 +345,22 @@ pub fn touches_research(changes: &[Change]) -> bool {
         .any(|path| path == RESEARCH_DIR || under(RESEARCH_DIR, path))
 }
 
-/// The paths a change names: one, or two for a rename.
+/// The paths a change names: one, or two for a rename or a copy.
 fn paths_of(change: &Change) -> Vec<&str> {
     match change {
         Change::Added(path)
         | Change::Modified(path)
         | Change::Deleted(path)
         | Change::Other { path, .. } => vec![path.as_str()],
-        Change::Renamed { from, to } => vec![from.as_str(), to.as_str()],
+        Change::Renamed { from, to } | Change::Copied { from, to } => {
+            vec![from.as_str(), to.as_str()]
+        }
     }
+}
+
+/// Whether a change adds or modifies a file strictly under `research/`.
+fn adds_or_modifies_research(change: &Change) -> bool {
+    matches!(change, Change::Added(path) | Change::Modified(path) if under(RESEARCH_DIR, path))
 }
 
 /// Whether `path` is strictly below directory `dir` (`dir` itself is not).
@@ -331,33 +369,96 @@ fn under(dir: &str, path: &str) -> bool {
         .is_some_and(|rest| rest.starts_with('/'))
 }
 
-/// A path that must never be joined onto a checkout directory.
-fn is_unsafe(path: &str) -> bool {
-    path.starts_with('/') || path.contains("..")
+/// Whether `path` is a plain relative path: non-empty, made only of `A-Z a-z 0-9 . _ - /`, not
+/// starting with `/`, and with no empty, `.` or `..` component. Only such a path may be joined
+/// onto a checkout directory.
+#[must_use]
+pub fn is_plain_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.starts_with('/')
+        && path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/'))
+        && path
+            .split('/')
+            .all(|component| !component.is_empty() && component != "." && component != "..")
 }
 
-/// The `*.json` files directly in `dir`, sorted. A missing directory is empty.
-fn json_files(dir: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
+/// The metadata of `relative` under `root`, found with `symlink_metadata` on every component
+/// after `root`, so a symbolic link on the way is seen as a link and is never followed. Every
+/// component but the last must be a directory.
+fn below(root: &Path, relative: &str) -> std::io::Result<fs::Metadata> {
+    let mut path = root.to_path_buf();
+    let mut meta = fs::metadata(root)?;
+    for part in relative.split('/') {
+        if !meta.is_dir() {
+            return Err(std::io::Error::other(format!(
+                "{relative} has a component that is not a directory"
+            )));
+        }
+        path.push(part);
+        meta = fs::symlink_metadata(&path)?;
+    }
+    Ok(meta)
+}
+
+/// Reads the regular file `relative` under the checkout `root` and returns its text. A path
+/// that is not a plain path (see [`is_plain_path`]) is refused before anything is read, and so
+/// is anything that is not a regular file by `symlink_metadata`: a symbolic link, a directory,
+/// or a file reached through one. Every error message names the path.
+pub fn read_regular(root: &Path, relative: &str) -> Result<String, String> {
+    if !is_plain_path(relative) {
+        return Err(format!("{relative} is not a plain path"));
+    }
+    let meta = below(root, relative)
+        .map_err(|e| format!("{relative} is missing or not a regular file: {e}"))?;
+    if !meta.is_file() {
+        return Err(format!("{relative} is not a regular file"));
+    }
+    fs::read_to_string(root.join(relative)).map_err(|e| format!("{relative} cannot be read: {e}"))
+}
+
+/// The names of the `*.json` entries directly in `root/dir`, sorted. A missing directory has
+/// none. A `.json` entry that is not a regular file (a symbolic link, say) is pushed onto
+/// `failures` and left out of the list. A `dir` that is not a directory, or that is reached
+/// through a link, is an error.
+fn json_files(root: &Path, dir: &str, failures: &mut Vec<String>) -> Result<Vec<String>, String> {
+    match below(root, dir) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return Err(format!("{dir} is not a directory")),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e),
-    };
-    let mut files = Vec::new();
+        Err(e) => return Err(format!("cannot read {dir}: {e}")),
+    }
+    let entries = fs::read_dir(root.join(dir)).map_err(|e| format!("cannot read {dir}: {e}"))?;
+    let mut names = Vec::new();
     for entry in entries {
-        let path = entry?.path();
-        if path.is_file() && path.extension().is_some_and(|ext| ext == JSON_EXT) {
-            files.push(path);
+        let entry = entry.map_err(|e| format!("cannot read {dir}: {e}"))?;
+        let file_name = entry.file_name();
+        if !file_name
+            .as_encoded_bytes()
+            .ends_with(JSON_SUFFIX.as_bytes())
+        {
+            continue;
+        }
+        let Ok(name) = file_name.into_string() else {
+            failures.push(format!("{dir}: a config file name is not UTF-8"));
+            continue;
+        };
+        // `file_type` does not follow a link, so a symbolic link is reported as one.
+        if entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            names.push(name);
+        } else {
+            failures.push(format!("{dir}/{name} is not a regular file"));
         }
     }
-    files.sort();
-    Ok(files)
+    names.sort();
+    Ok(names)
 }
 
-/// Reads and parses one config. The error text names `shown`, the path as the diff spells it.
-fn load_config(path: &Path, shown: &str) -> Result<ResearchConfig, String> {
-    let text = fs::read_to_string(path).map_err(|e| format!("{shown}: cannot read it: {e}"))?;
-    ResearchConfig::parse(&text).map_err(|e| format!("{shown}: {e}"))
+/// Reads and parses the config at `relative` under `root`. The error text names `relative`.
+fn load_config(root: &Path, relative: &str) -> Result<ResearchConfig, String> {
+    let text = read_regular(root, relative)?;
+    ResearchConfig::parse(&text).map_err(|e| format!("{relative}: {e}"))
 }
 
 /// The name of a file directly in [`CONFIG_DIR`], or `None` for any other path.
@@ -366,24 +467,31 @@ fn config_entry(path: &str) -> Option<&str> {
 }
 
 /// Checks a pull request. `base` and `head` are the two checkouts' root directories; `today`
-/// is the current date. Returns every failure, one message each (empty means pass).
+/// is the current date. `agent` is true when a research agent opened the pull request: then
+/// there is no pass for a pull request that changes nothing under `research/`, rule 1 applies
+/// to every path, and the change list must add or modify a file under `research/`. Returns
+/// every failure, one message each (empty means pass).
 pub fn check_proposal(
     changes: &[Change],
+    agent: bool,
     base: &Path,
     head: &Path,
     today: NaiveDate,
 ) -> Vec<String> {
-    if !touches_research(changes) {
+    if !agent && !touches_research(changes) {
         return Vec::new();
     }
     let mut failures = Vec::new();
+    if agent && !changes.iter().any(adds_or_modifies_research) {
+        failures.push("an agent pull request must change research files".to_owned());
+    }
 
-    // Rules 1 and 2: where the changes are, and that nothing is removed or moved.
+    // Rules 1 and 2: where the changes are, and that nothing is removed, renamed or copied.
     for change in changes {
         for path in paths_of(change) {
-            if is_unsafe(path) {
+            if !is_plain_path(path) {
                 failures.push(format!(
-                    "changed path {path:?} is not a plain relative path under research/configs, research/notes or research/labels"
+                    "changed path {path:?} is not a plain path: only A-Z a-z 0-9 . _ - and / are allowed, with no leading '/' and no empty, '.' or '..' component"
                 ));
             } else if ![CONFIG_DIR, NOTES_DIR, LABELS_DIR]
                 .iter()
@@ -411,6 +519,11 @@ pub fn check_proposal(
                     "research file renamed from {from:?} to {to:?}; renames are not allowed"
                 ));
             }
+            Change::Copied { from, to } => {
+                failures.push(format!(
+                    "research file copied from {from:?} to {to:?}; copies are not allowed"
+                ));
+            }
             Change::Other { status, path } => {
                 failures.push(format!("research file {path:?} has status {status:?}; only additions and changes are allowed"));
             }
@@ -435,7 +548,7 @@ pub fn check_proposal(
     }
     for change in changes {
         for path in paths_of(change) {
-            if is_unsafe(path) || !under(CONFIG_DIR, path) {
+            if !is_plain_path(path) || !under(CONFIG_DIR, path) {
                 continue;
             }
             match config_entry(path) {
@@ -453,38 +566,35 @@ pub fn check_proposal(
     }
 
     // Rule 4: every config in head parses, names its file, and has a note with its headings.
-    let head_configs = head.join(CONFIG_DIR);
     let config_changed = !config_changes.is_empty();
-    if !head_configs.is_dir() {
-        if config_changed {
-            failures.push(format!("no {CONFIG_DIR} directory in the head checkout"));
-        }
-    } else {
-        match json_files(&head_configs) {
-            Err(e) => failures.push(format!("cannot read {CONFIG_DIR}: {e}")),
-            Ok(files) => {
-                for file in files {
-                    let shown = format!("{CONFIG_DIR}/{}", file_name(&file));
-                    match load_config(&file, &shown) {
-                        Err(message) => failures.push(message),
-                        Ok(config) => {
-                            if Some(config.name.as_str()) != file_stem(&file) {
-                                failures.push(format!(
-                                    "{shown}: name {:?} must equal the file name without .json",
-                                    config.name
-                                ));
-                            }
-                            check_note_file(head, &config, &mut failures);
+    if config_changed && !head.join(CONFIG_DIR).is_dir() {
+        failures.push(format!("no {CONFIG_DIR} directory in the head checkout"));
+    }
+    match json_files(head, CONFIG_DIR, &mut failures) {
+        Err(e) => failures.push(e),
+        Ok(names) => {
+            for name in names {
+                let shown = format!("{CONFIG_DIR}/{name}");
+                match load_config(head, &shown) {
+                    Err(message) => failures.push(message),
+                    Ok(config) => {
+                        if Some(config.name.as_str()) != name.strip_suffix(JSON_SUFFIX) {
+                            failures.push(format!(
+                                "{shown}: name {:?} must equal the file name without .json",
+                                config.name
+                            ));
                         }
+                        check_note_file(head, &config, &mut failures);
                     }
                 }
             }
         }
     }
 
-    // Rule 5: the one added or modified config, against the base.
+    // Rule 5: the one added or modified config, against the base. A path that is not plain was
+    // refused by rule 1 and is never read.
     if let [(is_added, path)] = config_changes.as_slice()
-        && !is_unsafe(path)
+        && is_plain_path(path)
     {
         check_budget_and_parent(*is_added, path, base, head, today, &mut failures);
     }
@@ -494,13 +604,9 @@ pub fn check_proposal(
 
 /// Rule 4's note check for one config in head.
 fn check_note_file(head: &Path, config: &ResearchConfig, failures: &mut Vec<String>) {
-    // `parse` has already fixed the rationale to research/notes/<name>.md, so it is safe to join.
-    let note = head.join(&config.rationale);
-    match fs::read_to_string(&note) {
-        Err(_) => failures.push(format!(
-            "{}: the note {:?} is missing",
-            config.name, config.rationale
-        )),
+    // `parse` has already fixed the rationale to research/notes/<name>.md.
+    match read_regular(head, &config.rationale) {
+        Err(e) => failures.push(format!("{}: {e}", config.name)),
         Ok(text) => {
             if let Err(e) = check_note(&text) {
                 failures.push(format!("{}: {e}", config.rationale));
@@ -509,7 +615,7 @@ fn check_note_file(head: &Path, config: &ResearchConfig, failures: &mut Vec<Stri
     }
 }
 
-/// Rule 5 for the one added or modified config at `path` (a diff path, already known safe).
+/// Rule 5 for the one added or modified config at `path` (a diff path, already known plain).
 fn check_budget_and_parent(
     is_added: bool,
     path: &str,
@@ -518,9 +624,8 @@ fn check_budget_and_parent(
     today: NaiveDate,
     failures: &mut Vec<String>,
 ) {
-    let head_file = head.join(path);
     // A config that does not parse was reported by rule 4; there is nothing more to check.
-    let Ok(config) = load_config(&head_file, path) else {
+    let Ok(config) = load_config(head, path) else {
         return;
     };
 
@@ -532,38 +637,40 @@ fn check_budget_and_parent(
     }
 
     // The base's configs. A base config that does not parse is reported here, by name.
-    let base_configs = base.join(CONFIG_DIR);
-    let base_files = match json_files(&base_configs) {
-        Ok(files) => files,
+    let base_names = match json_files(base, CONFIG_DIR, failures) {
+        Ok(names) => names,
         Err(e) => {
-            failures.push(format!("cannot read the base {CONFIG_DIR}: {e}"));
+            failures.push(e);
             return;
         }
     };
     let mut base_parsed: Vec<(String, Result<ResearchConfig, String>)> = Vec::new();
-    for file in &base_files {
-        let stem = file_stem(file).unwrap_or_default().to_owned();
-        let shown = format!("base {CONFIG_DIR}/{}", file_name(file));
-        let loaded = load_config(file, &shown);
+    for name in &base_names {
+        let stem = name
+            .strip_suffix(JSON_SUFFIX)
+            .unwrap_or_default()
+            .to_owned();
+        let loaded = load_config(base, &format!("{CONFIG_DIR}/{name}"));
         if let Err(message) = &loaded {
             failures.push(format!("{message} (the base must be clean)"));
         }
         base_parsed.push((stem, loaded));
     }
 
-    // The newest config of the family at the base, its own old version included.
+    // The newest config at the base that shares the family or the strategy kind, its own old
+    // version included. A new family does not reset the budget for the same strategy.
+    let kind = strategy_kind(&config);
     let newest = base_parsed
         .iter()
         .filter_map(|(_, loaded)| loaded.as_ref().ok())
-        .filter(|other| other.family == config.family)
-        .map(|other| other.created)
-        .max();
+        .filter(|other| other.family == config.family || strategy_kind(other) == kind)
+        .max_by_key(|other| other.created);
     if let Some(newest) = newest
-        && (config.created - newest).num_days() < CHANGE_BUDGET_DAYS
+        && (config.created - newest.created).num_days() < CHANGE_BUDGET_DAYS
     {
         failures.push(format!(
-            "{path:?}: created {} is less than {CHANGE_BUDGET_DAYS} days after {newest}, the newest config of family {:?}",
-            config.created, config.family
+            "{path:?}: created {} is less than {CHANGE_BUDGET_DAYS} days after {} of config {:?}, the newest at the base with family {:?} or strategy kind {kind:?}",
+            config.created, newest.created, newest.name, config.family
         ));
     }
 
@@ -602,34 +709,59 @@ fn check_budget_and_parent(
     }
 
     // A modified config keeps its name and family.
-    if !is_added {
-        let base_file = base.join(path);
-        let shown = format!("base {path}");
-        if let Ok(old) = load_config(&base_file, &shown) {
-            if old.name != config.name {
-                failures.push(format!(
-                    "{path:?}: a modified config must keep its name ({:?} at the base, {:?} now)",
-                    old.name, config.name
-                ));
-            }
-            if old.family != config.family {
-                failures.push(format!(
-                    "{path:?}: a modified config must keep its family ({:?} at the base, {:?} now)",
-                    old.family, config.family
-                ));
-            }
+    if !is_added && let Ok(old) = load_config(base, path) {
+        if old.name != config.name {
+            failures.push(format!(
+                "{path:?}: a modified config must keep its name ({:?} at the base, {:?} now)",
+                old.name, config.name
+            ));
+        }
+        if old.family != config.family {
+            failures.push(format!(
+                "{path:?}: a modified config must keep its family ({:?} at the base, {:?} now)",
+                old.family, config.family
+            ));
         }
     }
 }
 
-/// The last component of a path.
-fn file_name(path: &Path) -> String {
-    path.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default()
-}
+/// The change budget of one config, re-checked against the configs in `root` (a checkout) when
+/// it is signed: one message for every other config that shares its family or its strategy kind
+/// and whose `created` date is less than [`CHANGE_BUDGET_DAYS`] days away from its own, in either
+/// direction. Empty means the budget is clear. Symbolic links and configs that do not parse are
+/// errors, and so is a `name` that no config in `root` has.
+pub fn budget_conflicts(root: &Path, name: &str) -> Result<Vec<String>, EvalError> {
+    let mut failures = Vec::new();
+    let names = json_files(root, CONFIG_DIR, &mut failures).map_err(invalid)?;
+    if !failures.is_empty() {
+        return Err(invalid(failures.join("; ")));
+    }
+    let mut configs = Vec::with_capacity(names.len());
+    for file in &names {
+        configs.push(load_config(root, &format!("{CONFIG_DIR}/{file}")).map_err(invalid)?);
+    }
+    let target = configs
+        .iter()
+        .find(|config| config.name == name)
+        .ok_or_else(|| invalid(format!("no config named {name:?} in {CONFIG_DIR}")))?;
+    let kind = strategy_kind(target);
 
-/// The file name without `.json`.
-fn file_stem(path: &Path) -> Option<&str> {
-    path.file_stem().and_then(|stem| stem.to_str())
+    let mut messages = Vec::new();
+    for other in configs.iter().filter(|config| config.name != name) {
+        let same_family = other.family == target.family;
+        let same_kind = strategy_kind(other) == kind;
+        let apart = (other.created - target.created).num_days().abs();
+        if (same_family || same_kind) && apart < CHANGE_BUDGET_DAYS {
+            let shared = match (same_family, same_kind) {
+                (true, true) => "family and strategy kind",
+                (true, false) => "family",
+                _ => "strategy kind",
+            };
+            messages.push(format!(
+                "{:?} (created {}) is less than {CHANGE_BUDGET_DAYS} days from {name:?} (created {}) and shares its {shared}",
+                other.name, other.created, target.created
+            ));
+        }
+    }
+    Ok(messages)
 }
