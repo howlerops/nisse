@@ -16,7 +16,7 @@ use rust_decimal::Decimal;
 
 use crate::{
     DecisionContext, EngineError, Finding, OrderBookState, OrderGateway, Strategy, SyncOptions,
-    decide_and_record,
+    SyncReport, decide_and_record,
     features::{RollingStats, WindowSpec},
     reconcile_and_record, record_stream_update,
     strategies::feature,
@@ -415,9 +415,11 @@ where
             .map_err(|err| EngineError::Store(Box::new(err)))
     }
 
-    /// Decides for every symbol and sends the resulting orders. Steps are in
-    /// `docs/phases/phase-3.md`, "Rebalance steps".
-    pub async fn rebalance(&mut self) -> Result<RebalanceReport, EngineError> {
+    /// Reconciles orders and positions with the broker and records what changed, without
+    /// deciding anything. Fills the pass finds count toward the day-trade limit. Errors with
+    /// `NotReconciled` when an order's state is still unknown and `ForeignOrders` when the
+    /// broker has orders the engine did not send: the caller must not decide after either.
+    pub async fn reconcile(&mut self) -> Result<SyncReport, EngineError> {
         let report = reconcile_and_record(
             self.gateway.broker(),
             &mut self.state,
@@ -448,6 +450,13 @@ where
         if foreign > 0 {
             return Err(EngineError::ForeignOrders(foreign));
         }
+        Ok(report)
+    }
+
+    /// Decides for every symbol and sends the resulting orders. Steps are in
+    /// `docs/phases/phase-3.md`, "Rebalance steps".
+    pub async fn rebalance(&mut self) -> Result<RebalanceReport, EngineError> {
+        self.reconcile().await?;
         let (working, working_sells) = self.working_quantities();
         // The newest bar any symbol has. A symbol whose last bar is older than that has a gap
         // in its data: it is decided without its price features, so the strategy skips it

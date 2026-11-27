@@ -372,6 +372,9 @@ pub async fn advisory_unlock<C: GenericClient>(client: &C, key: i64) -> Result<b
 pub const SCORE_JOB_LOCK: i64 = 0x6e69_7373_6501;
 /// Lock key of a holdout run's look-count check and trial registration.
 pub const HOLDOUT_LOCK: i64 = 0x6e69_7373_6502;
+/// Lock key of an engine process. Held by an engine process for its whole life, so two
+/// scheduled engine commands never overlap.
+pub const ENGINE_LOCK: i64 = 0x6e69_7373_6503;
 
 /// Rebuilds a symbol from its stored text.
 fn parse_symbol(text: &str) -> Result<Symbol, StoreError> {

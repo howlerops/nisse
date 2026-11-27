@@ -1416,3 +1416,116 @@ async fn a_fill_of_an_untracked_order_is_not_a_day_trade() {
         0
     );
 }
+
+/// Both orders of `enter_both` fill at the next open while the trader is not listening: the
+/// broker's updates are left undrained, so only reconciliation can find the fills.
+async fn enter_both_and_miss_the_fills(store: &MemoryStore) -> Engine<'_> {
+    let (trader, _) = enter_both(store).await;
+    let session = sessions(&[(AAA, &["109"]), (BBB, &["58"])], 7);
+    trader.broker().on_session(&session[0]).unwrap();
+    trader
+}
+
+#[tokio::test]
+async fn reconcile_records_a_missed_fill_without_deciding() {
+    let store = MemoryStore::new();
+    let mut trader = enter_both_and_miss_the_fills(&store).await;
+    let decisions_before = store.decisions().len();
+    let positions_before = store
+        .records()
+        .iter()
+        .filter(|r| matches!(r, StoreRecord::Position(_)))
+        .count();
+
+    let report = trader.reconcile().await.unwrap();
+
+    assert_eq!(report.fills.len(), 2);
+    assert!(report.is_reconciled());
+    for id in ["nisse-1-0", "nisse-2-0"] {
+        let order = trader.state().tracker.get(ClientOrderId::new(id)).unwrap();
+        assert_eq!(order.state, OrderState::Filled);
+    }
+    let positions_after = store
+        .records()
+        .iter()
+        .filter(|r| matches!(r, StoreRecord::Position(_)))
+        .count();
+    assert_eq!(positions_after - positions_before, 2);
+    assert_eq!(
+        trader.state().positions.quantities(),
+        trader
+            .broker()
+            .positions()
+            .await
+            .unwrap()
+            .iter()
+            .map(|p| (p.symbol, p.qty.as_decimal()))
+            .collect::<BTreeMap<Symbol, Decimal>>()
+    );
+    // Nothing was decided.
+    assert_eq!(store.decisions().len(), decisions_before);
+}
+
+#[tokio::test]
+async fn reconcile_twice_is_a_noop_the_second_time() {
+    let store = MemoryStore::new();
+    let mut trader = enter_both_and_miss_the_fills(&store).await;
+    let first = trader.reconcile().await.unwrap();
+    assert_eq!(first.fills.len(), 2);
+    let records_before = store.records().len();
+    let positions_before = trader.state().positions.quantities();
+
+    let second = trader.reconcile().await.unwrap();
+
+    assert!(second.fills.is_empty());
+    assert!(second.state_changes.is_empty());
+    assert!(second.findings.is_empty());
+    assert!(second.problems.is_empty());
+    assert_eq!(second.unrepresentable_at_broker, 0);
+    assert_eq!(store.records().len(), records_before);
+    assert_eq!(trader.state().positions.quantities(), positions_before);
+}
+
+#[tokio::test]
+async fn reconcile_reports_foreign_orders() {
+    // An open order at the broker that the tracker does not know.
+    let store = MemoryStore::new();
+    let broker = FakeBroker::new(new_call_log());
+    let stranger = intent("someone-else-1", "5", None);
+    broker.set_open_orders(vec![accepted_from(&stranger)]);
+    let mut trader = Trader::new(
+        strategy(),
+        OrderGateway::new(broker.clone(), &store),
+        &store,
+        &store,
+        clock(),
+        config(vec![sym(AAA), sym(BBB)]),
+        OrderBookState::default(),
+    )
+    .unwrap();
+    assert!(matches!(
+        trader.reconcile().await,
+        Err(EngineError::ForeignOrders(1))
+    ));
+    assert!(store.decisions().is_empty());
+
+    // Open orders of a kind the engine never sends.
+    let store = MemoryStore::new();
+    let broker = FakeBroker::new(new_call_log());
+    broker.set_unrepresentable(2);
+    let mut trader = Trader::new(
+        strategy(),
+        OrderGateway::new(broker.clone(), &store),
+        &store,
+        &store,
+        clock(),
+        config(vec![sym(AAA), sym(BBB)]),
+        OrderBookState::default(),
+    )
+    .unwrap();
+    assert!(matches!(
+        trader.reconcile().await,
+        Err(EngineError::ForeignOrders(2))
+    ));
+    assert!(store.decisions().is_empty());
+}

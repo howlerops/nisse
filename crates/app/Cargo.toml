@@ -1,0 +1,34 @@
+[package]
+name = "nisse-app"
+description = "The engine process: scheduled commands that trade one strategy through the broker adapter"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+chrono = { workspace = true }
+nisse-alpaca-adapter = { workspace = true }
+nisse-bars = { workspace = true }
+nisse-core = { workspace = true }
+nisse-engine = { workspace = true }
+nisse-risk = { workspace = true }
+nisse-store = { workspace = true }
+rust_decimal = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+nisse-store = { workspace = true, features = ["test-support"] }
+
+[[bin]]
+name = "nisse-engine"
+path = "src/bin/nisse-engine.rs"

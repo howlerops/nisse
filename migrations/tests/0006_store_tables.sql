@@ -7,7 +7,8 @@ SELECT pg_temp.assert_true(
    WHERE c.relnamespace = 'public'::regnamespace AND c.relkind IN ('r', 'p')
      AND c.relpersistence = 'p')
   = ARRAY[
-      'decision', 'decision_holdout', 'eval_score', 'fill', 'heartbeat', 'market_snapshot', 'order_event',
+      'decision', 'decision_holdout', 'engine_step', 'eval_score', 'fill', 'heartbeat',
+      'market_snapshot', 'order_event',
       'outcome_window', 'position_event', 'risk_check', 'risk_event', 'schema_migration',
       'strategy_version', 'trial_registry', 'trial_result'
     ],

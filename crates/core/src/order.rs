@@ -223,6 +223,57 @@ pub trait Broker: Send + Sync {
     fn account(&self) -> impl Future<Output = Result<AccountSnapshot, Self::Error>> + Send;
 }
 
+/// A shared reference to a broker is a broker, so one can be lent to a trader and still be
+/// used by its owner (a test driving a simulated broker, for example).
+impl<B: Broker + ?Sized> Broker for &B {
+    type Error = B::Error;
+
+    fn submit(
+        &self,
+        intent: &OrderIntent,
+    ) -> impl Future<Output = Result<BrokerOrder, SubmitError<Self::Error>>> + Send {
+        (**self).submit(intent)
+    }
+
+    fn cancel(
+        &self,
+        venue_order_id: VenueOrderId,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        (**self).cancel(venue_order_id)
+    }
+
+    fn cancel_all(&self) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        (**self).cancel_all()
+    }
+
+    fn replace(
+        &self,
+        venue_order_id: VenueOrderId,
+        request: &ReplaceRequest,
+    ) -> impl Future<Output = Result<BrokerOrder, SubmitError<Self::Error>>> + Send {
+        (**self).replace(venue_order_id, request)
+    }
+
+    fn order_by_client_id(
+        &self,
+        client_order_id: ClientOrderId,
+    ) -> impl Future<Output = Result<Option<BrokerOrder>, Self::Error>> + Send {
+        (**self).order_by_client_id(client_order_id)
+    }
+
+    fn open_orders(&self) -> impl Future<Output = Result<OpenOrders, Self::Error>> + Send {
+        (**self).open_orders()
+    }
+
+    fn positions(&self) -> impl Future<Output = Result<Vec<BrokerPosition>, Self::Error>> + Send {
+        (**self).positions()
+    }
+
+    fn account(&self) -> impl Future<Output = Result<AccountSnapshot, Self::Error>> + Send {
+        (**self).account()
+    }
+}
+
 /// The write-ahead intent log. `record_intent` must have returned `Ok` before the order is
 /// sent to the broker; this is the one synchronous store write on the order path.
 pub trait IntentLog: Send + Sync {
@@ -232,4 +283,15 @@ pub trait IntentLog: Send + Sync {
         &self,
         intent: &OrderIntent,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+}
+
+impl<L: IntentLog + ?Sized> IntentLog for &L {
+    type Error = L::Error;
+
+    fn record_intent(
+        &self,
+        intent: &OrderIntent,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        (**self).record_intent(intent)
+    }
 }
