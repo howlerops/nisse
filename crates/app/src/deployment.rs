@@ -73,6 +73,13 @@ pub fn verify_deployment(
     })
 }
 
+/// [`verify_deployment`] with the key read from [`ENV_SIGNING_KEY`]. Every command that can
+/// trade calls this first, inside the command itself, so that no caller can forget it.
+pub fn verify_from_env(config: &EngineConfig) -> Result<Deployment, AppError> {
+    let key = std::env::var(ENV_SIGNING_KEY).ok();
+    verify_deployment(config, key.as_deref())
+}
+
 /// An `Unsigned` refusal with the given message.
 fn unsigned(message: impl Into<String>) -> AppError {
     AppError::Unsigned(message.into())

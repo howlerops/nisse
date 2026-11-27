@@ -13,7 +13,7 @@ Everything a research agent may write lives here, and nothing else does.
 
 A pull request that touches `configs/`, `notes/` or `labels/` may touch nothing else, may
 change at most one config, and must leave 30 days since the last change to the same strategy
-family. CI checks this (`nisse-proposal-check`); a person merges. Design:
+family. CI checks this (`nisse-proposal-check`, run by a workflow the pull request cannot edit); a person merges. Agents open their pull requests from a fork. Design:
 `docs/phases/phase-7.md`.
 
 Nothing here is investment advice.

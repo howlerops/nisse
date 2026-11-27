@@ -850,3 +850,34 @@ async fn an_unknown_month_end_does_not_hold_back_an_owed_rebalance() {
 
     f.db.drop_db().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_deployment_that_must_be_signed_and_is_not_trades_nothing() {
+    let mut f = fixture().await;
+    // The config demands a signature and points at a manifest that does not exist.
+    f.config.signature.required = true;
+    f.config.signature.manifest = f.scratch.path().join("no-such.manifest.json");
+    let sim = broker();
+    let day = date(2025, 12, 31);
+
+    let close = ManualClock::new(plus_minutes(close_at(day), 10));
+    let err = session_close(&f.config, &f.market, &f.store, f.sink.clone(), &sim, &close)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AppError::Unsigned(_)), "{err:?}");
+
+    let open = ManualClock::new(at(date(2026, 1, 1), 15));
+    let err = tick(&f.config, &f.market, &f.store, f.sink.clone(), &sim, &open)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AppError::Unsigned(_)), "{err:?}");
+
+    // Nothing was fetched, decided, recorded or sent.
+    assert_eq!(f.market.calls(), 0);
+    assert_eq!(count(&f.store, "decision").await, 0);
+    assert_eq!(count(&f.store, "engine_step").await, 0);
+    assert_eq!(count(&f.store, "heartbeat").await, 0);
+    assert!(sim.open_orders().await.unwrap().orders.is_empty());
+
+    f.db.drop_db().await.unwrap();
+}

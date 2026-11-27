@@ -9,8 +9,9 @@ nothing in this repository starts an agent on its own.
 - `research/agents/*.md`: the instructions for the three runs.
 - `nisse-proposal-check`: the CI check every research pull request must pass.
 - `nisse-agent-report`: writes the aggregates-only report agents read.
-- `nisse-sign` and the engine's signature check: a merged config is signed; an engine whose
-  config says `"required": true` trades nothing without a valid signature.
+- `nisse-sign` and the engine's signature check: a merged config is signed (by a workflow you
+  start and approve); an engine whose config says `"required": true` trades nothing without
+  a valid signature.
 
 ## Decide first
 
@@ -27,22 +28,33 @@ nothing in this repository starts an agent on its own.
 
 ## Turn it on
 
-1. **Signing key.** Generate 32 random bytes as hex (`openssl rand -hex 32`). Put it in the
-   repository's Actions secrets as `NISSE_SIGNING_KEY`, in an environment named `signing`
-   that only the `main` branch may use, and in `/etc/nisse/nisse.env` on the engine host.
-   It goes nowhere else, and never into a file in this repository.
-2. **First signature.** After the config is on `main`, run the "Sign research configs"
-   workflow (it also runs on every push to `main` that changes `research/configs/`). Copy
-   the manifest it prints to `research/signed/<name>.manifest.json` on the host.
-3. **Require it.** Set `"required": true` in the engine config's `signature` block on the
+1. **Agents work from a fork, never in this repository.** This repository has no branch
+   protection (CLAUDE.md), so any token that can write to it can push to `main`. Create a
+   fork under a separate account for the agents. Their token (step 5) can write to the
+   fork only. A pull request from a fork is treated as an agent pull request by CI, with the
+   strictest rules. If research moves to its own repository, the same holds there.
+2. **Signing key.** Generate 32 random bytes as hex (`openssl rand -hex 32`). Put it in this
+   repository's Actions secrets as `NISSE_SIGNING_KEY` **in an environment named `signing`**,
+   and configure that environment with (a) deployment branches: `main` only, and (b) a
+   required reviewer: you. Both matter: the signing job runs the code on `main` with the key
+   in its environment, so every run must wait for you. Put the same key in
+   `/etc/nisse/nisse.env` on the engine host. It goes nowhere else, and never into a file in
+   this repository.
+3. **Sign.** After you have merged a config, start the "Sign research configs" workflow by
+   hand on `main` and approve its run. It never starts by itself. It refuses a config that
+   is within 30 days of another of the same family or strategy kind. Copy the manifest it
+   prints to `research/signed/<name>.manifest.json` on the host.
+4. **Require it.** Set `"required": true` in the engine config's `signature` block on the
    host. From then on `tick` and `session-close` exit 2 without a valid manifest.
-4. **Agent report.** Add to the host's crontab, after the scoring job:
+5. **Token.** A fine-grained GitHub token for the agents' account with: contents read and
+   write on **the fork only**; pull requests read and write on this repository (to open the
+   pull request); nothing else. It must not have contents write on this repository.
+6. **Agent report.** Add to the host's crontab, after the scoring job:
    `deploy/run.sh report target/release/nisse-agent-report config/eval/gates.json research/configs/trend-v1.json data/bars data/agent-report.json`.
    How the file reaches the agents (a private gist, a bucket, a commit to a private
-   repository) depends on decision 1; it must not be committed to a public repository.
-5. **Token.** Create a fine-grained GitHub token with access to the research repository only:
-   contents read and write, pull requests read and write, nothing else.
-6. **Scheduled tasks.** Create three Claude Code scheduled tasks, each starting a fresh
+   repository) depends on decision 1 under "Decide first"; it must not be committed to a
+   public repository.
+7. **Scheduled tasks.** Create three Claude Code scheduled tasks, each starting a fresh
    session, each given the matching file from `research/agents/` as its instructions and
    the token from step 5: pre-market (before 13:30 UTC on weekdays), post-close (after the
    report is written), overnight (once a night at most). Hourly at most, per PLAN.md.
@@ -51,9 +63,14 @@ nothing in this repository starts an agent on its own.
 
 Treat it as untrusted input. Before merging:
 
-- The "research proposal" check is green. It guarantees the pull request touches only
-  `research/configs/`, `research/notes/` and `research/labels/`, changes at most one config,
-  and respects the 30-day budget.
+- It comes from the agents' fork, and the "Research proposal" workflow's check is green on
+  it. For a pull request from a fork (or from a branch named `research/...`) that check
+  fails unless the pull request changes only plain files under `research/configs/`,
+  `research/notes/` and `research/labels/`, changes at most one config, and respects the
+  30-day budget. For any other pull request that touches nothing under `research/` the
+  workflow checks nothing and says so: a green result there says nothing about what the
+  pull request changes. That workflow's file comes from `main`, not from the pull request,
+  so a pull request cannot weaken it; look at the "Files changed" tab all the same.
 - Read the note. Was the rationale written before any result? Is it a reason, or a
   description of a backtest?
 - Run `scripts/evaluate-proposal.sh research/configs/<name>.json` where the data is. It
@@ -64,3 +81,8 @@ Treat it as untrusted input. Before merging:
 
 Disable the three scheduled tasks and revoke the token. The engine keeps running on the last
 signed config.
+
+A manifest does not expire, and the engine checks only that it signs the deployment the
+engine's config describes. To retire a signed config, remove its manifest from the host (and
+point the engine config's `signature.manifest` at the one you want); to retire every
+manifest at once, change the key.
