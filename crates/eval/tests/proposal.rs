@@ -9,7 +9,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use chrono::NaiveDate;
-use nisse_eval::proposal::{Change, ResearchConfig, check_note, check_proposal, parse_changes};
+use nisse_eval::EvalError;
+use nisse_eval::proposal::{
+    Change, ResearchConfig, budget_conflicts, check_note, check_proposal, is_plain_path,
+    parse_changes, read_regular,
+};
 use serde_json::{Value, json};
 
 /// "Today" for every test.
@@ -66,6 +70,14 @@ impl Tree {
         );
         self.write(&format!("research/notes/{name}.md"), VALID_NOTE);
     }
+
+    /// Makes `rel` a symbolic link to `target` (which is not followed by the checks).
+    #[cfg(unix)]
+    fn link(&self, rel: &str, target: &str) {
+        let file = self.root.join(rel);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(target, file).unwrap();
+    }
 }
 
 impl Drop for Tree {
@@ -114,9 +126,14 @@ fn added_config(name: &str) -> Vec<Change> {
     ]
 }
 
-/// Runs the check with `base` and `head` as the two trees.
+/// Runs the check with `base` and `head` as the two trees, for a pull request by a person.
 fn run(changes: &[Change], base: &Tree, head: &Tree) -> Vec<String> {
-    check_proposal(changes, base.path(), head.path(), today())
+    check_proposal(changes, false, base.path(), head.path(), today())
+}
+
+/// Runs the check as an agent pull request.
+fn run_agent(changes: &[Change], base: &Tree, head: &Tree) -> Vec<String> {
+    check_proposal(changes, true, base.path(), head.path(), today())
 }
 
 /// Two trees that start with the same base contents: `base_configs` written to both.
@@ -331,8 +348,21 @@ fn check_note_refuses_the_last_heading_with_no_text() {
 // ---- parse_changes ---------------------------------------------------------------------------
 
 #[test]
+fn parse_changes_reads_nul_separated_records() {
+    let changes = parse_changes("A\0a\0M\0b\0D\0c\0").unwrap();
+    assert_eq!(
+        changes,
+        vec![
+            Change::Added("a".into()),
+            Change::Modified("b".into()),
+            Change::Deleted("c".into()),
+        ]
+    );
+}
+
+#[test]
 fn parse_changes_reads_each_status() {
-    let text = "A\ta.json\nM\tb.json\nD\tc.json\nR100\told.md\tnew.md\nT\td\n";
+    let text = "A\0a.json\0M\0b.json\0D\0c.json\0R100\0old.md\0new.md\0T\0d\0";
     let changes = parse_changes(text).unwrap();
     assert_eq!(
         changes,
@@ -353,22 +383,104 @@ fn parse_changes_reads_each_status() {
 }
 
 #[test]
-fn parse_changes_skips_blank_lines() {
-    let changes = parse_changes("\nA\ta.json\n\n   \nM\tb.json\n").unwrap();
-    assert_eq!(changes.len(), 2);
+fn parse_changes_reads_a_rename_record() {
+    let changes = parse_changes("R087\0research/notes/a.md\0research/notes/b.md\0").unwrap();
+    assert_eq!(
+        changes,
+        vec![Change::Renamed {
+            from: "research/notes/a.md".into(),
+            to: "research/notes/b.md".into()
+        }]
+    );
+}
+
+#[test]
+fn parse_changes_keeps_both_paths_of_a_copy() {
+    let changes = parse_changes("C75\0research/configs/a.json\0research/configs/b.json\0").unwrap();
+    assert_eq!(
+        changes,
+        vec![Change::Copied {
+            from: "research/configs/a.json".into(),
+            to: "research/configs/b.json".into()
+        }]
+    );
+    // The source of a copy is checked too: a copy out of research/ is refused.
+    let (base, head) = trees(&[]);
+    let failures = run(
+        &[Change::Copied {
+            from: "crates/x.rs".into(),
+            to: "research/configs/b.json".into(),
+        }],
+        &base,
+        &head,
+    );
+    assert!(
+        failures.iter().any(|f| f.contains("crates/x.rs")),
+        "{failures:?}"
+    );
+}
+
+#[test]
+fn parse_changes_reads_a_type_change() {
+    assert_eq!(
+        parse_changes("T\0d\0").unwrap(),
+        vec![Change::Other {
+            status: "T".into(),
+            path: "d".into()
+        }]
+    );
+}
+
+#[test]
+fn parse_changes_empty_input_is_no_changes() {
     assert!(parse_changes("").unwrap().is_empty());
 }
 
 #[test]
-fn parse_changes_refuses_a_line_with_no_tab() {
-    assert!(parse_changes("M README.md\n").is_err());
-    assert!(parse_changes("A\ta.json\nnonsense\n").is_err());
+fn parse_changes_accepts_a_missing_trailing_nul() {
+    assert_eq!(
+        parse_changes("M\0a").unwrap(),
+        vec![Change::Modified("a".into())]
+    );
 }
 
 #[test]
-fn parse_changes_refuses_the_wrong_number_of_paths() {
-    assert!(parse_changes("R100\tonly-one\n").is_err());
-    assert!(parse_changes("M\ta\tb\n").is_err());
+fn parse_changes_refuses_a_missing_path() {
+    assert!(parse_changes("A\0").is_err());
+    assert!(parse_changes("A").is_err());
+    assert!(parse_changes("A\0a\0M\0").is_err());
+    assert!(parse_changes("R100\0old\0").is_err());
+    assert!(parse_changes("C50\0only\0").is_err());
+}
+
+#[test]
+fn parse_changes_refuses_an_empty_path() {
+    assert!(parse_changes("A\0\0").is_err());
+    assert!(parse_changes("R100\0\0new\0").is_err());
+    assert!(parse_changes("R100\0old\0\0").is_err());
+}
+
+#[test]
+fn parse_changes_refuses_an_empty_or_unknown_status() {
+    assert!(parse_changes("\0a\0").is_err());
+    assert!(parse_changes("1\0a\0").is_err());
+    assert!(parse_changes("R\0a\0b\0").is_err());
+    assert!(parse_changes("A1\0a\0").is_err());
+    // The old line format is no longer read.
+    assert!(parse_changes("M\tREADME.md\n").is_err());
+}
+
+#[test]
+fn parse_changes_keeps_odd_paths_as_written() {
+    assert_eq!(
+        parse_changes("A\0a\tb\0M\0c\nd\0A\0\"q\"\0A\0\u{e9}.json\0").unwrap(),
+        vec![
+            Change::Added("a\tb".into()),
+            Change::Modified("c\nd".into()),
+            Change::Added("\"q\"".into()),
+            Change::Added("\u{e9}.json".into()),
+        ]
+    );
 }
 
 // ---- check_proposal --------------------------------------------------------------------------
@@ -601,4 +713,321 @@ fn several_violations_are_all_reported() {
     changes.push(modified("crates/risk/src/gate.rs"));
     let failures = run(&changes, &base, &head);
     assert!(failures.len() >= 2, "{failures:?}");
+}
+
+// ---- is_plain_path and rule 1 ----------------------------------------------------------------
+
+#[test]
+fn is_plain_path_accepts_only_the_plain_form() {
+    for good in ["research/notes/a.md", "a..b", "a-b_c.9", "x/y"] {
+        assert!(is_plain_path(good), "{good:?}");
+    }
+    for bad in [
+        "", "/a", "a/", "./a", "a/./b", "a/../b", "a//b", "a\\b", "a b", "a\"b", "\u{e9}", "a\tb",
+        "a\nb", "a:b",
+    ] {
+        assert!(!is_plain_path(bad), "{bad:?}");
+    }
+}
+
+#[test]
+fn a_path_that_is_not_plain_fails_under_rule_1_in_both_modes() {
+    let (base, head) = trees(&[]);
+    head.put(&config("trend-v1", "trend", today(), Value::Null));
+    for bad in [
+        "research/notes/a\"b.md",
+        "research/notes/a b.md",
+        "research/notes/\u{e9}.md",
+        "research/notes/a\\b.md",
+        "research/configs/./x.json",
+        "research//x",
+        "research/configs/../x.json",
+        "research/configs/x/",
+    ] {
+        for agent in [false, true] {
+            let changes = vec![added(bad)];
+            let failures = check_proposal(&changes, agent, base.path(), head.path(), today());
+            let shown = format!("{bad:?}");
+            assert!(
+                failures
+                    .iter()
+                    .any(|f| f.contains("is not a plain path") && f.contains(&shown)),
+                "{bad:?} agent={agent}: {failures:?}"
+            );
+        }
+    }
+    // A leading slash is not under research/, so only an agent pull request reaches rule 1 for it.
+    let changes = vec![added("/research/configs/x.json")];
+    assert_eq!(run(&changes, &base, &head), Vec::<String>::new());
+    let failures = run_agent(&changes, &base, &head);
+    assert!(
+        failures.iter().any(|f| f.contains("is not a plain path")),
+        "{failures:?}"
+    );
+}
+
+#[test]
+fn a_non_plain_research_path_is_never_read() {
+    // The config under the odd name is valid JSON, but its name is not plain, so nothing reads it.
+    let (base, head) = trees(&[]);
+    head.put(&config("trend-v1", "trend", today(), Value::Null));
+    let odd = config("trend-v2", "trend", today(), Value::Null).to_string();
+    head.write("research/configs/a b.json", &odd);
+    let changes = vec![added("research/configs/a b.json")];
+    let failures = run(&changes, &base, &head);
+    assert!(
+        failures.iter().any(|f| f.contains("is not a plain path")),
+        "{failures:?}"
+    );
+    assert!(
+        !failures.iter().any(|f| f.contains("trend-v2")),
+        "{failures:?}"
+    );
+}
+
+#[test]
+fn read_regular_reads_a_plain_regular_file_and_refuses_the_rest() {
+    let tree = Tree::new();
+    tree.write("research/notes/a.md", "text");
+    assert_eq!(
+        read_regular(tree.path(), "research/notes/a.md").unwrap(),
+        "text"
+    );
+    let missing = read_regular(tree.path(), "research/notes/missing.md").unwrap_err();
+    assert!(missing.contains("missing.md"), "{missing}");
+    let dotdot = read_regular(tree.path(), "research/../notes/a.md").unwrap_err();
+    assert!(dotdot.contains("is not a plain path"), "{dotdot}");
+    let dir = read_regular(tree.path(), "research/notes").unwrap_err();
+    assert!(dir.contains("is not a regular file"), "{dir}");
+}
+
+#[cfg(unix)]
+#[test]
+fn read_regular_does_not_follow_a_link_on_the_way() {
+    let tree = Tree::new();
+    tree.write("research/notes/a.md", "text");
+    tree.link("linked", "research");
+    let err = read_regular(tree.path(), "linked/notes/a.md").unwrap_err();
+    assert!(err.contains("linked/notes/a.md"), "{err}");
+}
+
+// ---- agent mode ------------------------------------------------------------------------------
+
+#[test]
+fn an_agent_pull_request_must_change_research_files() {
+    let (base, head) = trees(&[]);
+    head.put(&config("trend-v1", "trend", today(), Value::Null));
+
+    // Only limits changed: a person's pull request passes, an agent's fails.
+    let limits = vec![modified("config/limits/limits.json")];
+    assert_eq!(run(&limits, &base, &head), Vec::<String>::new());
+    let failures = run_agent(&limits, &base, &head);
+    assert!(
+        failures
+            .iter()
+            .any(|f| f.contains("config/limits/limits.json")),
+        "{failures:?}"
+    );
+
+    // Only a workflow changed: fails for an agent, rule 1 names it.
+    let workflow = vec![modified(".github/workflows/sign.yml")];
+    let failures = run_agent(&workflow, &base, &head);
+    assert!(
+        failures
+            .iter()
+            .any(|f| f.contains(".github/workflows/sign.yml")),
+        "{failures:?}"
+    );
+
+    // An empty change list fails for an agent only.
+    assert_eq!(run(&[], &base, &head), Vec::<String>::new());
+    let failures = run_agent(&[], &base, &head);
+    assert!(
+        failures
+            .iter()
+            .any(|f| f.contains("must change research files")),
+        "{failures:?}"
+    );
+}
+
+#[test]
+fn a_valid_first_config_passes_in_both_modes() {
+    let (base, head) = trees(&[]);
+    head.put(&config("trend-v1", "trend", today(), Value::Null));
+    let changes = added_config("trend-v1");
+    assert_eq!(run(&changes, &base, &head), Vec::<String>::new());
+    assert_eq!(run_agent(&changes, &base, &head), Vec::<String>::new());
+}
+
+// ---- the budget by strategy kind -------------------------------------------------------------
+
+#[test]
+fn a_new_family_with_the_same_strategy_kind_does_not_reset_the_budget() {
+    let first = config("trend-v1", "trend", day(0), Value::Null);
+    let (base, head) = trees(std::slice::from_ref(&first));
+    head.put(&config("trend-b", "trendb", day(0), Value::Null));
+    let failures = run(&added_config("trend-b"), &base, &head);
+    assert!(
+        failures.iter().any(|f| f.contains("trend-v1")),
+        "{failures:?}"
+    );
+}
+
+#[test]
+fn a_new_family_with_the_same_strategy_kind_passes_30_days_later() {
+    let first = config("trend-v1", "trend", day(0), Value::Null);
+    let (base, head) = trees(std::slice::from_ref(&first));
+    head.put(&config("trend-b", "trendb", day(30), Value::Null));
+    assert_eq!(
+        run(&added_config("trend-b"), &base, &head),
+        Vec::<String>::new()
+    );
+}
+
+// ---- symbolic links --------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn a_note_that_is_a_symlink_fails() {
+    let first = config("trend-v1", "trend", day(0), Value::Null);
+    let (base, head) = trees(std::slice::from_ref(&first));
+    let cfg = config("trend-b", "trend", day(40), json!("trend-v1"));
+    head.write("research/configs/trend-b.json", &cfg.to_string());
+    head.write("research/notes/other.md", VALID_NOTE);
+    head.link("research/notes/trend-b.md", "other.md");
+    let failures = run(&added_config("trend-b"), &base, &head);
+    assert!(
+        failures
+            .iter()
+            .any(|f| f.contains("research/notes/trend-b.md is not a regular file")),
+        "{failures:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_config_that_is_a_symlink_fails() {
+    let (base, head) = trees(&[]);
+    head.write(
+        "research/elsewhere/trend-v1.json",
+        &config("trend-v1", "trend", today(), Value::Null).to_string(),
+    );
+    head.write("research/notes/trend-v1.md", VALID_NOTE);
+    head.link(
+        "research/configs/trend-v1.json",
+        "../elsewhere/trend-v1.json",
+    );
+    let failures = run(&added_config("trend-v1"), &base, &head);
+    assert!(
+        failures
+            .iter()
+            .any(|f| f.contains("research/configs/trend-v1.json is not a regular file")),
+        "{failures:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_json_file_outside_the_diff_fails() {
+    let (base, head) = trees(&[]);
+    head.put(&config("trend-v1", "trend", today(), Value::Null));
+    head.link("research/configs/extra.json", "../../outside.json");
+    let failures = run(&added_config("trend-v1"), &base, &head);
+    assert!(
+        failures.iter().any(|f| f.contains("extra.json")),
+        "{failures:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_json_file_in_the_base_fails_the_budget_check() {
+    let (base, head) = trees(&[]);
+    base.link("research/configs/old.json", "../../outside.json");
+    head.put(&config("trend-v1", "trend", today(), Value::Null));
+    let failures = run(&added_config("trend-v1"), &base, &head);
+    assert!(
+        failures.iter().any(|f| f.contains("old.json")),
+        "{failures:?}"
+    );
+}
+
+// ---- budget_conflicts ------------------------------------------------------------------------
+
+#[test]
+fn budget_conflicts_with_no_other_config_is_empty() {
+    let tree = Tree::new();
+    tree.put(&config("trend-v1", "trend", day(0), Value::Null));
+    assert_eq!(
+        budget_conflicts(tree.path(), "trend-v1").unwrap(),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn budget_conflicts_names_a_same_family_config_10_days_away() {
+    let tree = Tree::new();
+    tree.put(&config("trend-a", "trend", day(0), Value::Null));
+    tree.put(&config("trend-b", "trend", day(10), json!("trend-a")));
+    let later = budget_conflicts(tree.path(), "trend-b").unwrap();
+    assert_eq!(later.len(), 1, "{later:?}");
+    assert!(later[0].contains("trend-a"), "{later:?}");
+    // In the other direction too.
+    let earlier = budget_conflicts(tree.path(), "trend-a").unwrap();
+    assert_eq!(earlier.len(), 1, "{earlier:?}");
+    assert!(earlier[0].contains("trend-b"), "{earlier:?}");
+}
+
+#[test]
+fn budget_conflicts_names_a_same_kind_config_29_days_earlier() {
+    let tree = Tree::new();
+    tree.put(&config("trend-a", "trend", day(0), Value::Null));
+    tree.put(&config("trend-b", "trendb", day(29), Value::Null));
+    let messages = budget_conflicts(tree.path(), "trend-b").unwrap();
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    assert!(messages[0].contains("trend-a"), "{messages:?}");
+}
+
+#[test]
+fn budget_conflicts_is_empty_30_days_apart() {
+    let tree = Tree::new();
+    tree.put(&config("trend-a", "trend", day(0), Value::Null));
+    tree.put(&config("trend-b", "trendb", day(30), Value::Null));
+    assert_eq!(
+        budget_conflicts(tree.path(), "trend-b").unwrap(),
+        Vec::<String>::new()
+    );
+    // The same family 30 days apart is clear too.
+    // Family trend, 30 days after trend-b (day 30) and 60 after trend-a (day 0).
+    tree.put(&config("trend-c", "trend", day(60), json!("trend-a")));
+    assert_eq!(
+        budget_conflicts(tree.path(), "trend-c").unwrap(),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn budget_conflicts_for_an_unknown_name_is_an_error() {
+    let tree = Tree::new();
+    tree.put(&config("trend-a", "trend", day(0), Value::Null));
+    let err = budget_conflicts(tree.path(), "no-such").unwrap_err();
+    assert!(matches!(err, EvalError::InvalidProposal(_)), "{err:?}");
+}
+
+#[test]
+fn budget_conflicts_refuses_a_config_that_does_not_parse() {
+    let tree = Tree::new();
+    tree.put(&config("trend-a", "trend", day(0), Value::Null));
+    tree.write("research/configs/bad.json", "{");
+    let err = budget_conflicts(tree.path(), "trend-a").unwrap_err();
+    assert!(err.to_string().contains("bad.json"), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn budget_conflicts_refuses_a_symlinked_config() {
+    let tree = Tree::new();
+    tree.put(&config("trend-a", "trend", day(0), Value::Null));
+    tree.link("research/configs/link.json", "trend-a.json");
+    assert!(budget_conflicts(tree.path(), "trend-a").is_err());
 }

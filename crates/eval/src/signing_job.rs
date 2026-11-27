@@ -6,20 +6,20 @@
 //! Every refusal is an [`EvalError::InvalidProposal`] (or a [`EvalError::Core`] from the
 //! signing primitives). No message ever contains the key.
 
-use std::fs;
 use std::path::Path;
 
 use nisse_core::signing::{Manifest, STAGE_PAPER, SigningKey, deployment_hash};
 
 use crate::EvalError;
-use crate::proposal::{CONFIG_DIR, ResearchConfig, check_note};
+use crate::proposal::{
+    CONFIG_DIR, JSON_SUFFIX, ResearchConfig, budget_conflicts, check_note, is_plain_path,
+    read_regular,
+};
 
 pub use nisse_core::signing::ENV_SIGNING_KEY;
 
 /// Where manifests live, relative to a checkout's root.
 const SIGNED_DIR: &str = "research/signed";
-/// The extension every config file has, with its dot.
-const JSON_SUFFIX: &str = ".json";
 
 fn invalid(message: impl Into<String>) -> EvalError {
     EvalError::InvalidProposal(message.into())
@@ -33,7 +33,7 @@ fn config_stem(config_path: &str) -> Result<&str, EvalError> {
             "config path {config_path:?} must be {CONFIG_DIR}/<name>.json"
         ))
     };
-    if config_path.contains("..") || config_path.starts_with('/') || config_path.contains('\\') {
+    if !is_plain_path(config_path) {
         return Err(refuse());
     }
     let file = config_path
@@ -49,9 +49,11 @@ fn config_stem(config_path: &str) -> Result<&str, EvalError> {
 
 /// Signs the research config at `<root>/<config_path>` for the paper stage and returns the
 /// manifest. Refuses anything that should not be signed: a path outside the config directory,
-/// a config that does not parse or whose name differs from its file stem, a missing or
-/// malformed note, a build with uncommitted changes, an unknown (all-zero) commit, or a key
-/// that is not a valid hex key of at least `MIN_KEY_BYTES`.
+/// a config or note that is not a regular file (a symbolic link, say), a config that does not
+/// parse or whose name differs from its file stem, a change budget shared with another config
+/// (re-checked here, see [`budget_conflicts`]), a missing or malformed note, a build with
+/// uncommitted changes, an unknown (all-zero) commit, or a key that is not a valid hex key of at
+/// least `MIN_KEY_BYTES`.
 pub fn sign_config(
     root: &Path,
     config_path: &str,
@@ -62,8 +64,8 @@ pub fn sign_config(
 ) -> Result<Manifest, EvalError> {
     let stem = config_stem(config_path)?;
 
-    let text = fs::read_to_string(root.join(config_path))
-        .map_err(|_| invalid(format!("cannot read config {config_path}")))?;
+    let text =
+        read_regular(root, config_path).map_err(|e| invalid(format!("cannot read config: {e}")))?;
     let config = ResearchConfig::parse(&text)?;
     if config.name != stem {
         return Err(invalid(format!(
@@ -72,9 +74,20 @@ pub fn sign_config(
         )));
     }
 
+    // The change budget, re-checked now: two proposals opened on one day can both pass against
+    // the same base.
+    let conflicts = budget_conflicts(root, &config.name)?;
+    if !conflicts.is_empty() {
+        return Err(invalid(format!(
+            "the change budget of {:?} is shared with other configs; {}",
+            config.name,
+            conflicts.join("; ")
+        )));
+    }
+
     // `ResearchConfig::parse` guarantees `rationale` is exactly `research/notes/<name>.md`.
-    let note = fs::read_to_string(root.join(&config.rationale))
-        .map_err(|_| invalid(format!("cannot read note {}", config.rationale)))?;
+    let note = read_regular(root, &config.rationale)
+        .map_err(|e| invalid(format!("cannot read note: {e}")))?;
     check_note(&note)?;
 
     if !clean_build {
