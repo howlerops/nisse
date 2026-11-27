@@ -55,14 +55,22 @@ A kill switch engaged by a row from outside the engine (the phone) is enforced b
 function, `enforce_kill`, which needs only the store and the broker: no trader, no bar
 files, no signature, no engine lock.
 
-- It reads the switch (an unreadable switch counts as engaged). Off: nothing else happens,
-  and the broker is not contacted.
+- It reads the switch. A newest switch row that cannot be understood counts as engaged. A
+  store that cannot be reached at all is an error and cancels nothing: a database outage
+  must not cancel orders every minute. Off: nothing else happens, and the broker is not
+  contacted.
 - Engaged, with the limits' `flatten_on_kill` false (the switch halts): if the broker lists
-  any open order, cancel everything.
+  any open order, cancel everything. If the broker cannot even list its orders, cancel
+  everything blind.
 - Engaged, with `flatten_on_kill` true (the switch means exit): cancel the open buys and
-  leave the sells, which are the exits.
+  leave the sells, which are the exits. A buy that cannot be cancelled is recorded and the
+  run goes on; without the list nothing can be done safely, and that is a recorded failure.
 - A cancel is recorded as `engine_step` `kill` / `cancel` (`done`, or `failed` with the
-  error), so it can be seen from the phone's Activity screen.
+  error), with its time, so it can be seen from the phone's Activity screen.
+- The watcher writes a heartbeat under the source `kill-watch` after every run that did
+  its job. The phone shows its age, and the Kill screen says "open orders are NOT being
+  cancelled" when the watcher has not run for three minutes: a kill from the phone is only
+  as good as the watcher behind it.
 
 It runs in three places:
 
@@ -106,9 +114,11 @@ ui/ext/nisse-native/     crate: #[native_module("nisse-native")], wraps nisse-ui
 ui/ext/nisse-native/tests/app.rs   headless tests: the screens, the module and Postgres together
 ```
 
-Screens: **Status** (switch, mode, heartbeat age, owed rebalance; "off" is green only while
-the engine has a recent heartbeat, and no state is shown once the last read is older than two
-refreshes), **Positions**, **Gates** (per version), **Activity** (the engine's newest steps,
+Every data screen shows a read only while it is recent (younger than two refreshes, and the
+last refresh did not fail) and says how old it is.
+
+Screens: **Status** (switch, mode, the engine's and the watcher's heartbeat ages, owed
+rebalance; "off" is green only while the engine has a recent heartbeat), **Positions**, **Gates** (per version), **Activity** (the engine's newest steps,
 including cancels made for the kill switch), **Proposals** (open pull requests),
 **Kill** (type your name, confirm; the result is what the store says afterwards), and
 **Settings** (the connection string, kept in the app's storage; Native Shell documents no
@@ -132,4 +142,4 @@ encrypted storage, so this is a plain file in the app's sandbox).
   `nisse-ui-data` independent of `nisse-core`'s NautilusTrader types.
 - Private network or TLS for the phone's database connection.
 - Create the login role for the phone (member of `nisse_ui`).
-- The end-to-end test: engage from the phone against paper, watch the next tick cancel.
+- The end-to-end test: engage from the phone against paper, watch the watcher cancel.

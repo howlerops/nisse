@@ -38,6 +38,9 @@ pub struct StatusView {
     /// Seconds since the engine's newest heartbeat by the database's clock (not this
     /// device's), or null when it has never written one.
     pub heartbeat_age_seconds: Option<f64>,
+    /// Seconds since the kill watcher on the host last ran, by the database's clock, or null
+    /// when it never has. The watcher is what cancels open orders after a kill from here.
+    pub watcher_age_seconds: Option<f64>,
     /// A rebalance is owed (a resize or an incomplete rebalance is pending).
     pub rebalance_owed: bool,
     /// The hash of the limits file the engine last loaded, or null.
@@ -92,6 +95,8 @@ pub struct StepView {
     pub status: String,
     /// The step's detail as JSON text.
     pub detail: String,
+    /// Seconds since the step was recorded, by the database's clock.
+    pub age_seconds: f64,
 }
 
 /// The store, read for the screens, and the kill switch.
@@ -111,6 +116,7 @@ impl Nisse {
                 equity_peak: status.equity_peak.map(|peak| peak.to_string()),
                 // Seconds fit a JS number exactly far beyond any real age.
                 heartbeat_age_seconds: status.heartbeat_age_seconds.map(|age| age as f64),
+                watcher_age_seconds: status.watcher_age_seconds.map(|age| age as f64),
                 rebalance_owed: status.rebalance_owed,
                 limits_hash: status.limits_hash,
             })
@@ -194,6 +200,7 @@ impl Nisse {
                     step: row.step,
                     status: row.status,
                     detail: row.detail.to_string(),
+                    age_seconds: row.age_seconds as f64,
                 })
                 .collect())
         })

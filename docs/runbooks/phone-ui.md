@@ -30,8 +30,10 @@ needs one new dependency in the app's Rust module.
    `CREATE ROLE nisse_phone LOGIN PASSWORD '...' IN ROLE nisse_ui;`
    Let that login connect only from the private network (`pg_hba.conf`).
 2. **Engine.** The host must be running the build that includes Phase 8, and its crontab
-   must have the `kill-watch` line (re-install `deploy/crontab`). Check `log/killwatch.log`
-   gets "kill-watch: switch off" every minute.
+   must have the `kill-watch` line (re-install `deploy/crontab` after every rebuild of the
+   host). Check `log/killwatch.log` gets "kill-watch: switch off" every minute, and that the
+   app's Status screen shows "Kill watcher: ran N s before this read" with a small N. That
+   log gains a line a minute: rotate it (for example with `logrotate`).
 3. **Native Shell.** Install it on your computer (`https://nsh.dev/docs/installation`), the
    same version as the `nsh-*` crates in `ui/ext/nisse-native/Cargo.toml` (0.7.2).
 4. **Check and run.** In `ui/`: `nsh check` (TypeScript types: this has never been run),
@@ -52,8 +54,11 @@ not send makes its reconciliation stop.
 
 1. On the phone, Status shows "Kill switch: off" and a recent heartbeat.
 2. Kill: type your name, "Engage kill switch", "Yes, engage now". The app shows
-   "Kill switch ENGAGED" only after reading it back.
-3. Within about a minute, the app's Activity screen shows "kill  cancel: done",
+   "Kill switch ENGAGED" only after reading it back, and says whether the watcher is running.
+   If it says "Open orders are NOT being cancelled", the watcher is not running: fix that
+   first.
+3. Within about a minute, the app's Activity screen shows a new "kill  cancel: done, just now"
+   row (read the age: an old row is an old cancel),
    `log/killwatch.log` on the host has "switch ENGAGED; N open orders cancelled", and Alpaca
    shows no open orders. Repeat the test once in the evening, with the market closed and an
    order resting for the next open: that is the case the watcher exists for.

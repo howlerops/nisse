@@ -2784,6 +2784,7 @@ dependencies = [
  "nsh-core",
  "nsh-engine",
  "nsh-testing",
+ "serde_json",
  "tokio",
  "tokio-postgres",
 ]

@@ -148,6 +148,7 @@ async fn status_of_an_empty_store() {
             equity_peak: None,
             last_heartbeat: None,
             heartbeat_age_seconds: None,
+            watcher_age_seconds: None,
             rebalance_owed: false,
             limits_hash: None,
         }
@@ -587,4 +588,50 @@ fn the_resize_constants_still_appear_in_the_engine_session() {
         session.contains(&format!("RESIZE_STEP: &str = \"{RESIZE_STEP}\"")),
         "session.rs no longer defines RESIZE_STEP as {RESIZE_STEP:?}"
     );
+}
+
+#[tokio::test]
+async fn the_watcher_has_its_own_age_and_steps_carry_theirs() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    client
+        .execute(
+            "INSERT INTO heartbeat (source, event_ts) VALUES \
+             ($1, clock_timestamp() - interval '40 seconds'), \
+             ('engine', clock_timestamp() - interval '200 seconds')",
+            &[&nisse_ui_data::WATCH_SOURCE],
+        )
+        .await
+        .unwrap();
+    client
+        .execute(
+            "INSERT INTO engine_step (run_key, step, status, detail, event_ts) \
+             VALUES ('kill', 'cancel', 'done', '{}', clock_timestamp() - interval '3 hours')",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let got = status(&client, SOURCE).await.unwrap();
+    let watcher = got.watcher_age_seconds.unwrap();
+    assert!((40..=45).contains(&watcher), "{watcher}");
+    let engine = got.heartbeat_age_seconds.unwrap();
+    assert!((200..=205).contains(&engine), "{engine}");
+
+    let steps = recent_steps(&client, 10).await.unwrap();
+    assert_eq!(steps.len(), 1);
+    assert!(
+        (10_800..=10_810).contains(&steps[0].age_seconds),
+        "{:?}",
+        steps[0]
+    );
+
+    // The watcher's source name is the engine's own constant.
+    assert!(
+        include_str!("../../app/src/kill_watch.rs")
+            .contains(&format!("\"{}\"", nisse_ui_data::WATCH_SOURCE))
+    );
+
+    drop(client);
+    db.drop_db().await.unwrap();
 }

@@ -19,6 +19,8 @@ const REFRESH_MS = 30_000;
 const STALE_MS = 75_000;
 /** A heartbeat older than this (seconds) is shown as late. The engine ticks every two minutes. */
 const HEARTBEAT_LATE_SECONDS = 300;
+/** The kill watcher runs every minute; one that has not run for this long (seconds) is not relied on. */
+const WATCHER_LATE_SECONDS = 180;
 /** The repository whose open pull requests the Proposals screen lists. */
 const PULLS_URL = "https://api.github.com/repos/howlerops/nisse/pulls?state=open&per_page=30";
 
@@ -112,44 +114,71 @@ function NotConnected() {
   );
 }
 
-/** Re-reads `read` every `REFRESH_MS` while the calling screen is on show. */
-function keepFresh(read: () => void) {
-  const id = setInterval(() => read(), REFRESH_MS);
-  cleanup(() => clearInterval(id));
+/**
+ * A read of the store that is shown only while it is recent. It is re-read every `REFRESH_MS`
+ * while the calling screen is on show; `value()` is the last read only if that read succeeded
+ * and is younger than `STALE_MS` by this device's clock, so a screen left open, or an app
+ * brought back from the background, never goes on showing an old answer. `problem()` is why
+ * there is no value, when there is a reason.
+ */
+function freshRead<T>(url: () => string | null, read: (url: string) => Promise<T>) {
+  const readAt = signal<number | null>(null);
+  const clock = signal(Date.now());
+  const data = resource(url, async (connection, info) => {
+    const value = await read(connection);
+    // A load that was overtaken by a newer one must not count as a fresh read.
+    if (!info.signal.aborted) readAt.set(Date.now());
+    return value;
+  });
+  const tick = setInterval(() => clock.set(Date.now()), 1000);
+  const refresh = setInterval(() => data.refetch(), REFRESH_MS);
+  cleanup(() => {
+    clearInterval(tick);
+    clearInterval(refresh);
+  });
+  // The distance from the read, whichever way the device's clock has moved since.
+  const age = () => (readAt() === null ? null : Math.abs(clock() - (readAt() ?? 0)));
+  const ageSeconds = () => Math.round((age() ?? 0) / 1000);
+  const stale = () => (age() ?? 0) > STALE_MS;
+  return {
+    value: (): T | undefined => (!data.error() && !stale() && readAt() !== null ? data() : undefined),
+    problem: (): unknown =>
+      data.error() ?? (stale() ? `The last read is ${ageSeconds()} s old and has not been refreshed.` : undefined),
+    ageSeconds,
+    refetch: () => data.refetch(),
+  };
+}
+
+/** "just now", "5 min ago", "3 h ago", "2 d ago". */
+function ago(seconds: number): string {
+  if (seconds < 60) return "just now";
+  if (seconds < 90 * 60) return `${Math.round(seconds / 60)} min ago`;
+  if (seconds < 48 * 3600) return `${Math.round(seconds / 3600)} h ago`;
+  return `${Math.round(seconds / 86400)} d ago`;
+}
+
+/** Whether something that should run every minute or two ran recently enough. */
+function recent(seconds: number | null | undefined, limit: number): boolean {
+  return seconds !== null && seconds !== undefined && seconds <= limit;
 }
 
 function StatusScreen(props: { url: () => string | null }) {
-  // When the state on show was read, by this device's clock, and the time now. The state is
-  // shown only while that read is recent: a screen left open, or an app brought back from the
-  // background, must not go on showing an old "off".
-  const readAt = signal<number | null>(null);
-  const clock = signal(Date.now());
-  const tick = setInterval(() => clock.set(Date.now()), 1000);
-  cleanup(() => clearInterval(tick));
-
-  const status = resource(props.url, async (url) => {
-    const read = await Nisse.status(url);
-    readAt.set(Date.now());
-    return read;
-  });
-  keepFresh(status.refetch);
-
-  const age = () => (readAt() === null ? null : clock() - (readAt() ?? 0));
-  const stale = () => (age() ?? 0) > STALE_MS;
-  const shown = () => !status.error() && !stale() && readAt() !== null && status();
-  const heartbeatAge = () => status()?.heartbeatAgeSeconds;
-  const alive = () => {
-    const seconds = heartbeatAge();
-    return seconds !== null && seconds !== undefined && seconds <= HEARTBEAT_LATE_SECONDS;
-  };
+  const status = freshRead(props.url, (url) => Nisse.status(url));
+  const alive = () => recent(status.value()?.heartbeatAgeSeconds, HEARTBEAT_LATE_SECONDS);
+  const watching = () => recent(status.value()?.watcherAgeSeconds, WATCHER_LATE_SECONDS);
   const heartbeat = () => {
-    const seconds = heartbeatAge();
+    const seconds = status.value()?.heartbeatAgeSeconds;
     if (seconds === null || seconds === undefined) return "Heartbeat: never";
     return `Heartbeat: ${Math.round(seconds)} s before this read${alive() ? "" : " (late)"}`;
   };
+  const watcher = () => {
+    const seconds = status.value()?.watcherAgeSeconds;
+    if (seconds === null || seconds === undefined) return "Kill watcher: never ran";
+    return `Kill watcher: ran ${Math.round(seconds)} s before this read${watching() ? "" : " (late)"}`;
+  };
   // "off" is only good news when the engine is known to be alive.
   const switchLine = () => {
-    if (status()?.killSwitch) return { text: "Kill switch: ENGAGED", color: RED };
+    if (status.value()?.killSwitch) return { text: "Kill switch: ENGAGED", color: RED };
     if (alive()) return { text: "Kill switch: off", color: GREEN };
     return { text: "Kill switch: off (engine not confirmed alive)", color: AMBER };
   };
@@ -158,91 +187,94 @@ function StatusScreen(props: { url: () => string | null }) {
       <If when={!props.url()}>
         <NotConnected />
       </If>
-      <If when={status.error()}>
-        <CannotConfirm what="the engine's state" error={status.error()} />
+      <If when={status.problem()}>
+        <CannotConfirm what="the engine's state" error={status.problem()} />
       </If>
-      <If when={!status.error() && stale()}>
-        <CannotConfirm
-          what="the engine's state"
-          error={`The last read is ${Math.round((age() ?? 0) / 1000)} s old and has not been refreshed.`}
-        />
-      </If>
-      <If when={shown()}>
+      <If when={status.value()}>
         <Card title="ENGINE">
           <Line color={switchLine().color} strong>{switchLine().text}</Line>
-          <Line>{`Drawdown mode: ${status()?.drawdownMode ?? ""}`}</Line>
-          <Line>{`Equity peak: ${status()?.equityPeak ?? "none yet"}`}</Line>
+          <Line>{`Drawdown mode: ${status.value()?.drawdownMode ?? ""}`}</Line>
+          <Line>{`Equity peak: ${status.value()?.equityPeak ?? "none yet"}`}</Line>
           <Line color={alive() ? INK : AMBER}>{heartbeat()}</Line>
-          <Line color={status()?.rebalanceOwed ? AMBER : INK}>
-            {status()?.rebalanceOwed ? "Rebalance owed: yes" : "Rebalance owed: no"}
+          <Line color={watching() ? INK : AMBER}>{watcher()}</Line>
+          <Line color={status.value()?.rebalanceOwed ? AMBER : INK}>
+            {status.value()?.rebalanceOwed ? "Rebalance owed: yes" : "Rebalance owed: no"}
           </Line>
-          <Line color={MUTED}>{`Limits: ${status()?.limitsHash ?? "none recorded"}`}</Line>
-          <Line color={MUTED}>{`Read ${Math.max(0, Math.round((age() ?? 0) / 1000))} s ago`}</Line>
+          <Line color={MUTED}>{`Limits: ${status.value()?.limitsHash ?? "none recorded"}`}</Line>
+          <Line color={MUTED}>{`Read ${status.ageSeconds()} s ago`}</Line>
         </Card>
       </If>
-      <Button title="Refresh" onPress={() => status.refetch()} />
+      <Button title="Refresh" onPress={status.refetch} />
     </View>
   );
 }
 
 function PositionsScreen(props: { url: () => string | null }) {
-  const positions = resource(props.url, (url) => Nisse.positions(url));
-  const orders = resource(props.url, (url) => Nisse.orders(url));
-  keepFresh(() => {
-    positions.refetch();
-    orders.refetch();
-  });
+  const positions = freshRead(props.url, (url) => Nisse.positions(url));
+  const orders = freshRead(props.url, (url) => Nisse.orders(url));
   return (
     <View style={{ gap: 16 }}>
       <If when={!props.url()}>
         <NotConnected />
       </If>
-      <If when={positions.error() ?? orders.error()}>
-        <CannotConfirm what="positions and orders" error={positions.error() ?? orders.error()} />
+      <If when={positions.problem() ?? orders.problem()}>
+        <CannotConfirm what="positions and orders" error={positions.problem() ?? orders.problem()} />
       </If>
-      <If when={!positions.error() && positions()}>
+      <If when={positions.value()}>
         <Card title="POSITIONS">
-          <If when={(positions() ?? []).length === 0}>
+          <If when={(positions.value() ?? []).length === 0}>
             <Line color={MUTED}>None.</Line>
           </If>
-          <Each of={positions() ?? []}>
+          <Each of={positions.value() ?? []}>
             {(position) => <Line>{`${position().symbol}  ${position().qty} @ ${position().avgCost}`}</Line>}
           </Each>
+          <Line color={MUTED}>{`Read ${positions.ageSeconds()} s ago`}</Line>
         </Card>
       </If>
-      <If when={!orders.error() && orders()}>
-        <Card title="OPEN ORDERS">
-          <If when={(orders() ?? []).length === 0}>
+      <If when={orders.value()}>
+        <Card title="OPEN ORDERS, AS THE ENGINE LAST RECORDED THEM">
+          <If when={(orders.value() ?? []).length === 0}>
             <Line color={MUTED}>None.</Line>
           </If>
-          <Each of={orders() ?? []}>
+          <Each of={orders.value() ?? []}>
             {(order) => (
               <Line>{`${order().side} ${order().qty} ${order().symbol} (${order().state})`}</Line>
             )}
           </Each>
+          <Line color={MUTED}>
+            This list changes when an engine run reconciles with the broker, not at the moment an order is
+            cancelled. The broker's own dashboard is the live view.
+          </Line>
         </Card>
       </If>
+      <Button
+        title="Refresh"
+        onPress={() => {
+          positions.refetch();
+          orders.refetch();
+        }}
+      />
     </View>
   );
 }
 
 function GatesScreen(props: { url: () => string | null }) {
-  const versions = resource(props.url, (url) => Nisse.versions(url));
+  const versions = freshRead(props.url, (url) => Nisse.versions(url));
   const tone = (state: string) => (state === "pass" ? GREEN : state === "fail" ? RED : MUTED);
   return (
     <View style={{ gap: 16 }}>
       <If when={!props.url()}>
         <NotConnected />
       </If>
-      <If when={versions.error()}>
-        <CannotConfirm what="the gate reports" error={versions.error()} />
+      <If when={versions.problem()}>
+        <CannotConfirm what="the gate reports" error={versions.problem()} />
       </If>
-      <If when={!versions.error() && versions() && (versions() ?? []).length === 0}>
+      <If when={versions.value() && (versions.value() ?? []).length === 0}>
         <Card title="STRATEGY VERSIONS">
           <Line color={MUTED}>None yet.</Line>
         </Card>
       </If>
-      <Each of={versions() ?? []}>
+      <Each of={versions.value() ?? []}>
         {(version) => (
           <Card title={`VERSION ${version().id}  ${version().gitSha.slice(0, 7)}`}>
             <If when={version().gates.length === 0}>
@@ -257,35 +289,40 @@ function GatesScreen(props: { url: () => string | null }) {
       <Line color={MUTED}>
         A strategy is promoted on these gates over the whole trial history, never on recent results.
       </Line>
+      <Button title="Refresh" onPress={versions.refetch} />
     </View>
   );
 }
 
 function ActivityScreen(props: { url: () => string | null }) {
-  const steps = resource(props.url, (url) => Nisse.steps(url));
-  keepFresh(steps.refetch);
+  const steps = freshRead(props.url, (url) => Nisse.steps(url));
   const tone = (status: string) => (status === "failed" ? RED : status === "started" ? AMBER : INK);
   return (
     <View style={{ gap: 16 }}>
       <If when={!props.url()}>
         <NotConnected />
       </If>
-      <If when={steps.error()}>
-        <CannotConfirm what="what the engine last did" error={steps.error()} />
+      <If when={steps.problem()}>
+        <CannotConfirm what="what the engine last did" error={steps.problem()} />
       </If>
-      <If when={!steps.error() && steps()}>
+      <If when={steps.value()}>
         <Card title="ENGINE STEPS, NEWEST FIRST">
-          <If when={(steps() ?? []).length === 0}>
+          <If when={(steps.value() ?? []).length === 0}>
             <Line color={MUTED}>None yet.</Line>
           </If>
-          <Each of={steps() ?? []}>
+          <Each of={steps.value() ?? []}>
             {(step) => (
-              <Line color={tone(step().status)}>{`${step().runKey}  ${step().step}: ${step().status}`}</Line>
+              <Line color={tone(step().status)}>
+                {`${step().runKey}  ${step().step}: ${step().status}, ${ago(step().ageSeconds)}`}
+              </Line>
             )}
           </Each>
         </Card>
       </If>
-      <Line color={MUTED}>A cancel made because of the kill switch shows as "kill  cancel: done".</Line>
+      <Line color={MUTED}>
+        A cancel made because of the kill switch is a "kill  cancel" row. Read its age: an old row is an old cancel.
+      </Line>
+      <Button title="Refresh" onPress={steps.refetch} />
     </View>
   );
 }
@@ -328,8 +365,17 @@ function KillScreen(props: { url: () => string | null }) {
   const name = signal("");
   const armed = signal(false);
   const busy = signal(false);
-  // What the last attempt established: nothing yet, engaged (read back), or not confirmed.
-  const result = signal<{ ok: boolean; text: string } | null>(null);
+  // What the last attempt established, and when. It is taken down after `STALE_MS`: the
+  // switch can be released on the host, and this card must not go on saying "ENGAGED".
+  const result = signal<{ ok: boolean; cancelling: boolean; text: string; at: number } | null>(null);
+  const clock = signal(Date.now());
+  const tick = setInterval(() => clock.set(Date.now()), 1000);
+  cleanup(() => clearInterval(tick));
+  const current = () => {
+    const last = result();
+    return last && Math.abs(clock() - last.at) <= STALE_MS ? last : null;
+  };
+  const expired = () => result() !== null && current() === null;
 
   const engage = async () => {
     const url = props.url();
@@ -338,15 +384,36 @@ function KillScreen(props: { url: () => string | null }) {
     result.set(null);
     try {
       const row = await Nisse.engageKill(url, name());
-      result.set({
-        ok: true,
-        text:
-          `Read back from the store (row ${row}). The engine stops sending orders from its next check, ` +
-          "and its watcher cancels open orders within about a minute, at any hour. " +
-          "Look at Activity for \"kill  cancel: done\", and at Positions for open orders.",
-      });
+      // The switch is engaged and read back. Whether open orders are being cancelled depends
+      // on the watcher on the host, so say only what a fresh read shows about it.
+      let watcherAge: number | null | undefined;
+      try {
+        watcherAge = (await Nisse.status(url)).watcherAgeSeconds;
+      } catch {
+        watcherAge = undefined;
+      }
+      const engaged = `Read back from the store (row ${row}). The engine sends no new orders from its next check.`;
+      if (recent(watcherAge, WATCHER_LATE_SECONDS)) {
+        result.set({
+          ok: true,
+          cancelling: true,
+          at: Date.now(),
+          text:
+            `${engaged} The kill watcher on the host ran ${Math.round(watcherAge ?? 0)} s ago and cancels open ` +
+            "orders within about a minute. Confirm it in Activity: a new \"kill  cancel\" row.",
+        });
+      } else {
+        result.set({
+          ok: true,
+          cancelling: false,
+          at: Date.now(),
+          text:
+            `${engaged} But the kill watcher on the host has not run recently, so open orders are NOT being ` +
+            "cancelled. Cancel them at the broker now.",
+        });
+      }
     } catch (error) {
-      result.set({ ok: false, text: `NOT CONFIRMED: ${String(error)}` });
+      result.set({ ok: false, cancelling: false, at: Date.now(), text: `NOT CONFIRMED: ${String(error)}` });
     } finally {
       busy.set(false);
       armed.set(false);
@@ -385,15 +452,25 @@ function KillScreen(props: { url: () => string | null }) {
           <Button title="Cancel" disabled={busy()} onPress={() => armed.set(false)} />
         </If>
       </Card>
-      <If when={result()}>
-        <Card title={result()?.ok ? "RESULT" : "NOT CONFIRMED"}>
-          <If when={result()?.ok}>
+      <If when={current()}>
+        <Card title={current()?.ok ? "RESULT" : "NOT CONFIRMED"}>
+          <If when={current()?.ok}>
             <Line color={RED} strong>Kill switch ENGAGED</Line>
           </If>
-          <Line color={result()?.ok ? INK : RED} strong={!result()?.ok}>{result()?.text ?? ""}</Line>
-          <If when={!result()?.ok}>
+          <If when={current()?.ok && !current()?.cancelling}>
+            <Line color={RED} strong>Open orders are NOT being cancelled</Line>
+          </If>
+          <Line color={current()?.ok && current()?.cancelling ? INK : RED} strong={!current()?.ok}>
+            {current()?.text ?? ""}
+          </Line>
+          <If when={!current()?.ok || !current()?.cancelling}>
             <Line color={MUTED}>{OUT_OF_BAND}</Line>
           </If>
+        </Card>
+      </If>
+      <If when={expired()}>
+        <Card title="RESULT">
+          <Line color={MUTED}>The earlier result is no longer current. Read Status for the state now.</Line>
         </Card>
       </If>
     </View>

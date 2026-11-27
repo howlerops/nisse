@@ -57,13 +57,15 @@ fn runtime() -> tokio::runtime::Runtime {
         .unwrap()
 }
 
-/// A scratch store in which the engine wrote a heartbeat a few seconds ago.
+/// A scratch store in which the engine and the kill watcher each wrote a heartbeat a few
+/// seconds ago.
 fn store_with_a_live_engine(rt: &tokio::runtime::Runtime) -> ScratchDb {
     let db = rt.block_on(ScratchDb::create());
     let client = rt.block_on(db.client()).unwrap();
     rt.block_on(client.execute(
-        "INSERT INTO heartbeat (source, event_ts) \
-         VALUES ('engine', clock_timestamp() - interval '5 seconds')",
+        "INSERT INTO heartbeat (source, event_ts) VALUES \
+         ('engine', clock_timestamp() - interval '5 seconds'), \
+         ('kill-watch', clock_timestamp() - interval '5 seconds')",
         &[],
     ))
     .unwrap();
@@ -186,7 +188,8 @@ fn positions_and_gates_show_what_is_stored() {
     app.wait_for("SPY  3 @ 500.25").unwrap();
     assert!(!app.shows("GLD  10 @ 200"));
     // No order is open in this store (the two lists load separately).
-    app.wait_for("OPEN ORDERS").unwrap();
+    app.wait_for("OPEN ORDERS, AS THE ENGINE LAST RECORDED THEM")
+        .unwrap();
 
     app.press("Gates").unwrap();
     app.wait_for("None yet.").unwrap();
@@ -313,8 +316,66 @@ fn the_activity_screen_lists_the_engine_steps() {
     .unwrap();
     let mut app = start(Some(&as_ui_role(&db.url)), "Kill switch: off");
     app.press("Activity").unwrap();
-    app.wait_for("kill  cancel: done").unwrap();
+    app.wait_for("kill  cancel: done, just now").unwrap();
     drop(app);
     drop(client);
     rt.block_on(db.drop_db()).unwrap();
+}
+
+#[test]
+fn an_old_cancel_row_is_shown_with_its_age() {
+    let rt = runtime();
+    let db = store_with_a_live_engine(&rt);
+    let client = rt.block_on(db.client()).unwrap();
+    rt.block_on(client.execute(
+        "INSERT INTO engine_step (run_key, step, status, detail, event_ts) \
+         VALUES ('kill', 'cancel', 'done', '{}', clock_timestamp() - interval '2 days 1 hour')",
+        &[],
+    ))
+    .unwrap();
+    let mut app = start(Some(&as_ui_role(&db.url)), "Kill switch: off");
+    app.press("Activity").unwrap();
+    app.wait_for("kill  cancel: done, 2 d ago").unwrap();
+    assert!(!app.shows("kill  cancel: done, just now"));
+    drop(app);
+    drop(client);
+    rt.block_on(db.drop_db()).unwrap();
+}
+
+#[test]
+fn a_kill_without_a_running_watcher_says_orders_are_not_being_cancelled() {
+    // The engine is alive but the watcher has never run (its cron line is missing).
+    let rt = runtime();
+    let db = rt.block_on(ScratchDb::create());
+    let client = rt.block_on(db.client()).unwrap();
+    rt.block_on(client.execute(
+        "INSERT INTO heartbeat (source, event_ts) \
+         VALUES ('engine', clock_timestamp() - interval '5 seconds')",
+        &[],
+    ))
+    .unwrap();
+    let mut app = start(Some(&as_ui_role(&db.url)), "Kill watcher: never ran");
+
+    app.press("Kill").unwrap();
+    app.wait_for("Engage kill switch").unwrap();
+    app.type_text("Your name", "ana").unwrap();
+    app.press("Engage kill switch").unwrap();
+    app.press("Yes, engage now").unwrap();
+    app.wait_for("Open orders are NOT being cancelled").unwrap();
+    // The switch itself is engaged and says so.
+    assert!(app.shows("Kill switch ENGAGED"));
+
+    drop(app);
+    drop(client);
+    rt.block_on(db.drop_db()).unwrap();
+}
+
+#[test]
+fn the_heartbeat_source_is_the_engine_configs() {
+    // The module reads the heartbeat of source "engine"; the engine writes under the name in
+    // its config. If the config changes, this fails and the module must change with it.
+    let config: serde_json::Value =
+        serde_json::from_str(include_str!("../../../../config/engine/paper.json")).unwrap();
+    assert_eq!(config["source"], "engine");
+    assert!(include_str!("../src/lib.rs").contains("const HEARTBEAT_SOURCE: &str = \"engine\";"));
 }

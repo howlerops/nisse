@@ -56,9 +56,18 @@ pub struct Status {
     pub last_heartbeat: Option<UnixNanos>,
     /// Seconds since the newest heartbeat, by the database's clock; `None` with no heartbeat.
     pub heartbeat_age_seconds: Option<u64>,
+    /// Seconds since the kill watcher's newest heartbeat, by the database's clock; `None`
+    /// when it has never run. The watcher is what cancels open orders after a kill from the
+    /// phone: if it is not running, such a kill stops new orders but cancels nothing until an
+    /// engine run does.
+    pub watcher_age_seconds: Option<u64>,
     pub rebalance_owed: bool,
     pub limits_hash: Option<String>,
 }
+
+/// The heartbeat source of the kill watcher. The same text as `WATCH_SOURCE` in
+/// `crates/app/src/kill_watch.rs` (a test checks that file still has it).
+pub const WATCH_SOURCE: &str = "kill-watch";
 
 /// The risk state, the newest heartbeat of `source`, whether a rebalance is owed, and the
 /// newest limits hash, as the Status screen shows them.
@@ -76,6 +85,7 @@ pub async fn status<C: GenericClient>(client: &C, source: &str) -> Result<Status
         equity_peak: risk.drawdown.peak,
         last_heartbeat,
         heartbeat_age_seconds,
+        watcher_age_seconds: heartbeat_age(client, WATCH_SOURCE).await?,
         rebalance_owed,
         limits_hash: risk_event::latest_limits_hash(client).await?,
     })
@@ -241,6 +251,8 @@ pub struct Step {
     pub status: String,
     pub detail: Value,
     pub ts: UnixNanos,
+    /// Seconds since the row's time, by the database's clock (zero for a row in the future).
+    pub age_seconds: u64,
 }
 
 /// The newest `limit` rows of `engine_step`, newest first. `limit` is clamped to 1..=200.
@@ -248,8 +260,9 @@ pub async fn recent_steps<C: GenericClient>(client: &C, limit: u32) -> Result<Ve
     let limit = i64::from(limit.clamp(1, MAX_STEPS));
     let rows = client
         .query(
-            "SELECT run_key, step, status, detail, event_ts FROM engine_step \
-             ORDER BY id DESC LIMIT $1",
+            "SELECT run_key, step, status, detail, event_ts, \
+                    greatest(extract(epoch FROM (clock_timestamp() - event_ts)), 0)::float8 AS age \
+             FROM engine_step ORDER BY id DESC LIMIT $1",
             &[&limit],
         )
         .await?;
@@ -262,6 +275,8 @@ pub async fn recent_steps<C: GenericClient>(client: &C, limit: u32) -> Result<Ve
             status: row.try_get("status")?,
             detail: row.try_get("detail")?,
             ts: to_unix_nanos(event_ts)?,
+            // Non-negative by the query; whole seconds of any real age fit a u64.
+            age_seconds: row.try_get::<_, f64>("age")?.floor() as u64,
         });
     }
     Ok(steps)
