@@ -18,7 +18,10 @@ use nisse_app::{
     AppError,
     commands::{Command, USAGE, describe_kill_watch, engage_kill_switch},
     config::EngineConfig,
-    kill_watch::{KILL_CANCEL_STEP, KILL_RUN_KEY, KillEnforcement, enforce_kill, flatten_on_kill},
+    kill_watch::{
+        KILL_CANCEL_STEP, KILL_RUN_KEY, KillEnforcement, WATCH_SOURCE, enforce_kill,
+        flatten_on_kill, watch_once,
+    },
     session::session_close,
 };
 use nisse_core::nautilus::{
@@ -111,10 +114,11 @@ fn resting_sell(id: &str) -> OrderIntent {
     }
 }
 
-/// The simulated broker, counting the calls to `open_orders`.
+/// The simulated broker, counting the calls to `open_orders`, which fail when `list_fails`.
 struct Counting<'a> {
     sim: &'a SimBroker,
     opens: AtomicUsize,
+    list_fails: bool,
 }
 
 impl Broker for Counting<'_> {
@@ -149,6 +153,9 @@ impl Broker for Counting<'_> {
 
     async fn open_orders(&self) -> Result<OpenOrders, SimError> {
         self.opens.fetch_add(1, Ordering::SeqCst);
+        if self.list_fails {
+            return Err(SimError("the broker could not list its orders".to_owned()));
+        }
         self.sim.open_orders().await
     }
 
@@ -222,6 +229,7 @@ async fn switch_off_does_not_ask_the_broker() {
     let counting = Counting {
         sim: &sim,
         opens: AtomicUsize::new(0),
+        list_fails: false,
     };
 
     let outcome = enforce_kill(&f.store, &counting, false, now())
@@ -373,7 +381,7 @@ async fn flatten_mode_tries_every_buy_when_one_cancel_is_refused() {
         .await
         .unwrap();
 
-    let err = enforce_kill(
+    let outcome = enforce_kill(
         &f.store,
         &RefusesOne {
             sim: &sim,
@@ -383,12 +391,19 @@ async fn flatten_mode_tries_every_buy_when_one_cancel_is_refused() {
         now(),
     )
     .await
-    .unwrap_err();
+    .unwrap();
 
-    assert!(
-        matches!(err, AppError::Engine(EngineError::Broker(_))),
-        "{err:?}"
-    );
+    // A switch that flattens goes on (the rebalance that follows has the exits to send); the
+    // buy that could not be cancelled is on record.
+    assert!(outcome.cancelled, "{outcome:?}");
+    let (status, detail) = f
+        .store
+        .step_status(KILL_RUN_KEY, KILL_CANCEL_STEP)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status, StepStatus::Failed);
+    assert!(detail["error"].is_string(), "{detail}");
     // Every other buy was cancelled: only the refused one is left.
     let left = sim.open_orders().await.unwrap().orders;
     assert_eq!(left.len(), 1, "of {buys}: {left:?}");
@@ -504,4 +519,144 @@ fn describe_kill_watch_lines() {
         line(true, 2, false),
         "kill-watch: switch ENGAGED; 2 open orders, none cancelled (exits left)"
     );
+}
+
+/// The number of heartbeats the watcher has written.
+async fn watch_beats(store: &Store) -> i64 {
+    store
+        .client()
+        .query_one(
+            "SELECT count(*) FROM heartbeat WHERE source = $1",
+            &[&WATCH_SOURCE],
+        )
+        .await
+        .unwrap()
+        .get(0)
+}
+
+#[tokio::test]
+async fn a_halting_switch_cancels_blind_when_the_broker_cannot_list_orders() {
+    let f = fixture().await;
+    let sim = broker();
+    month_end_orders_resting(&f, &sim).await;
+    engage_kill_switch(&f.store, &ManualClock::new(now()), "phone")
+        .await
+        .unwrap();
+    let no_list = Counting {
+        sim: &sim,
+        opens: AtomicUsize::new(0),
+        list_fails: true,
+    };
+
+    let outcome = enforce_kill(&f.store, &no_list, false, now())
+        .await
+        .unwrap();
+
+    assert!(outcome.engaged && outcome.cancelled, "{outcome:?}");
+    assert!(sim.open_orders().await.unwrap().orders.is_empty());
+    let (status, detail) = f
+        .store
+        .step_status(KILL_RUN_KEY, KILL_CANCEL_STEP)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status, StepStatus::Done);
+    assert!(detail["listing_failed"].is_string(), "{detail}");
+
+    f.db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_flattening_switch_that_cannot_list_orders_fails_and_says_so() {
+    let f = fixture().await;
+    let sim = broker();
+    month_end_orders_resting(&f, &sim).await;
+    let resting = sim.open_orders().await.unwrap().orders.len();
+    engage_kill_switch(&f.store, &ManualClock::new(now()), "phone")
+        .await
+        .unwrap();
+    let no_list = Counting {
+        sim: &sim,
+        opens: AtomicUsize::new(0),
+        list_fails: true,
+    };
+
+    let err = enforce_kill(&f.store, &no_list, true, now())
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, AppError::Engine(EngineError::Broker(_))),
+        "{err:?}"
+    );
+    // Nothing was cancelled blind: the exits must not be cancelled.
+    assert_eq!(sim.open_orders().await.unwrap().orders.len(), resting);
+    let (status, _) = f
+        .store
+        .step_status(KILL_RUN_KEY, KILL_CANCEL_STEP)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status, StepStatus::Failed);
+
+    f.db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_watcher_leaves_a_heartbeat_when_it_did_its_job() {
+    let f = fixture().await;
+    let sim = broker();
+
+    // Switch off, with and without a broker client: nothing to do, and that is recorded.
+    watch_once(&f.store, Some(&sim), false, now())
+        .await
+        .unwrap();
+    watch_once(&f.store, None::<&SimBroker>, false, now())
+        .await
+        .unwrap();
+    assert_eq!(watch_beats(&f.store).await, 2);
+
+    // Engaged with orders resting: cancelled, and a heartbeat.
+    month_end_orders_resting(&f, &sim).await;
+    engage_kill_switch(&f.store, &ManualClock::new(now()), "phone")
+        .await
+        .unwrap();
+    let outcome = watch_once(&f.store, Some(&sim), false, now())
+        .await
+        .unwrap();
+    assert!(outcome.cancelled, "{outcome:?}");
+    assert_eq!(watch_beats(&f.store).await, 3);
+
+    f.db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_watcher_that_cannot_enforce_an_engaged_switch_leaves_no_heartbeat() {
+    let f = fixture().await;
+    let sim = broker();
+    month_end_orders_resting(&f, &sim).await;
+    engage_kill_switch(&f.store, &ManualClock::new(now()), "phone")
+        .await
+        .unwrap();
+
+    // No broker client (missing keys).
+    let err = watch_once(&f.store, None::<&SimBroker>, false, now())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AppError::KillNotEnforced(_)), "{err:?}");
+    // The cancel is refused.
+    watch_once(&f.store, Some(&CancelFails(&sim)), false, now())
+        .await
+        .unwrap_err();
+
+    assert_eq!(watch_beats(&f.store).await, 0);
+    let (status, _) = f
+        .store
+        .step_status(KILL_RUN_KEY, KILL_CANCEL_STEP)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status, StepStatus::Failed);
+
+    f.db.drop_db().await.unwrap();
 }

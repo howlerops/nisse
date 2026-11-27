@@ -35,12 +35,12 @@ use nisse_app::{
     commands::{self, Command, USAGE},
     config::EngineConfig,
     deployment::{Deployment, ENV_SIGNING_KEY, verify_deployment},
-    kill_watch::{KillEnforcement, enforce_kill, flatten_on_kill},
+    kill_watch::{flatten_on_kill, watch_once},
     market::AlpacaMarket,
     restore::wait_for_engine_lock,
     session::{session_close, tick},
 };
-use nisse_core::{Clock, KillSwitchSource, SystemClock};
+use nisse_core::{Clock, SystemClock};
 use nisse_store::{Store, StoreError, StoreWriter, WriterConfig};
 
 /// The HTTP timeout of every Alpaca request.
@@ -223,35 +223,16 @@ async fn run_kill_watch(config_path: &std::path::Path) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // An unreadable switch counts as engaged, as `enforce_kill` treats it.
-    let engaged = match store.kill_switch_engaged().await {
-        Ok(engaged) => engaged,
-        Err(err) => {
-            eprintln!("nisse-engine: kill-watch: switch unreadable, treating it as engaged: {err}");
-            true
-        }
-    };
-    if !engaged {
-        println!(
-            "{}",
-            commands::describe_kill_watch(&KillEnforcement {
-                engaged: false,
-                open_orders: 0,
-                cancelled: false,
-            })
-        );
-        return ExitCode::SUCCESS;
-    }
+    // The broker client is only needed when the switch is engaged; missing keys are not an
+    // error while it is off. `watch_once` records the failure when they are needed and absent.
     let trading = match alpaca_http() {
-        Ok(http) => AlpacaTrading::new(http, &AlpacaConfig::paper(nisse_alpaca_adapter::Feed::Iex)),
-        Err(err) => {
-            eprintln!(
-                "nisse-engine: kill-watch: no broker client, open orders NOT cancelled: {err}"
-            );
-            return ExitCode::FAILURE;
-        }
+        Ok(http) => Some(AlpacaTrading::new(
+            http,
+            &AlpacaConfig::paper(nisse_alpaca_adapter::Feed::Iex),
+        )),
+        Err(_) => None,
     };
-    match enforce_kill(&store, &trading, flatten, SystemClock.now()).await {
+    match watch_once(&store, trading.as_ref(), flatten, SystemClock.now()).await {
         Ok(outcome) => {
             println!("{}", commands::describe_kill_watch(&outcome));
             ExitCode::SUCCESS

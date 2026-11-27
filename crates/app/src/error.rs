@@ -9,6 +9,9 @@ pub enum AppError {
     /// is missing, does not verify, or is for a different deployment or stage.
     #[error("unsigned deployment: {0}")]
     Unsigned(String),
+    /// The kill switch is engaged and could not be enforced (no broker client).
+    #[error("kill switch not enforced: {0}")]
+    KillNotEnforced(String),
     /// Another engine process holds the database lock. Nothing was done.
     #[error("another engine process is running")]
     Busy,
