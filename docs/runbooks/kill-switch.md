@@ -18,8 +18,22 @@ The flag is stored as `kill_switch` rows in the append-only `risk_event` table; 
 row wins. If the engine cannot read the flag, it treats it as engaged. Releasing it is a new
 row written by a person. Nothing in the engine releases it.
 
-The engine process that polls the flag, and the phone UI that sets it, are later phases
-(6 and 8). Until they exist, use the out-of-band steps below.
+On the engine host (Phase 6):
+
+```
+nisse-engine kill config/engine/paper.json --by <your name>
+nisse-engine release-kill config/engine/paper.json --by <your name>
+nisse-engine status config/engine/paper.json
+```
+
+`kill` writes the flag, asks the broker to cancel every open order, then waits up to a minute
+for any engine run in flight to end and cancels once more. It does not need the engine's
+state to be readable. If it reports that a run was still in flight, run it again. Every
+engine run reads the flag when it starts. `status` shows the flag, the drawdown mode,
+positions and the last heartbeat without changing anything.
+
+The phone UI that sets the flag is Phase 8. If the host cannot be reached, use the
+out-of-band steps below.
 
 ## 2. Out of band, at Alpaca
 
