@@ -33,7 +33,7 @@ pub const EVAL_VERSION: &str = "gate-v1";
 const GATE_RULES: i64 = nisse_risk::rule::ALL.len() as i64;
 
 /// The fewest holdout sessions a holdout run may be judged on.
-const MIN_HOLDOUT_SESSIONS: usize = 20;
+pub const MIN_HOLDOUT_SESSIONS: u64 = 60;
 
 /// The verdict on one gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,10 +159,13 @@ impl TrialSeries {
         if self.dirty_build != Some(false) {
             return Err("dirty build, or the build state is not recorded");
         }
-        let boundary = gates.holdout_start.format("%Y-%m-%d").to_string();
+        let boundary = gates.holdout_start_text();
         if self.holdout_start.as_deref() != Some(boundary.as_str()) {
             return Err("run under a different holdout boundary, or none recorded");
         }
+        let Some(start) = gates.holdout_boundary() else {
+            return Err("the holdout boundary is out of range");
+        };
         if self.holdout {
             return if self.data_end.is_some() {
                 Ok(())
@@ -170,21 +173,11 @@ impl TrialSeries {
                 Err(DATA_END)
             };
         }
-        match (self.data_end, boundary_nanos(gates)) {
-            (Some(end), Some(start)) if end < start => Ok(()),
+        match self.data_end {
+            Some(end) if end < start.as_u64() => Ok(()),
             _ => Err(DATA_END),
         }
     }
-}
-
-/// The holdout boundary, 00:00:00 UTC on `holdout_start`, in nanoseconds.
-fn boundary_nanos(gates: &Gates) -> Option<u64> {
-    let nanos = gates
-        .holdout_start
-        .and_hms_opt(0, 0, 0)?
-        .and_utc()
-        .timestamp_nanos_opt()?;
-    u64::try_from(nanos).ok()
 }
 
 /// The returns array when the result says it is complete and every element is a number.
@@ -377,13 +370,45 @@ fn candidate(inputs: &ReportInputs) -> Option<&TrialSeries> {
         .max_by_key(|t| t.trial_id)
 }
 
-/// The newest holdout run of the version, whether or not it is usable.
-fn newest_holdout(inputs: &ReportInputs) -> Option<&TrialSeries> {
+/// The holdout run judged for `candidate`: the version's oldest holdout run whose costs and
+/// symbols equal the candidate's. The first look counts; a later one cannot rescue it. `None`
+/// when either of the candidate's values is null (nothing to match on).
+fn judged_holdout_run<'a>(
+    inputs: &'a ReportInputs,
+    candidate: &TrialSeries,
+) -> Option<&'a TrialSeries> {
+    if candidate.costs.is_null() || candidate.symbols.is_null() {
+        return None;
+    }
+    inputs
+        .trials
+        .iter()
+        .filter(|t| {
+            t.holdout
+                && t.strategy_version_id == inputs.version
+                && t.costs == candidate.costs
+                && t.symbols == candidate.symbols
+        })
+        .min_by_key(|t| t.trial_id)
+}
+
+/// The number of holdout trials the version has, whatever their costs.
+fn holdout_runs_for_version(inputs: &ReportInputs) -> usize {
     inputs
         .trials
         .iter()
         .filter(|t| t.holdout && t.strategy_version_id == inputs.version)
-        .max_by_key(|t| t.trial_id)
+        .count()
+}
+
+/// The candidate's returns from its first non-zero return on. The flat warm-up before the first
+/// trade would understate its Sharpe ratio.
+fn active_returns(returns: &[f64]) -> &[f64] {
+    let start = returns
+        .iter()
+        .position(|r| *r != 0.0)
+        .unwrap_or(returns.len());
+    returns.get(start..).unwrap_or_default()
 }
 
 /// A verdict with a value, judged by `pass`.
@@ -436,18 +461,22 @@ fn usable_returns<'a>(candidate: &'a TrialSeries, gates: &Gates) -> Result<&'a [
         .ok_or_else(|| cannot_use("no complete return series"))
 }
 
-/// The last `holdout_sessions` returns of a holdout run. `None` when the run has no returns, no
-/// recorded session count, fewer than [`MIN_HOLDOUT_SESSIONS`], or more than it has returns.
-fn holdout_tail(run: &TrialSeries) -> Option<&[f64]> {
-    let returns = run.returns.as_deref()?;
-    let sessions = usize::try_from(run.holdout_sessions?).ok()?;
-    if sessions < MIN_HOLDOUT_SESSIONS {
-        return None;
-    }
+/// The last `holdout_sessions` returns of a holdout run. An error (the note) when the run has no
+/// returns, no recorded session count or fewer than [`MIN_HOLDOUT_SESSIONS`], or more sessions
+/// than returns.
+fn holdout_tail(run: &TrialSeries) -> Result<&[f64], String> {
+    let too_few = || format!("fewer than {MIN_HOLDOUT_SESSIONS} holdout sessions");
+    let returns = run.returns.as_deref().ok_or_else(too_few)?;
+    let sessions = run
+        .holdout_sessions
+        .filter(|sessions| *sessions >= MIN_HOLDOUT_SESSIONS)
+        .ok_or_else(too_few)?;
+    let sessions = usize::try_from(sessions).map_err(|_| too_few())?;
     returns
         .len()
         .checked_sub(sessions)
         .and_then(|start| returns.get(start..))
+        .ok_or_else(|| "more holdout sessions than the holdout run has returns".to_owned())
 }
 
 fn trial_budget(inputs: &ReportInputs) -> GateResult {
@@ -638,20 +667,6 @@ fn holdout_gate(inputs: &ReportInputs) -> GateResult {
             format!("{looks} holdout runs exceed the {max_looks} allowed; the holdout is retired"),
         );
     }
-    let Some(run) = newest_holdout(inputs) else {
-        return undecided(NAME, None, None, "no holdout run for this version yet");
-    };
-    if let Err(reason) = run.usable(gates) {
-        return undecided(
-            NAME,
-            None,
-            None,
-            &format!("the holdout run cannot be used: {reason}"),
-        );
-    }
-    let Some(tail) = holdout_tail(run) else {
-        return undecided(NAME, None, None, "fewer than 20 holdout sessions");
-    };
     let ppy = gates.periods_per_year;
     let Some(candidate) = candidate(inputs) else {
         return undecided(
@@ -661,16 +676,54 @@ fn holdout_gate(inputs: &ReportInputs) -> GateResult {
             "no backtest trial of this version has a stored result yet",
         );
     };
-    let candidate_returns = match usable_returns(candidate, gates) {
-        Ok(returns) => returns,
-        Err(note) => return undecided(NAME, None, None, &note),
-    };
-    let Some(candidate_sharpe) = moments::sharpe(candidate_returns) else {
+    let Some(run) = judged_holdout_run(inputs, candidate) else {
         return undecided(
             NAME,
             None,
             None,
-            "the candidate's Sharpe ratio is undefined",
+            "no holdout run with the candidate's costs and symbols",
+        );
+    };
+    if candidate.trial_id > run.trial_id {
+        return undecided(
+            NAME,
+            None,
+            None,
+            "the candidate was registered after the holdout was looked at",
+        );
+    }
+    if let Err(reason) = run.usable(gates) {
+        return undecided(
+            NAME,
+            None,
+            None,
+            &format!("the holdout run cannot be used: {reason}"),
+        );
+    }
+    // Before any Sharpe: a run that went flat has zero returns and no Sharpe ratio.
+    if run.final_drawdown_mode.as_deref() == Some("flat") {
+        return judged(
+            NAME,
+            false,
+            None,
+            None,
+            "the holdout run ended flat after a drawdown".to_owned(),
+        );
+    }
+    let tail = match holdout_tail(run) {
+        Ok(tail) => tail,
+        Err(note) => return undecided(NAME, None, None, &note),
+    };
+    let candidate_returns = match usable_returns(candidate, gates) {
+        Ok(returns) => returns,
+        Err(note) => return undecided(NAME, None, None, &note),
+    };
+    let Some(candidate_sharpe) = moments::sharpe(active_returns(candidate_returns)) else {
+        return undecided(
+            NAME,
+            None,
+            None,
+            "the candidate's active Sharpe ratio is undefined",
         );
     };
     let threshold =
@@ -683,15 +736,6 @@ fn holdout_gate(inputs: &ReportInputs) -> GateResult {
             "the holdout sessions have no Sharpe ratio",
         );
     };
-    if run.final_drawdown_mode.as_deref() == Some("flat") {
-        return judged(
-            NAME,
-            false,
-            Some(value),
-            Some(threshold),
-            "the holdout run ended flat after a drawdown".to_owned(),
-        );
-    }
     judged(
         NAME,
         value >= threshold,
@@ -810,6 +854,10 @@ fn info(inputs: &ReportInputs, candidate: Option<&TrialSeries>) -> Value {
         .and_then(moments::sharpe)
         .map(|s| moments::annualise(s, ppy));
     let haircut = sharpe.map(|s| ((1.0 - gates.sharpe_haircut) * s).max(0.0));
+    let active_sharpe = returns
+        .map(active_returns)
+        .and_then(moments::sharpe)
+        .map(|s| moments::annualise(s, ppy));
     let sharpe_interval =
         returns.and_then(|r| bootstrap::interval(r, annualised(moments::sharpe, ppy), &config));
     let sortino_interval =
@@ -831,11 +879,12 @@ fn info(inputs: &ReportInputs, candidate: Option<&TrialSeries>) -> Value {
         "fold_sharpes": returns.map_or(Value::Null, |r| fold_sharpes(r, gates)),
         "haircut_sharpe": finite(haircut),
         "haircut_sharpe_note": "the limits file's haircut_sharpe may not exceed this",
+        "active_sharpe": finite(active_sharpe),
         "lifetime_trials": inputs.lifetime_trials,
         "trial_budget": gates.trial_budget,
         "candidate_trial_id": candidate.map(|t| t.trial_id),
         "candidate_run": candidate_run(inputs, candidate),
-        "holdout_run": holdout_run(inputs),
+        "holdout_run": holdout_run(inputs, candidate),
     })
 }
 
@@ -857,12 +906,15 @@ fn candidate_run(inputs: &ReportInputs, candidate: Option<&TrialSeries>) -> Valu
     })
 }
 
-/// The newest holdout run of the version: its annualised Sharpe over the holdout sessions (the
-/// figure the holdout gate judges). Null without a holdout run.
-fn holdout_run(inputs: &ReportInputs) -> Value {
+/// The holdout run the holdout gate judges: its annualised Sharpe over the holdout sessions (the
+/// figure the gate compares), its costs and symbols, and how many holdout runs the version has
+/// in all. Null without a candidate or without a holdout run matching its costs and symbols.
+fn holdout_run(inputs: &ReportInputs, candidate: Option<&TrialSeries>) -> Value {
     let ppy = inputs.gates.periods_per_year;
-    newest_holdout(inputs).map_or(Value::Null, |run| {
+    let picked = candidate.and_then(|c| judged_holdout_run(inputs, c));
+    picked.map_or(Value::Null, |run| {
         let sharpe = holdout_tail(run)
+            .ok()
             .and_then(moments::sharpe)
             .map(|s| moments::annualise(s, ppy));
         json!({
@@ -870,6 +922,9 @@ fn holdout_run(inputs: &ReportInputs) -> Value {
             "holdout_sessions": run.holdout_sessions,
             "final_drawdown_mode": run.final_drawdown_mode,
             "sharpe": finite(sharpe),
+            "costs": run.costs,
+            "symbols": run.symbols,
+            "holdout_runs_for_version": holdout_runs_for_version(inputs),
         })
     })
 }

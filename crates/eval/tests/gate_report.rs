@@ -63,9 +63,20 @@ fn alternatives(n: usize) -> Vec<Vec<f64>> {
         .collect()
 }
 
+/// The cost model "A" every trial of the default helpers runs under.
+fn costs_a() -> Value {
+    json!({"slippage_bps": "2"})
+}
+
+/// A different cost model, "B": zero slippage.
+fn costs_b() -> Value {
+    json!({"slippage_bps": "0"})
+}
+
 /// A usable backtest trial over the snapshot "snap" and the range 0..1000: a clean build, the
-/// file's holdout boundary, an ordinary run ending the day before it (or a holdout run with its
-/// end recorded). A holdout run's sessions are all of its returns.
+/// file's holdout boundary, costs A and symbols SPY, an ordinary run ending the day before the
+/// boundary (or a holdout run with its end recorded). A holdout run's sessions are all of its
+/// returns.
 fn series(trial_id: i64, version: i64, holdout: bool, returns: Vec<f64>) -> TrialSeries {
     let sessions = returns.len() as u64;
     TrialSeries {
@@ -86,8 +97,8 @@ fn series(trial_id: i64, version: i64, holdout: bool, returns: Vec<f64>) -> Tria
         }),
         holdout_sessions: holdout.then_some(sessions),
         final_drawdown_mode: Some("normal".to_owned()),
-        costs: Value::Null,
-        symbols: Value::Null,
+        costs: costs_a(),
+        symbols: json!(["SPY"]),
     }
 }
 
@@ -653,6 +664,14 @@ fn annualised_sharpe(returns: &[f64]) -> f64 {
     moments::annualise(moments::sharpe(returns).unwrap(), gates().periods_per_year)
 }
 
+/// `gates.json` with another `holdout_start`.
+fn gates_starting(text: &str) -> Gates {
+    let mut json: Value =
+        serde_json::from_str(include_str!("../../../config/eval/gates.json")).unwrap();
+    json["holdout_start"] = json!(text);
+    Gates::from_json(&json).unwrap()
+}
+
 #[test]
 fn holdout_runs_are_never_the_candidate_nor_in_the_statistics() {
     let cand = drift(500, 0.001, 0.010);
@@ -729,7 +748,10 @@ fn holdout_branches_are_judged_in_order() {
     // 2. No holdout run of this version.
     let none = holdout_gate_of(base.clone(), 0);
     assert_eq!(none.status, GateStatus::NotEvaluated);
-    assert_eq!(none.note, "no holdout run for this version yet");
+    assert_eq!(
+        none.note,
+        "no holdout run with the candidate's costs and symbols"
+    );
 
     // 3. A holdout run that cannot be used.
     let unusable = TrialSeries {
@@ -745,8 +767,8 @@ fn holdout_branches_are_judged_in_order() {
         gate.note
     );
 
-    // 4. Fewer than 20 sessions, none recorded, or more than the run has.
-    for sessions in [Some(19), None, Some(501)] {
+    // 4. Fewer than 60 sessions or none recorded; or more than the run has.
+    for sessions in [Some(59), None] {
         let gate = holdout_gate_of(
             base.iter()
                 .cloned()
@@ -755,8 +777,20 @@ fn holdout_branches_are_judged_in_order() {
             0,
         );
         assert_eq!(gate.status, GateStatus::NotEvaluated, "{sessions:?}");
-        assert_eq!(gate.note, "fewer than 20 holdout sessions", "{sessions:?}");
+        assert_eq!(gate.note, "fewer than 60 holdout sessions", "{sessions:?}");
     }
+    let too_many = holdout_gate_of(
+        base.iter()
+            .cloned()
+            .chain([holdout_trial(2, 1, cand.clone(), Some(501))])
+            .collect(),
+        0,
+    );
+    assert_eq!(too_many.status, GateStatus::NotEvaluated);
+    assert_eq!(
+        too_many.note,
+        "more holdout sessions than the holdout run has returns"
+    );
 
     // 5. Ended flat after a drawdown: a fail, even with a good Sharpe.
     let flat = TrialSeries {
@@ -775,8 +809,8 @@ fn holdout_branches_are_judged_in_order() {
     assert_eq!(gate.value, Some(annualised_sharpe(&weak_returns[440..])));
     assert_eq!(gate.threshold, Some(haircut));
 
-    // 7. At or above the haircut Sharpe: a pass, on the last 60 sessions (or the last 20).
-    for sessions in [60, 20] {
+    // 7. At or above the haircut Sharpe: a pass, on the last 60 sessions.
+    for sessions in [60, 100] {
         let gate = holdout_gate_of(
             base.iter()
                 .cloned()
@@ -805,6 +839,196 @@ fn the_holdout_is_judged_on_its_last_sessions_only() {
     let gate = holdout_gate_of(trials, 0);
     assert_eq!(gate.status, GateStatus::Pass);
     assert_eq!(gate.value, Some(annualised_sharpe(&returns[440..])));
+}
+
+#[test]
+fn the_first_matching_look_is_judged_and_a_later_one_cannot_rescue_it() {
+    let cand = drift(500, 0.01, 0.010);
+    let weak = drift(500, 0.0, 0.010);
+    let base = series(1, 1, false, cand.clone());
+    let first_a = holdout_trial(2, 1, weak.clone(), Some(60));
+
+    // A later look under costs B (zero slippage) clears the bar; it is not the look judged.
+    let later_b = TrialSeries {
+        costs: costs_b(),
+        ..holdout_trial(3, 1, cand.clone(), Some(60))
+    };
+    let gate = holdout_gate_of(vec![base.clone(), first_a.clone(), later_b], 0);
+    assert_eq!(gate.status, GateStatus::Fail, "{}", gate.note);
+    assert_eq!(gate.value, Some(annualised_sharpe(&weak[440..])));
+
+    // A later look under costs A, which clears the bar, is not judged either.
+    let later_a = holdout_trial(3, 1, cand, Some(60));
+    let gate = holdout_gate_of(vec![base, first_a, later_a], 0);
+    assert_eq!(gate.status, GateStatus::Fail, "{}", gate.note);
+    assert_eq!(gate.value, Some(annualised_sharpe(&weak[440..])));
+}
+
+#[test]
+fn a_holdout_run_with_other_symbols_is_ignored() {
+    let cand = drift(500, 0.01, 0.010);
+    let base = series(1, 1, false, cand.clone());
+    let other_symbols = TrialSeries {
+        symbols: json!(["QQQ"]),
+        ..holdout_trial(2, 1, cand, Some(60))
+    };
+    let gate = holdout_gate_of(vec![base.clone(), other_symbols.clone()], 0);
+    assert_eq!(gate.status, GateStatus::NotEvaluated);
+    assert_eq!(
+        gate.note,
+        "no holdout run with the candidate's costs and symbols"
+    );
+
+    // Judged only against the matching run, even when the other one is older.
+    let weak = drift(500, 0.0, 0.010);
+    let matching = holdout_trial(3, 1, weak.clone(), Some(60));
+    let gate = holdout_gate_of(vec![base, other_symbols, matching], 0);
+    assert_eq!(gate.status, GateStatus::Fail, "{}", gate.note);
+    assert_eq!(gate.value, Some(annualised_sharpe(&weak[440..])));
+}
+
+#[test]
+fn a_candidate_registered_after_the_holdout_look_is_not_evaluated() {
+    let cand = drift(500, 0.01, 0.010);
+    let trials = vec![
+        holdout_trial(1, 1, cand.clone(), Some(60)),
+        series(2, 1, false, cand),
+    ];
+    let gate = holdout_gate_of(trials, 0);
+    assert_eq!(gate.status, GateStatus::NotEvaluated);
+    assert_eq!(
+        gate.note,
+        "the candidate was registered after the holdout was looked at"
+    );
+}
+
+#[test]
+fn a_flat_holdout_run_with_zero_returns_fails() {
+    let cand = drift(500, 0.01, 0.010);
+    let base = series(1, 1, false, cand);
+    for sessions in [Some(60), None] {
+        let flat = TrialSeries {
+            final_drawdown_mode: Some("flat".to_owned()),
+            ..holdout_trial(2, 1, vec![0.0; 500], sessions)
+        };
+        let gate = holdout_gate_of(vec![base.clone(), flat], 0);
+        assert_eq!(gate.status, GateStatus::Fail, "{sessions:?}: {}", gate.note);
+        assert!(gate.note.contains("ended flat"), "{}", gate.note);
+    }
+}
+
+#[test]
+fn the_holdout_needs_sixty_sessions_exactly() {
+    let cand = drift(500, 0.01, 0.010);
+    let base = series(1, 1, false, cand.clone());
+    let run = |sessions| {
+        holdout_gate_of(
+            vec![
+                base.clone(),
+                holdout_trial(2, 1, cand.clone(), Some(sessions)),
+            ],
+            0,
+        )
+    };
+    assert_eq!(run(59).status, GateStatus::NotEvaluated);
+    assert_eq!(run(60).status, GateStatus::Pass);
+}
+
+#[test]
+fn the_threshold_ignores_the_flat_warm_up() {
+    let ppy = gates().periods_per_year;
+    let strong = drift(250, 0.01, 0.010);
+    // Two hundred and fifty flat sessions before the first trade, then the strong returns.
+    let mut warm = vec![0.0; 250];
+    warm.extend_from_slice(&strong);
+
+    let active = moments::annualise(moments::sharpe(&strong).unwrap(), ppy);
+    let full = moments::annualise(moments::sharpe(&warm).unwrap(), ppy);
+    let expected = (1.0 - gates().sharpe_haircut) * active;
+    assert!(
+        (1.0 - gates().sharpe_haircut) * full < expected,
+        "the warm-up must lower the full-series figure"
+    );
+
+    // A holdout tail between the two haircut figures: the warm-up version would pass it, the
+    // active one must not.
+    let tail = drift(60, 0.004, 0.010);
+    let tail_sharpe = annualised_sharpe(&tail);
+    assert!(
+        (1.0 - gates().sharpe_haircut) * full < tail_sharpe && tail_sharpe < expected,
+        "{tail_sharpe} not between {} and {expected}",
+        (1.0 - gates().sharpe_haircut) * full
+    );
+
+    let trials = vec![
+        series(1, 1, false, warm),
+        holdout_trial(2, 1, tail, Some(60)),
+    ];
+    let gate = holdout_gate_of(trials, 0);
+    assert_eq!(gate.status, GateStatus::Fail, "{}", gate.note);
+    let threshold = gate.threshold.unwrap();
+    assert!(
+        (threshold - expected).abs() < 1e-12,
+        "{threshold} vs {expected}"
+    );
+}
+
+#[test]
+fn a_candidate_with_no_active_return_is_not_evaluated() {
+    let base = series(1, 1, false, vec![0.0; 500]);
+    let holdout = holdout_trial(2, 1, drift(500, 0.01, 0.010), Some(60));
+    let gate = holdout_gate_of(vec![base, holdout], 0);
+    assert_eq!(gate.status, GateStatus::NotEvaluated);
+    assert_eq!(
+        gate.note,
+        "the candidate's active Sharpe ratio is undefined"
+    );
+}
+
+#[test]
+fn info_reports_the_active_sharpe_and_the_judged_holdout_run() {
+    let ppy = gates().periods_per_year;
+    let strong = drift(250, 0.01, 0.010);
+    let mut warm = vec![0.0; 250];
+    warm.extend_from_slice(&strong);
+    let trials = vec![
+        series(1, 1, false, warm.clone()),
+        holdout_trial(2, 1, drift(60, 0.01, 0.010), Some(60)),
+        TrialSeries {
+            costs: costs_b(),
+            ..holdout_trial(3, 1, drift(60, 0.01, 0.010), Some(60))
+        },
+    ];
+    let report = build_report(&inputs(1, trials, 3));
+    let info = &report.info;
+    let active = moments::annualise(moments::sharpe(&strong).unwrap(), ppy);
+    let full = moments::annualise(moments::sharpe(&warm).unwrap(), ppy);
+    assert!((info["active_sharpe"].as_f64().unwrap() - active).abs() < 1e-9);
+    assert!((info["sharpe"].as_f64().unwrap() - full).abs() < 1e-9);
+    // The haircut stays on the full series.
+    assert!((info["haircut_sharpe"].as_f64().unwrap() - 0.5 * full).abs() < 1e-9);
+
+    let run = &info["holdout_run"];
+    assert_eq!(run["trial_id"], json!(2));
+    assert_eq!(run["costs"], costs_a());
+    assert_eq!(run["symbols"], json!(["SPY"]));
+    assert_eq!(run["holdout_runs_for_version"], json!(2));
+
+    let none = build_report(&inputs(1, vec![series(1, 1, false, vec![0.0; 500])], 1));
+    assert!(none.info["active_sharpe"].is_null());
+}
+
+#[test]
+fn a_holdout_boundary_out_of_range_makes_the_trial_unusable() {
+    let early = gates_starting("1000-01-01");
+    let trial = TrialSeries {
+        holdout_start: Some("1000-01-01".to_owned()),
+        ..series(1, 1, false, drift(10, 0.0, 0.01))
+    };
+    assert_eq!(
+        trial.usable(&early),
+        Err("the holdout boundary is out of range")
+    );
 }
 
 // ---- replay and risk ------------------------------------------------------------------------
@@ -936,7 +1160,12 @@ fn candidate_run_and_holdout_run_carry_the_documented_keys() {
         symbols: json!(["SPY"]),
         ..series(1, 1, false, cand.clone())
     };
-    let trials = vec![candidate, holdout_trial(2, 1, cand, Some(60))];
+    let holdout = TrialSeries {
+        costs: json!({"slippage_bps": "2", "fee_per_share": "0.0001"}),
+        symbols: json!(["SPY"]),
+        ..holdout_trial(2, 1, cand, Some(60))
+    };
+    let trials = vec![candidate, holdout];
     let report = build_report(&inputs(1, trials, 2));
 
     let run = &report.info["candidate_run"];
@@ -971,12 +1200,21 @@ fn candidate_run_and_holdout_run_carry_the_documented_keys() {
         "holdout_sessions",
         "final_drawdown_mode",
         "sharpe",
+        "costs",
+        "symbols",
+        "holdout_runs_for_version",
     ] {
         assert!(holdout.get(key).is_some(), "holdout_run misses {key}");
     }
     assert_eq!(holdout["trial_id"], json!(2));
     assert_eq!(holdout["holdout_sessions"], json!(60));
     assert_eq!(holdout["final_drawdown_mode"], json!("normal"));
+    assert_eq!(
+        holdout["costs"],
+        json!({"slippage_bps": "2", "fee_per_share": "0.0001"})
+    );
+    assert_eq!(holdout["symbols"], json!(["SPY"]));
+    assert_eq!(holdout["holdout_runs_for_version"], json!(1));
 }
 
 #[test]
