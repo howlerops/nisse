@@ -520,7 +520,8 @@ async fn a_session_zero_decision_gets_three_windows_and_three_scores() {
         OutcomeReport {
             written: 3,
             quality_scores: 3,
-            waiting: 0
+            waiting: 0,
+            base_too_old: 0
         }
     );
 
@@ -594,7 +595,8 @@ async fn a_late_decision_waits_then_is_scored_from_a_later_file() {
         OutcomeReport {
             written: 2,
             quality_scores: 2,
-            waiting: 1
+            waiting: 1,
+            base_too_old: 0
         }
     );
     assert_eq!(outcome_count(&fx.client, id).await, 2);
@@ -610,7 +612,8 @@ async fn a_late_decision_waits_then_is_scored_from_a_later_file() {
         OutcomeReport {
             written: 1,
             quality_scores: 1,
-            waiting: 0
+            waiting: 0,
+            base_too_old: 0
         }
     );
     assert_eq!(outcome_count(&fx.client, id).await, 3);
@@ -648,7 +651,8 @@ async fn a_null_expected_vol_gets_windows_and_no_quality_score() {
         OutcomeReport {
             written: 3,
             quality_scores: 0,
-            waiting: 0
+            waiting: 0,
+            base_too_old: 0
         }
     );
     assert_eq!(outcome_count(&fx.client, id).await, 3);
@@ -671,7 +675,8 @@ async fn a_symbol_without_bars_waits_for_every_horizon() {
         OutcomeReport {
             written: 0,
             quality_scores: 0,
-            waiting: 3
+            waiting: 3,
+            base_too_old: 0
         }
     );
     assert_eq!(outcome_count(&fx.client, id).await, 0);
@@ -696,7 +701,8 @@ async fn a_missing_benchmark_bar_on_the_decision_day_makes_it_wait() {
         OutcomeReport {
             written: 3,
             quality_scores: 3,
-            waiting: 3
+            waiting: 3,
+            base_too_old: 0
         }
     );
     assert_eq!(outcome_count(&fx.client, on_gap).await, 0);
@@ -757,7 +763,8 @@ async fn a_crash_between_the_writes_does_not_duplicate_a_score() {
         OutcomeReport {
             written: 3,
             quality_scores: 2,
-            waiting: 0
+            waiting: 0,
+            base_too_old: 0
         }
     );
     assert_eq!(outcome_count(&fx.client, id).await, 3);
@@ -796,7 +803,8 @@ async fn every_pending_decision_is_scored_not_just_the_first_page() {
         OutcomeReport {
             written: 3_600,
             quality_scores: 3_600,
-            waiting: 0
+            waiting: 0,
+            base_too_old: 0
         }
     );
     assert_eq!(count_all(&client, "outcome_window").await, 3_600,);
@@ -804,4 +812,84 @@ async fn every_pending_decision_is_scored_not_just_the_first_page() {
     drop(client);
     drop(dir);
     db.drop_db().await.unwrap();
+}
+
+// ---- base bars too old ----------------------------------------------------------------------
+
+const HOUR: u64 = 3_600_000_000_000;
+
+/// AAA bars for `sessions` sessions except the sessions in `skip_aaa`; SPY for every session.
+fn bars_with_aaa_gaps(sessions: u64, skip_aaa: &[u64]) -> Vec<Bar> {
+    let mut bars = Vec::new();
+    for session in 0..sessions {
+        if !skip_aaa.contains(&session) {
+            bars.push(bar("AAA", aaa_point(session)));
+        }
+        bars.push(bar("SPY", spy_point(session)));
+    }
+    bars
+}
+
+#[tokio::test]
+async fn a_decision_with_a_too_old_base_bar_is_counted_apart_from_waiting() {
+    // AAA has no bars on sessions 1..=3. A decision 64 hours after session 0 has session 0 as its
+    // base bar, 64 hours old. Sessions 4.. exist, so every horizon would be scorable otherwise.
+    let fx = Fixture::new("too-old", &bars_with_aaa_gaps(SESSIONS, &[1, 2, 3])).await;
+    let too_old = seed_decision(
+        &fx.client,
+        fx.version,
+        "AAA",
+        UnixNanos::from(BASE + 64 * HOUR),
+        Some(0.16),
+    )
+    .await;
+    // The last session: its later bars do not exist yet, so it is merely waiting.
+    let late = fx.decision("AAA", SESSIONS - 1, Some(0.16)).await;
+    let reader = fx.reader();
+    let gates = gates();
+    let expected = OutcomeReport {
+        written: 0,
+        quality_scores: 0,
+        waiting: 3,
+        base_too_old: 3,
+    };
+
+    let first = score_outcomes(&fx.client, &reader, &gates, now())
+        .await
+        .unwrap();
+    assert_eq!(first, expected);
+    assert_eq!(outcome_count(&fx.client, too_old).await, 0);
+    assert!(quality_scores(&fx.client, too_old).await.is_empty());
+    assert_eq!(outcome_count(&fx.client, late).await, 0);
+
+    // Re-read each night: a second run reports the same counts and writes nothing.
+    let second = score_outcomes(&fx.client, &reader, &gates, now())
+        .await
+        .unwrap();
+    assert_eq!(second, expected);
+    assert_eq!(outcome_count(&fx.client, too_old).await, 0);
+    assert_eq!(outcome_count(&fx.client, late).await, 0);
+
+    fx.finish().await;
+}
+
+#[tokio::test]
+async fn a_decision_19h59m_after_its_bar_is_not_counted_as_too_old() {
+    // The same gap, but the decision is 19 hours 59 minutes after session 0: inside the age
+    // limit, so it is never counted as too old (the exact boundary is pinned in `outcome`).
+    let fx = Fixture::new("recent", &bars_with_aaa_gaps(SESSIONS, &[1, 2, 3])).await;
+    seed_decision(
+        &fx.client,
+        fx.version,
+        "AAA",
+        UnixNanos::from(BASE + 19 * HOUR + 59 * 60_000_000_000),
+        Some(0.16),
+    )
+    .await;
+    let report = score_outcomes(&fx.client, &fx.reader(), &gates(), now())
+        .await
+        .unwrap();
+    assert_eq!(report.base_too_old, 0);
+
+    fx.finish().await;
 }

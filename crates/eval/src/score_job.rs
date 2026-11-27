@@ -19,7 +19,7 @@ use tokio_postgres::GenericClient;
 use crate::{
     EvalError,
     gates::Gates,
-    outcome::{BarPoint, OUTCOME_HORIZONS, decision_quality, outcome},
+    outcome::{BarPoint, OUTCOME_HORIZONS, base_too_old, decision_quality, outcome},
 };
 
 /// The `eval_version` written with every score this job produces.
@@ -125,13 +125,17 @@ pub struct OutcomeReport {
     /// Decision-horizon pairs that could not be scored yet (not enough bars, or no bar for the
     /// symbol or the benchmark).
     pub waiting: u64,
+    /// Decision-horizon pairs left unscored because the decision was made 20 hours or more after
+    /// its bar; see `outcome::MAX_BASE_AGE_NANOS`. Not counted in `waiting`.
+    pub base_too_old: u64,
 }
 
 /// For each horizon in `OUTCOME_HORIZONS`: every decision still pending for it (all pages) is
 /// scored with `outcome(..)` from the bars in `bars`; those that can be computed get an
 /// `outcome_window` row and, when the decision has an `expected_vol > 0`, an `eval_score` row
 /// (`subject_type` decision, metric `decision_quality_<horizon>`, `eval_version`
-/// `EVAL_VERSION`); the rest are counted in `waiting`.
+/// `EVAL_VERSION`); the rest are counted in `waiting`, or in `base_too_old` when their base bar
+/// is too old to ever be scored from these bars.
 pub async fn score_outcomes<C: GenericClient>(
     client: &C,
     bars: &BarReader,
@@ -179,7 +183,11 @@ pub async fn score_outcomes<C: GenericClient>(
                 .get(decision.symbol.as_str())
                 .map_or(no_bars, Vec::as_slice);
             let Some(result) = outcome(symbol_bars, benchmark, decision.ts, horizon) else {
-                report.waiting += 1;
+                if base_too_old(symbol_bars, decision.ts) {
+                    report.base_too_old += 1;
+                } else {
+                    report.waiting += 1;
+                }
                 continue;
             };
             rows.push(OutcomeRow {
