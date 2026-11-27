@@ -39,6 +39,7 @@ pub const TICK_ATTEMPT_STEP: &str = "rebalance";
 
 /// The step names of a `session-close` run.
 const INGEST_STEP: &str = "ingest";
+const KILL_CANCEL_STEP: &str = "kill_cancel";
 const RECONCILE_STEP: &str = "reconcile";
 const OBSERVE_STEP: &str = "observe";
 const REBALANCE_STEP: &str = "rebalance";
@@ -59,6 +60,8 @@ pub struct TickOutcome {
     /// The rebalance this tick ran: one was owed, the market was open, orders could go out,
     /// and no tick had completed an attempt in this hour at this risk scale or a lower one.
     pub rebalance: Option<RebalanceReport>,
+    /// Open orders were cancelled because the switch was found engaged.
+    pub kill_cancelled: bool,
 }
 
 /// What the rebalance step of a `session-close` run did.
@@ -90,8 +93,9 @@ pub enum SessionCloseOutcome {
     },
 }
 
-/// Runs one `tick`: lock, restore, reconcile, observe, rebalance if the market is open and one
-/// is owed, then flush and write a heartbeat. Any error returns before the heartbeat.
+/// Runs one `tick`: lock, restore, cancel open orders if the switch is engaged, reconcile,
+/// observe, rebalance if the market is open and one is owed, then flush and write a heartbeat.
+/// Any error returns before the heartbeat.
 pub async fn tick<M: Market, B: Broker, C: Clock>(
     config: &EngineConfig,
     market: &M,
@@ -106,6 +110,7 @@ pub async fn tick<M: Market, B: Broker, C: Clock>(
     take_engine_lock(store).await?;
     let Restored { mut trader, .. } = restore(config, store, sink.clone(), broker, clock).await?;
 
+    let kill_cancelled = cancel_if_killed(&trader).await?;
     let fills = reconcile_pass(&mut trader).await?.fills.len();
     let observed = observe_pass(&mut trader, store, now).await?;
 
@@ -156,6 +161,7 @@ pub async fn tick<M: Market, B: Broker, C: Clock>(
         mode_change: observed.mode_change,
         market_open,
         rebalance,
+        kill_cancelled,
     })
 }
 
@@ -213,6 +219,36 @@ pub async fn session_close<M: Market, B: Broker, C: Clock>(
     .await?;
 
     let Restored { mut trader, .. } = restore(config, store, sink.clone(), broker, clock).await?;
+
+    match cancel_if_killed(&trader).await {
+        Ok(true) => {
+            store
+                .record_step(
+                    &run_key,
+                    KILL_CANCEL_STEP,
+                    StepStatus::Done,
+                    &json!({"cancelled": true}),
+                    now,
+                )
+                .await?;
+        }
+        Ok(false) => {}
+        Err(err) => {
+            let body = json!({"error": err.to_string()});
+            if let Err(record_err) = store
+                .record_step(&run_key, KILL_CANCEL_STEP, StepStatus::Failed, &body, now)
+                .await
+            {
+                tracing::error!(
+                    run_key = run_key.as_str(),
+                    step = KILL_CANCEL_STEP,
+                    error = %record_err,
+                    "could not record the failed step"
+                );
+            }
+            return Err(err);
+        }
+    }
 
     let reconciled = step(
         store,
@@ -404,6 +440,26 @@ fn minus_margin(date: NaiveDate) -> Result<NaiveDate, AppError> {
 fn plus_margin(date: NaiveDate) -> Result<NaiveDate, AppError> {
     date.checked_add_days(Days::new(CALENDAR_MARGIN_DAYS))
         .ok_or_else(|| AppError::Market(format!("{date} is out of range")))
+}
+
+/// When the kill switch is engaged and the engine still has orders it believes are open,
+/// asks the broker to cancel everything. The switch may have been engaged by a row written
+/// from elsewhere (the phone), in which case nothing has cancelled yet. Returns whether a
+/// cancel was sent. A broker failure is returned: the run fails and writes no heartbeat.
+async fn cancel_if_killed<B: Broker, C: Clock>(
+    trader: &EngineTrader<'_, B, C>,
+) -> Result<bool, AppError> {
+    let engaged = trader.risk().state().kill_switch_engaged;
+    let open = trader.state().tracker.unresolved_orders().next().is_some();
+    if !(engaged && open) {
+        return Ok(false);
+    }
+    trader
+        .broker()
+        .cancel_all()
+        .await
+        .map_err(|e| EngineError::Broker(Box::new(e)))?;
+    Ok(true)
 }
 
 /// Reconciles with the broker. The fills found count toward the day-trade limit inside the
