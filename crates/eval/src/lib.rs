@@ -15,6 +15,7 @@ pub mod outcome;
 pub mod proposal;
 pub mod replay;
 pub mod score_job;
+pub mod signing_job;
 pub mod stats;
 
 pub use error::EvalError;
