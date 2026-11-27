@@ -1286,3 +1286,67 @@ async fn a_stored_backtest_result_is_a_usable_trial_for_the_gate_report() {
     );
     db.drop_db().await.unwrap();
 }
+
+/// The link from a real holdout look to the gate report: an ordinary backtest, then a holdout look
+/// made on it with the same inputs and the same bar file, both read back through the store and
+/// judged by the report. Reaching the holdout gate's "fewer than 252 sessions" note means every
+/// stored key the earlier checks need is present and matches on both sides: the inputs, the
+/// usability of both runs, the holdout sessions, the bar file, the requested start and the returns
+/// prefix (the look's returns begin with the ordinary run's). A missing or differing key gives
+/// another note, so this test fails if a result field is renamed or the engine's returns differ.
+#[tokio::test]
+async fn a_real_holdout_look_is_judged_against_the_ordinary_run_it_extends() {
+    use nisse_eval::gate_report::{GateStatus, ReportInputs, TrialSeries, build_report};
+    use nisse_eval::gates::Gates;
+
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let store = Store::new(db.client().await.unwrap());
+    let dir = bars_dir("e2e-holdout", &market());
+    // The boundary 2021-03-15 leaves 80 synthetic sessions after it (at least 60) and 50 before
+    // it (at least 2). The helpers' 2021-05-03 would leave only 42. The ordinary run ends on
+    // 2021-03-12, the last session before the boundary; the look runs over the whole range.
+    let mut early = job(dir.path(), strategy_params());
+    early.end = utc(2021, 3, 12, 23, 59, 59, 999_999_999);
+    // Jobs in one directory share the gates file, so the boundary is set after the last `job`.
+    let full = job(dir.path(), strategy_params());
+    set_holdout(&full, "2021-03-15", 10);
+
+    let ordinary = run_backtest_job(&store, &early, options(true, false, false), now())
+        .await
+        .unwrap();
+    let look = run_backtest_job(&store, &full, options(true, false, true), now())
+        .await
+        .unwrap();
+
+    let stored = scoring::backtest_results(&client).await.unwrap();
+    let series = |trial_id: i64| {
+        let trial = stored.iter().find(|t| t.trial_id == trial_id).unwrap();
+        TrialSeries::from_stored(trial)
+    };
+    let inputs = ReportInputs {
+        version: ordinary.strategy_version_id,
+        gates: Gates::load(&full.gates_path).unwrap(),
+        lifetime_trials: 2,
+        holdout_looks: 1,
+        trials: vec![series(ordinary.trial_id), series(look.trial_id)],
+        replay: (0, 0),
+        risk_breaches: 0,
+        sent_orders: 0,
+        live: None,
+    };
+    let report = build_report(&inputs);
+
+    let holdout = report.gates.iter().find(|g| g.name == "holdout").unwrap();
+    assert_eq!(holdout.status, GateStatus::NotEvaluated, "{}", holdout.note);
+    assert_eq!(
+        holdout.note,
+        "the holdout baseline has fewer than 252 sessions with a non-zero return"
+    );
+    assert_eq!(
+        report.info["holdout_run"]["baseline_trial_id"],
+        json!(ordinary.trial_id)
+    );
+    assert_eq!(report.info["holdout_run"]["trial_id"], json!(look.trial_id));
+    db.drop_db().await.unwrap();
+}

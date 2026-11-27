@@ -538,6 +538,45 @@ fn a_healthy_case_is_evaluated_on_the_deduplicated_sharpes() {
     assert_eq!(gate.value, dsr::deflated_sharpe(&cand, &sharpes, 3));
 }
 
+/// Two runs of one version over the same snapshot and range count as two Sharpes when their
+/// costs differ (they are two experiments), and as one when every input is the same.
+#[test]
+fn deflated_sharpe_counts_runs_by_experiment_not_by_range() {
+    let cand = drift(500, 0.001, 0.010);
+    let alt = drift(500, 0.0005, 0.010);
+    let alt_sharpe = moments::sharpe(&alt).unwrap();
+    let cand_sharpe = moments::sharpe(&cand).unwrap();
+
+    // Trial 1 ran under costs B, trial 2 (the candidate) under costs A: two Sharpes.
+    let other_costs = TrialSeries {
+        costs: costs_b(),
+        ..series(1, 1, false, alt.clone())
+    };
+    let trials = vec![other_costs, series(2, 1, false, cand.clone())];
+    let report = build_report(&inputs(1, trials, 2));
+    let gate = find(&report, "deflated_sharpe");
+    assert_eq!(
+        gate.value,
+        dsr::deflated_sharpe(&cand, &[alt_sharpe, cand_sharpe], 2),
+        "{}",
+        gate.note
+    );
+
+    // Trial 1 and trial 2 are the same experiment: one Sharpe, the newer, and trial 3 is another
+    // version's run. Two Sharpes in all for three lifetime trials.
+    let trials = vec![
+        series(1, 1, false, alt),
+        series(2, 1, false, cand.clone()),
+        series(3, 2, false, drift(500, 0.002, 0.010)),
+    ];
+    let report = build_report(&inputs(1, trials, 3));
+    let other = moments::sharpe(&drift(500, 0.002, 0.010)).unwrap();
+    assert_eq!(
+        find(&report, "deflated_sharpe").value,
+        dsr::deflated_sharpe(&cand, &[cand_sharpe, other], 3)
+    );
+}
+
 #[test]
 fn pbo_with_a_dominated_alternative_passes_at_zero() {
     let cand = drift(500, 0.011, 0.010);
@@ -642,6 +681,28 @@ fn pbo_counts_only_the_newest_trial_of_each_other_version() {
     assert_eq!(find(&report, "pbo").value, pbo::pbo(&matrix));
 }
 
+#[test]
+fn pbo_leaves_out_another_versions_run_under_other_costs() {
+    let cand = drift(500, 0.011, 0.010);
+    let alts = alternatives(9);
+    let mut trials = configurations(&cand, &alts);
+    // Version 2's run (trial 1) was made under other costs than the candidate: it is left out.
+    trials[0].costs = costs_b();
+    let report = build_report(&inputs(1, trials.clone(), 10));
+    let gate = find(&report, "pbo");
+    assert_eq!(gate.status, GateStatus::NotEvaluated, "{}", gate.note);
+    assert_eq!(
+        gate.note,
+        "needs at least 10 configurations over the same data, found 9"
+    );
+
+    // The same run under the candidate's costs is in the matrix again.
+    trials[0].costs = costs_a();
+    let report = build_report(&inputs(1, trials, 10));
+    assert_eq!(find(&report, "pbo").value, expected_pbo(&cand, &alts));
+    assert_ne!(find(&report, "pbo").status, GateStatus::NotEvaluated);
+}
+
 // ---- holdout --------------------------------------------------------------------------------
 
 /// A holdout run of `version` over `returns`, judged on its last `sessions` returns.
@@ -655,6 +716,13 @@ fn holdout_trial(
         holdout_sessions: sessions,
         ..series(trial_id, version, true, returns)
     }
+}
+
+/// The returns of a holdout run made right after `base`: `base` followed by the holdout sessions
+/// `tail`. A look is made on the run it tests, so the baseline's returns are a strict prefix of
+/// the look's returns.
+fn extended(base: &[f64], tail: &[f64]) -> Vec<f64> {
+    [base, tail].concat()
 }
 
 fn holdout_gate_of(trials: Vec<TrialSeries>, looks: u64) -> GateResult {
@@ -706,7 +774,7 @@ fn holdout_runs_are_never_the_candidate_nor_in_the_statistics() {
 #[test]
 fn holdout_gate_follows_the_looks_and_the_version_s_own_holdout_run() {
     let cand = drift(500, 0.001, 0.010);
-    let own = series(2, 1, true, cand.clone());
+    let own = holdout_trial(2, 1, extended(&cand, &drift(60, 0.001, 0.010)), Some(60));
     let other = series(2, 2, true, cand.clone());
     let base = vec![series(1, 1, false, cand)];
 
@@ -736,7 +804,7 @@ fn holdout_branches_are_judged_in_order() {
     let cand = drift(500, 0.011, 0.010);
     let base = vec![series(1, 1, false, cand.clone())];
     let haircut = (1.0 - gates().sharpe_haircut) * annualised_sharpe(&cand);
-    let good = || holdout_trial(2, 1, cand.clone(), Some(60));
+    let good = || holdout_trial(2, 1, extended(&cand, &drift(60, 0.011, 0.010)), Some(60));
 
     // 1. Looks beyond the limit: retired, whatever the run.
     let looks = gates().holdout_max_looks;
@@ -803,24 +871,24 @@ fn holdout_branches_are_judged_in_order() {
     assert!(gate.note.contains("ended flat"), "{}", gate.note);
 
     // 6. The last 60 sessions below the haircut Sharpe: a fail.
-    let weak_returns = drift(500, 0.0, 0.010);
-    let weak = holdout_trial(2, 1, weak_returns.clone(), Some(60));
+    let weak_tail = drift(60, 0.0, 0.010);
+    let weak = holdout_trial(2, 1, extended(&cand, &weak_tail), Some(60));
     let gate = holdout_gate_of(base.iter().cloned().chain([weak]).collect(), 0);
     assert_eq!(gate.status, GateStatus::Fail);
-    assert_eq!(gate.value, Some(annualised_sharpe(&weak_returns[440..])));
+    assert_eq!(gate.value, Some(annualised_sharpe(&weak_tail)));
     assert_eq!(gate.threshold, Some(haircut));
 
     // 7. At or above the haircut Sharpe: a pass, on the last 60 sessions.
     for sessions in [60, 100] {
+        let tail = &cand[cand.len() - sessions as usize..];
         let gate = holdout_gate_of(
             base.iter()
                 .cloned()
-                .chain([holdout_trial(2, 1, cand.clone(), Some(sessions))])
+                .chain([holdout_trial(2, 1, extended(&cand, tail), Some(sessions))])
                 .collect(),
             0,
         );
         assert_eq!(gate.status, GateStatus::Pass, "{sessions}");
-        let tail = &cand[cand.len() - sessions as usize..];
         assert_eq!(gate.value, Some(annualised_sharpe(tail)));
         assert_eq!(gate.threshold, Some(haircut));
     }
@@ -829,13 +897,13 @@ fn holdout_branches_are_judged_in_order() {
 #[test]
 fn the_holdout_is_judged_on_its_last_sessions_only() {
     let cand = drift(500, 0.011, 0.010);
-    // The whole run is weak (about 0.1 a session against a candidate of 1.0); its last 60
-    // sessions are as strong as the candidate.
+    // The 440 sessions of the look before its last 60 are weak (about 0.1 a session against a
+    // candidate of 1.0); its last 60 sessions are as strong as the candidate.
     let mut returns = drift(440, 0.0, 0.010);
     returns.extend(drift(60, 0.011, 0.010));
     let trials = vec![
-        series(1, 1, false, cand),
-        holdout_trial(2, 1, returns.clone(), Some(60)),
+        series(1, 1, false, cand.clone()),
+        holdout_trial(2, 1, extended(&cand, &returns), Some(60)),
     ];
     let gate = holdout_gate_of(trials, 0);
     assert_eq!(gate.status, GateStatus::Pass);
@@ -847,7 +915,7 @@ fn the_first_matching_look_is_judged_and_a_later_one_cannot_rescue_it() {
     let cand = drift(500, 0.011, 0.010);
     let weak = drift(500, 0.0, 0.010);
     let base = series(1, 1, false, cand.clone());
-    let first_a = holdout_trial(2, 1, weak.clone(), Some(60));
+    let first_a = holdout_trial(2, 1, extended(&cand, &weak[440..]), Some(60));
 
     // A later look under costs B (zero slippage) clears the bar; it is not the look judged.
     let later_b = TrialSeries {
@@ -875,10 +943,7 @@ fn a_first_look_under_other_symbols_is_judged_and_a_later_matching_one_cannot_re
     };
     let gate = holdout_gate_of(vec![base.clone(), other_symbols.clone()], 0);
     assert_eq!(gate.status, GateStatus::NotEvaluated);
-    assert_eq!(
-        gate.note,
-        "the candidate's costs or symbols differ from those the holdout was looked at with"
-    );
+    assert_eq!(gate.note, DIFFERENT_INPUTS);
 
     // The first look is the one judged, even though a later matching run is strong enough to
     // pass: the candidate is compared with the first look's inputs, which differ here.
@@ -886,10 +951,7 @@ fn a_first_look_under_other_symbols_is_judged_and_a_later_matching_one_cannot_re
     let matching = holdout_trial(3, 1, weak, Some(60));
     let gate = holdout_gate_of(vec![base, other_symbols, matching], 0);
     assert_eq!(gate.status, GateStatus::NotEvaluated, "{}", gate.note);
-    assert_eq!(
-        gate.note,
-        "the candidate's costs or symbols differ from those the holdout was looked at with"
-    );
+    assert_eq!(gate.note, DIFFERENT_INPUTS);
 }
 
 #[test]
@@ -925,11 +987,12 @@ fn a_flat_holdout_run_with_zero_returns_fails() {
 fn the_holdout_needs_sixty_sessions_exactly() {
     let cand = drift(500, 0.011, 0.010);
     let base = series(1, 1, false, cand.clone());
-    let run = |sessions| {
+    let run = |sessions: u64| {
+        let tail = &cand[cand.len() - sessions as usize..];
         holdout_gate_of(
             vec![
                 base.clone(),
-                holdout_trial(2, 1, cand.clone(), Some(sessions)),
+                holdout_trial(2, 1, extended(&cand, tail), Some(sessions)),
             ],
             0,
         )
@@ -965,8 +1028,8 @@ fn the_threshold_ignores_the_flat_warm_up() {
     );
 
     let trials = vec![
-        series(1, 1, false, warm),
-        holdout_trial(2, 1, tail, Some(60)),
+        series(1, 1, false, warm.clone()),
+        holdout_trial(2, 1, extended(&warm, &tail), Some(60)),
     ];
     let gate = holdout_gate_of(trials, 0);
     assert_eq!(gate.status, GateStatus::Fail, "{}", gate.note);
@@ -980,8 +1043,9 @@ fn the_threshold_ignores_the_flat_warm_up() {
 #[test]
 fn a_baseline_with_no_active_return_is_not_evaluated() {
     // All flat: no non-zero return at all, so it is too short before its Sharpe is even asked.
-    let base = series(1, 1, false, vec![0.0; 500]);
-    let holdout = holdout_trial(2, 1, drift(500, 0.011, 0.010), Some(60));
+    let flat = vec![0.0; 500];
+    let base = series(1, 1, false, flat.clone());
+    let holdout = holdout_trial(2, 1, extended(&flat, &drift(60, 0.011, 0.010)), Some(60));
     let gate = holdout_gate_of(vec![base, holdout], 0);
     assert_eq!(gate.status, GateStatus::NotEvaluated);
     assert_eq!(gate.note, SHORT_BASELINE);
@@ -995,7 +1059,7 @@ fn info_reports_the_active_sharpe_and_the_judged_holdout_run() {
     warm.extend_from_slice(&strong);
     let trials = vec![
         series(1, 1, false, warm.clone()),
-        holdout_trial(2, 1, drift(60, 0.011, 0.010), Some(60)),
+        holdout_trial(2, 1, extended(&warm, &drift(60, 0.011, 0.010)), Some(60)),
         TrialSeries {
             costs: costs_b(),
             ..holdout_trial(3, 1, drift(60, 0.011, 0.010), Some(60))
@@ -1038,10 +1102,10 @@ fn a_holdout_boundary_out_of_range_makes_the_trial_unusable() {
     );
 }
 
-const DIFFERENT_INPUTS: &str =
-    "the candidate's costs or symbols differ from those the holdout was looked at with";
-const NO_BASELINE: &str =
-    "no usable ordinary run before the first holdout look has its costs and symbols";
+const DIFFERENT_INPUTS: &str = "the candidate's inputs (costs, symbols, limits, starting cash or seed) differ from those the holdout was looked at with";
+const NO_BASELINE: &str = "no usable ordinary run before the first holdout look has its inputs, start date, bar file and the same returns up to its end";
+const RUN_UNRECORDED: &str = "the holdout run's final drawdown mode is not recorded";
+const BASELINE_UNRECORDED: &str = "the holdout baseline's final drawdown mode is not recorded";
 const OTHER_EXPERIMENT: &str = "the holdout look tested another experiment than the candidate (the last ordinary run before the look)";
 const SHORT_BASELINE: &str =
     "the holdout baseline has fewer than 252 sessions with a non-zero return";
@@ -1068,9 +1132,14 @@ fn bypass_trials(costs_3_4: Value, symbols_3_4: Value) -> Vec<TrialSeries> {
     };
     vec![
         first(series(1, 1, false, cand.clone())),
-        first(holdout_trial(2, 1, weak, Some(60))),
+        first(holdout_trial(2, 1, extended(&cand, &weak[440..]), Some(60))),
         rerun(series(3, 1, false, cand.clone())),
-        rerun(holdout_trial(4, 1, cand, Some(60))),
+        rerun(holdout_trial(
+            4,
+            1,
+            extended(&cand, &drift(60, 0.011, 0.010)),
+            Some(60),
+        )),
     ]
 }
 
@@ -1111,7 +1180,7 @@ fn an_identical_ordinary_rerun_after_a_passed_holdout_does_not_disturb_it() {
     let cand = drift(500, 0.011, 0.010);
     let trials = vec![
         series(5, 1, false, cand.clone()),
-        holdout_trial(6, 1, cand.clone(), Some(60)),
+        holdout_trial(6, 1, extended(&cand, &drift(60, 0.011, 0.010)), Some(60)),
         series(7, 1, false, cand),
     ];
     let mut i = inputs(1, trials, 7);
@@ -1131,7 +1200,7 @@ fn the_baseline_is_the_newest_matching_ordinary_run_before_the_look() {
     let trials = vec![
         series(1, 1, false, drift(500, -0.001, 0.010)),
         series(2, 1, false, strong.clone()),
-        holdout_trial(3, 1, drift(60, 0.001, 0.010), Some(60)),
+        holdout_trial(3, 1, extended(&strong, &drift(60, 0.001, 0.010)), Some(60)),
     ];
     let report = build_report(&inputs(1, trials, 3));
     assert_eq!(report.candidate_trial_id, Some(2));
@@ -1174,15 +1243,26 @@ fn a_barely_positive_holdout_cannot_pass_against_a_losing_shorter_run() {
     // Trial 1: ordinary, full range, strong. Trial 2: ordinary, shorter range, losing. Trial 3:
     // the first holdout look, barely positive. Trial 4: an ordinary re-run of trial 1.
     let cand = drift(500, 0.011, 0.010);
+    let shorter_returns = drift(500, -0.001, 0.010);
     let shorter = TrialSeries {
         requested_start: 100,
         requested_end: 600,
-        ..series(2, 1, false, drift(500, -0.001, 0.010))
+        ..series(2, 1, false, shorter_returns.clone())
+    };
+    // The look covers the shorter run's start, so it is made on that run.
+    let look = TrialSeries {
+        requested_start: 100,
+        ..holdout_trial(
+            3,
+            1,
+            extended(&shorter_returns, &drift(60, 0.0001, 0.010)),
+            Some(60),
+        )
     };
     let trials = vec![
         series(1, 1, false, cand.clone()),
         shorter,
-        holdout_trial(3, 1, drift(60, 0.0001, 0.010), Some(60)),
+        look,
         series(4, 1, false, cand),
     ];
     let mut i = inputs(1, trials, 4);
@@ -1207,7 +1287,7 @@ fn strong_then_weak_over_one_range_judges_the_weak_run_everywhere() {
     let trials = vec![
         series(1, 1, false, strong),
         series(2, 1, false, weak.clone()),
-        holdout_trial(3, 1, drift(60, 0.004, 0.010), Some(60)),
+        holdout_trial(3, 1, extended(&weak, &drift(60, 0.004, 0.010)), Some(60)),
     ];
     let mut i = inputs(1, trials, 2);
     i.holdout_looks = 1;
@@ -1230,7 +1310,7 @@ fn strong_then_weak_over_one_range_judges_the_weak_run_everywhere() {
 #[test]
 fn a_baseline_over_another_snapshot_or_range_is_not_the_candidates() {
     let cand = drift(500, 0.011, 0.010);
-    let holdout = || holdout_trial(2, 1, drift(60, 0.011, 0.010), Some(60));
+    let holdout = || holdout_trial(2, 1, extended(&cand, &drift(60, 0.011, 0.010)), Some(60));
     // Strong, but over another snapshot; the candidate is registered after the look.
     let other_snapshot = TrialSeries {
         data_snapshot_id: "other".to_owned(),
@@ -1273,7 +1353,7 @@ fn a_baseline_over_another_snapshot_or_range_is_not_the_candidates() {
 #[test]
 fn a_candidate_after_the_look_is_judged_on_an_earlier_identical_copy_only() {
     let cand = drift(500, 0.011, 0.010);
-    let holdout = holdout_trial(2, 1, cand.clone(), Some(60));
+    let holdout = holdout_trial(2, 1, extended(&cand, &drift(60, 0.011, 0.010)), Some(60));
 
     // An identical earlier copy, registered before the look, is the baseline.
     let trials = vec![
@@ -1300,9 +1380,9 @@ fn a_candidate_after_the_look_is_judged_on_an_earlier_identical_copy_only() {
 
 #[test]
 fn a_baseline_that_is_not_positive_is_never_a_pass() {
-    let holdout = holdout_trial(2, 1, drift(60, 0.011, 0.010), Some(60));
     for returns in [drift(500, -0.011, 0.010), drift(500, 0.0, 0.010)] {
-        let trials = vec![series(1, 1, false, returns), holdout.clone()];
+        let look = holdout_trial(2, 1, extended(&returns, &drift(60, 0.011, 0.010)), Some(60));
+        let trials = vec![series(1, 1, false, returns), look];
         let gate = holdout_gate_of(trials, 0);
         assert_eq!(gate.status, GateStatus::NotEvaluated, "{}", gate.note);
         assert_eq!(gate.note, NOT_POSITIVE);
@@ -1328,7 +1408,7 @@ fn gate_with_inputs(
     let run = TrialSeries {
         costs: run_costs,
         symbols: run_symbols,
-        ..holdout_trial(2, 1, cand, Some(60))
+        ..holdout_trial(2, 1, extended(&cand, &drift(60, 0.011, 0.010)), Some(60))
     };
     holdout_gate_of(vec![base, run], 0)
 }
@@ -1502,26 +1582,45 @@ fn the_holdout_checks_run_in_the_documented_order() {
     assert_eq!(gate.note, SHORT_BASELINE);
 
     // (k) before (l): 300 active sessions whose Sharpe is undefined (constant, no variance).
-    let trials = vec![ord(1, vec![0.5; 300]), hold(2, cand.clone(), ok)];
+    let trials = vec![
+        ord(1, vec![0.5; 300]),
+        hold(2, extended(&[0.5; 300], &drift(60, 0.011, 0.010)), ok),
+    ];
     let gate = holdout_gate_of(trials, 0);
     assert_eq!(gate.note, UNDEFINED_BASELINE);
 
     // (l): the baseline's Sharpe is negative, so the threshold would be zero.
-    let trials = vec![ord(1, drift(500, -0.011, 0.010)), hold(2, cand.clone(), ok)];
+    let trials = vec![
+        ord(1, drift(500, -0.011, 0.010)),
+        hold(
+            2,
+            extended(&drift(500, -0.011, 0.010), &drift(60, 0.011, 0.010)),
+            ok,
+        ),
+    ];
     let gate = holdout_gate_of(trials, 0);
     assert_eq!(gate.status, GateStatus::NotEvaluated);
     assert_eq!(gate.note, NOT_POSITIVE);
 
     // (m): the holdout sessions have no Sharpe ratio (all flat).
-    let trials = vec![ord(1, cand.clone()), hold(2, vec![0.0; 500], ok)];
+    let trials = vec![
+        ord(1, cand.clone()),
+        hold(2, extended(&cand, &[0.0; 60]), ok),
+    ];
     let gate = holdout_gate_of(trials, 0);
     assert_eq!(gate.status, GateStatus::NotEvaluated);
     assert_eq!(gate.note, "the holdout sessions have no Sharpe ratio");
 
     // (n): the comparison decides, Fail below the haircut Sharpe and Pass at or above it.
-    let trials = vec![ord(1, cand.clone()), hold(2, drift(500, 0.0, 0.010), ok)];
+    let trials = vec![
+        ord(1, cand.clone()),
+        hold(2, extended(&cand, &drift(60, 0.0, 0.010)), ok),
+    ];
     assert_eq!(holdout_gate_of(trials, 0).status, GateStatus::Fail);
-    let trials = vec![ord(1, cand.clone()), hold(2, cand, ok)];
+    let trials = vec![
+        ord(1, cand.clone()),
+        hold(2, extended(&cand, &drift(60, 0.011, 0.010)), ok),
+    ];
     assert_eq!(holdout_gate_of(trials, 0).status, GateStatus::Pass);
 }
 
@@ -1540,7 +1639,11 @@ fn the_look_is_judged_against_its_own_baseline_whatever_is_registered_later() {
     };
     let first = series(1, 1, false, strong.clone());
     let second = range_b(series(2, 1, false, weak.clone()));
-    let look = holdout_trial(3, 1, drift(60, 0.0035, 0.010), Some(60));
+    // The look covers range B's start, so it is made on trial 2.
+    let look = TrialSeries {
+        requested_start: 100,
+        ..holdout_trial(3, 1, extended(&weak, &drift(60, 0.0035, 0.010)), Some(60))
+    };
     let report_for = |trials: Vec<TrialSeries>| {
         let count = trials.len() as u64;
         let mut i = inputs(1, trials, count);
@@ -1595,7 +1698,7 @@ fn a_look_made_right_after_its_run_passes_and_an_identical_rerun_does_not_distur
     let cand = drift(500, 0.011, 0.010);
     let base = series(1, 1, false, cand.clone());
     // Tail Sharpe 1.0 against a threshold of 0.5.
-    let look = holdout_trial(2, 1, drift(60, 0.011, 0.010), Some(60));
+    let look = holdout_trial(2, 1, extended(&cand, &drift(60, 0.011, 0.010)), Some(60));
 
     let mut i = inputs(1, vec![base.clone(), look.clone()], 2);
     i.holdout_looks = 1;
@@ -1616,9 +1719,9 @@ fn a_look_made_right_after_its_run_passes_and_an_identical_rerun_does_not_distur
 /// The baseline needs `MIN_BASELINE_SESSIONS` active sessions; the flat warm-up does not count.
 #[test]
 fn a_baseline_needs_252_active_sessions_and_the_warm_up_does_not_count() {
-    let look = || holdout_trial(2, 1, drift(60, 0.011, 0.010), Some(60));
     let judged_with = |returns: Vec<f64>| {
-        let trials = vec![series(1, 1, false, returns), look()];
+        let look = holdout_trial(2, 1, extended(&returns, &drift(60, 0.011, 0.010)), Some(60));
+        let trials = vec![series(1, 1, false, returns), look];
         holdout_gate_of(trials, 0)
     };
 
@@ -1656,7 +1759,12 @@ fn a_baseline_sharpe_of_two_hundredths_is_judged_because_the_length_is_the_guard
     assert!((annualised_sharpe(&weak) - 0.02).abs() < 1e-3);
 
     let mut trials = configurations(&weak, &alternatives(9));
-    trials.push(holdout_trial(11, 1, drift(60, 0.001, 0.010), Some(60)));
+    trials.push(holdout_trial(
+        11,
+        1,
+        extended(&weak, &drift(60, 0.001, 0.010)),
+        Some(60),
+    ));
     let mut i = inputs(1, trials, 11);
     i.holdout_looks = 1;
     let report = build_report(&i);
@@ -1700,13 +1808,20 @@ fn info_describes_the_holdout_run_without_a_verdict_and_a_null_baseline() {
 
 /// The review's sequence, one version: trial 1 an ordinary run (weak), trial 2 the look made right
 /// after it (its tail as good as trial 1's, so it passes against trial 1's threshold), trial 3 an
-/// ordinary re-run that is strong. Every trial carries the default inputs unless a test changes it.
-fn look_scenario() -> [TrialSeries; 3] {
+/// ordinary re-run with the given returns. Every trial carries the default inputs unless a test
+/// changes it.
+fn look_scenario_with(rerun: Vec<f64>) -> [TrialSeries; 3] {
+    let weak = drift(500, 0.002, 0.010);
     [
-        series(1, 1, false, drift(500, 0.002, 0.010)),
-        holdout_trial(2, 1, drift(60, 0.002, 0.010), Some(60)),
-        series(3, 1, false, drift(500, 0.011, 0.010)),
+        series(1, 1, false, weak.clone()),
+        holdout_trial(2, 1, extended(&weak, &drift(60, 0.002, 0.010)), Some(60)),
+        series(3, 1, false, rerun),
     ]
+}
+
+/// The look scenario with an identical re-run of trial 1: the experiment the look tested.
+fn look_scenario() -> [TrialSeries; 3] {
+    look_scenario_with(drift(500, 0.002, 0.010))
 }
 
 /// The report of the look scenario's three trials, one look made.
@@ -1730,7 +1845,7 @@ fn a_rerun_under_other_limits_is_not_the_experiment_the_look_tested() {
 
     // The review's scenario: the re-run is strong under other limits. It is the candidate, and
     // the look is not judged for it, so it never passes.
-    let mut trials = look_scenario();
+    let mut trials = look_scenario_with(drift(500, 0.011, 0.010));
     trials[2].limits_hash = Some("bbb".to_owned());
     let report = judge_scenario(trials);
     assert_eq!(report.candidate_trial_id, Some(3));
@@ -1741,6 +1856,19 @@ fn a_rerun_under_other_limits_is_not_the_experiment_the_look_tested() {
     assert_eq!(report.info["holdout_run"]["baseline_trial_id"], json!(1));
     assert_eq!(report.info["candidate_run"]["limits_hash"], json!("bbb"));
     assert_eq!(report.info["holdout_run"]["limits_hash"], json!("aaa"));
+}
+
+/// The old control case: an earlier weak run and a later strong candidate with identical recorded
+/// inputs. The strong re-run is not the experiment the look tested, so it is never a pass.
+#[test]
+fn a_strong_rerun_with_identical_inputs_is_another_experiment() {
+    let report = judge_scenario(look_scenario_with(drift(500, 0.011, 0.010)));
+    assert_eq!(report.candidate_trial_id, Some(3));
+    let gate = holdout_of(&report);
+    assert_eq!(gate.status, GateStatus::NotEvaluated, "{}", gate.note);
+    assert_eq!(gate.note, OTHER_EXPERIMENT);
+    assert_eq!(gate.value, None);
+    assert_eq!(gate.threshold, None);
 }
 
 #[test]
@@ -1862,32 +1990,91 @@ fn a_baseline_that_ended_flat_is_not_evaluated() {
 
 #[test]
 fn a_baseline_counts_only_its_non_zero_returns_against_252() {
+    // The baseline, the look made right after it and an identical re-run of it, judged.
+    let judged = |returns: Vec<f64>| {
+        let look = holdout_trial(2, 1, extended(&returns, &drift(60, 0.002, 0.010)), Some(60));
+        let trials = [
+            series(1, 1, false, returns.clone()),
+            look,
+            series(3, 1, false, returns),
+        ];
+        holdout_of(&judge_scenario(trials)).clone()
+    };
+
     // The review's idle baseline: 15 non-zero returns, then 485 zeros (500 sessions in all).
     let mut idle = drift(15, 0.011, 0.010);
     idle.extend(vec![0.0; 485]);
-    let mut trials = look_scenario();
-    trials[0].returns = Some(idle);
-    let gate = holdout_of(&judge_scenario(trials)).clone();
+    let gate = judged(idle);
     assert_eq!(gate.status, GateStatus::NotEvaluated, "{}", gate.note);
     assert_eq!(gate.note, SHORT_BASELINE);
 
     // Exactly 252 non-zero returns (among zeros) is judged.
     let mut enough = drift(252, 0.011, 0.010);
     enough.extend(vec![0.0; 248]);
-    let mut trials = look_scenario();
-    trials[0].returns = Some(enough);
-    let gate = holdout_of(&judge_scenario(trials)).clone();
+    let gate = judged(enough);
     assert_ne!(gate.note, SHORT_BASELINE, "{}", gate.note);
     assert_ne!(gate.status, GateStatus::NotEvaluated, "{}", gate.note);
 
     // 251 non-zero returns is not.
     let mut short = drift(251, 0.011, 0.010);
     short.extend(vec![0.0; 249]);
-    let mut trials = look_scenario();
-    trials[0].returns = Some(short);
-    let gate = holdout_of(&judge_scenario(trials)).clone();
+    let gate = judged(short);
     assert_eq!(gate.status, GateStatus::NotEvaluated, "{}", gate.note);
     assert_eq!(gate.note, SHORT_BASELINE);
+}
+
+/// The same bar file name is not the same bars: a look whose first return differs from the
+/// baseline's has no baseline, and the gate is never a pass.
+#[test]
+fn a_look_on_other_history_under_the_same_bar_file_has_no_baseline() {
+    let mut trials = look_scenario();
+    let mut changed = trials[1].returns.clone().unwrap();
+    changed[0] += 0.001;
+    trials[1].returns = Some(changed);
+    let gate = holdout_of(&judge_scenario(trials)).clone();
+    assert_eq!(gate.status, GateStatus::NotEvaluated, "{}", gate.note);
+    assert_eq!(gate.note, NO_BASELINE);
+    assert_ne!(gate.status, GateStatus::Pass);
+}
+
+/// A look over other requested dates, or whose returns are not longer than the baseline's, has no
+/// baseline either.
+#[test]
+fn a_look_with_another_start_or_no_longer_returns_has_no_baseline() {
+    let mut other_start = look_scenario();
+    other_start[1].requested_start = 100;
+    let gate = holdout_of(&judge_scenario(other_start)).clone();
+    assert_eq!(gate.status, GateStatus::NotEvaluated, "{}", gate.note);
+    assert_eq!(gate.note, NO_BASELINE);
+
+    let baseline_returns = look_scenario()[0].returns.clone().unwrap();
+    for returns in [baseline_returns.clone(), baseline_returns[..400].to_vec()] {
+        let mut trials = look_scenario();
+        trials[1].returns = Some(returns);
+        let gate = holdout_of(&judge_scenario(trials)).clone();
+        assert_eq!(gate.status, GateStatus::NotEvaluated, "{}", gate.note);
+        assert_eq!(gate.note, NO_BASELINE);
+    }
+}
+
+/// A run or a baseline whose final drawdown mode was not recorded is not evaluated, since it
+/// cannot be told apart from one that went flat.
+#[test]
+fn an_unrecorded_final_drawdown_mode_is_not_evaluated_on_the_run_or_the_baseline() {
+    let mut run_unrecorded = look_scenario();
+    run_unrecorded[1].final_drawdown_mode = None;
+    let gate = holdout_of(&judge_scenario(run_unrecorded)).clone();
+    assert_eq!(gate.status, GateStatus::NotEvaluated, "{}", gate.note);
+    assert_eq!(gate.note, RUN_UNRECORDED);
+    assert_eq!(gate.value, None);
+
+    let mut baseline_unrecorded = look_scenario();
+    baseline_unrecorded[0].final_drawdown_mode = None;
+    let gate = holdout_of(&judge_scenario(baseline_unrecorded)).clone();
+    assert_eq!(gate.status, GateStatus::NotEvaluated, "{}", gate.note);
+    assert_eq!(gate.note, BASELINE_UNRECORDED);
+    assert_eq!(gate.value, None);
+    assert_eq!(gate.threshold, None);
 }
 
 // ---- replay and risk ------------------------------------------------------------------------
@@ -2022,7 +2209,7 @@ fn candidate_run_and_holdout_run_carry_the_documented_keys() {
     let holdout = TrialSeries {
         costs: json!({"slippage_bps": "2", "fee_per_share": "0.0001"}),
         symbols: json!(["SPY"]),
-        ..holdout_trial(2, 1, cand, Some(60))
+        ..holdout_trial(2, 1, extended(&cand, &drift(60, 0.001, 0.010)), Some(60))
     };
     let trials = vec![candidate, holdout];
     let report = build_report(&inputs(1, trials, 2));
@@ -2070,6 +2257,8 @@ fn candidate_run_and_holdout_run_carry_the_documented_keys() {
         "costs",
         "symbols",
         "limits_hash",
+        "starting_cash",
+        "seed",
         "bars_file",
         "baseline_trial_id",
         "holdout_runs_for_version",
@@ -2077,6 +2266,8 @@ fn candidate_run_and_holdout_run_carry_the_documented_keys() {
         assert!(holdout.get(key).is_some(), "holdout_run misses {key}");
     }
     assert_eq!(holdout["limits_hash"], json!("aaa"));
+    assert_eq!(holdout["starting_cash"], json!("100000"));
+    assert_eq!(holdout["seed"], json!(7));
     assert_eq!(holdout["bars_file"], json!("bars.parquet"));
     assert_eq!(holdout["baseline_trial_id"], json!(1));
     assert_eq!(holdout["trial_id"], json!(2));
@@ -2146,7 +2337,12 @@ fn passing_inputs() -> ReportInputs {
     let cand = drift(500, 0.011, 0.010);
     let alts = alternatives(9);
     let mut trials = configurations(&cand, &alts);
-    trials.push(holdout_trial(11, 1, cand.clone(), Some(60)));
+    trials.push(holdout_trial(
+        11,
+        1,
+        extended(&cand, &drift(60, 0.011, 0.010)),
+        Some(60),
+    ));
     let mut i = inputs(1, trials, 11);
     i.holdout_looks = 1;
     i.replay = (0, 3);

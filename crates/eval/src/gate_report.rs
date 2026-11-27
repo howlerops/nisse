@@ -4,6 +4,7 @@
 //! Loading ([`load_inputs`]) and judging ([`build_report`]) are separate, so the judging is
 //! pure and tested without a database. Rules: `docs/phases/phase-5.md`, "Gate report".
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 
@@ -299,7 +300,7 @@ fn finite(value: Option<f64>) -> Value {
 /// whether or not it has returns or is usable. The statistical gates use it only when it is
 /// usable. The PBO matrix is the candidate's returns for its own version plus, for every other
 /// version, its newest usable non-holdout trial with returns over the candidate's snapshot,
-/// range and length; series are in ascending strategy version id.
+/// range and length and with the candidate's inputs; series are in ascending strategy version id.
 #[must_use]
 pub fn build_report(inputs: &ReportInputs) -> GateReport {
     let candidate = candidate(inputs);
@@ -455,8 +456,11 @@ fn judged_holdout_run(inputs: &ReportInputs) -> Option<&TrialSeries> {
 }
 
 /// The holdout baseline of `run`: the newest usable ordinary run of the version registered before
-/// `run`, with the same inputs as `run` and the same bar file. It depends only on what existed
-/// when the look was made, so nothing registered later can change it.
+/// `run`, with the same inputs as `run`, the same bar file and the same requested start, and whose
+/// returns are a strict prefix of the returns of `run` (see [`extends_returns`]). With the same
+/// inputs and the same bars before the boundary a deterministic engine gives the same returns
+/// session for session, so a prefix mismatch means the bars or an unrecorded input differed. It
+/// depends only on what existed when the look was made, so nothing registered later can change it.
 fn holdout_baseline<'a>(inputs: &'a ReportInputs, run: &TrialSeries) -> Option<&'a TrialSeries> {
     inputs
         .trials
@@ -468,8 +472,28 @@ fn holdout_baseline<'a>(inputs: &'a ReportInputs, run: &TrialSeries) -> Option<&
                 && t.usable(&inputs.gates).is_ok()
                 && same_inputs(t, run)
                 && same_present(&t.bars_file, &run.bars_file)
+                && t.requested_start == run.requested_start
+                && extends_returns(run, t)
         })
         .max_by_key(|t| t.trial_id)
+}
+
+/// Whether the returns of `base` are a strict prefix of the returns of `run`: both are present,
+/// `run` has more, and the first `base.len()` elements are equal. Exact equality, since both series
+/// were rounded the same way by the job.
+fn extends_returns(run: &TrialSeries, base: &TrialSeries) -> bool {
+    match (base.returns.as_deref(), run.returns.as_deref()) {
+        (Some(b), Some(r)) => r.len() > b.len() && r.get(..b.len()) == Some(b),
+        _ => false,
+    }
+}
+
+/// Whether the returns of `a` and `b` are both present and equal, element for element.
+fn same_returns(a: &TrialSeries, b: &TrialSeries) -> bool {
+    matches!(
+        (a.returns.as_deref(), b.returns.as_deref()),
+        (Some(x), Some(y)) if x == y
+    )
 }
 
 /// Whether two runs cover the same experiment: the same non-empty data snapshot and requested
@@ -610,29 +634,30 @@ fn deflated_sharpe(inputs: &ReportInputs, candidate: Option<&TrialSeries>) -> Ga
         Err(note) => return undecided(NAME, None, threshold, &note),
     };
 
-    // One Sharpe per (version, snapshot, range) from usable ordinary runs: the newest of each.
-    let mut newest: BTreeMap<(i64, &str, u64, u64), (i64, f64)> = BTreeMap::new();
-    for trial in &inputs.trials {
-        if trial.holdout || trial.usable(&inputs.gates).is_err() {
-            continue;
-        }
+    // One Sharpe per experiment (see `same_experiment`) from usable ordinary runs: the newest of
+    // each. Newest first, a run is kept unless a kept run of its version is the same experiment.
+    let mut usable: Vec<&TrialSeries> = inputs
+        .trials
+        .iter()
+        .filter(|t| !t.holdout && t.usable(&inputs.gates).is_ok())
+        .collect();
+    usable.sort_by_key(|t| Reverse(t.trial_id));
+    let mut kept: Vec<&TrialSeries> = Vec::new();
+    let mut sharpes: Vec<f64> = Vec::new();
+    for trial in usable {
         let Some(sharpe) = trial.returns.as_deref().and_then(moments::sharpe) else {
             continue;
         };
-        let key = (
-            trial.strategy_version_id.0,
-            trial.data_snapshot_id.as_str(),
-            trial.requested_start,
-            trial.requested_end,
-        );
-        let entry = newest.entry(key).or_insert((trial.trial_id, sharpe));
-        if trial.trial_id > entry.0 {
-            *entry = (trial.trial_id, sharpe);
+        let repeat = kept.iter().any(|k| {
+            k.strategy_version_id == trial.strategy_version_id && same_experiment(k, trial)
+        });
+        if !repeat {
+            kept.push(trial);
+            sharpes.push(sharpe);
         }
     }
-    let mut by_trial: Vec<(i64, f64)> = newest.into_values().collect();
-    by_trial.sort_by_key(|(trial_id, _)| *trial_id);
-    let sharpes: Vec<f64> = by_trial.into_iter().map(|(_, sharpe)| sharpe).collect();
+    // Oldest first, as the trials were registered.
+    sharpes.reverse();
 
     let lifetime = inputs.lifetime_trials;
     if lifetime >= 2 {
@@ -677,8 +702,8 @@ fn deflated_sharpe(inputs: &ReportInputs, candidate: Option<&TrialSeries>) -> Ga
 }
 
 /// The candidate's returns (for its own version) and, for every other version, its newest
-/// usable non-holdout trial with returns over the same snapshot, range and length, in ascending
-/// strategy version id.
+/// usable non-holdout trial with returns over the same snapshot, range and length and with the
+/// candidate's inputs (see [`same_inputs`]), in ascending strategy version id.
 fn pbo_matrix<'a>(
     inputs: &'a ReportInputs,
     candidate: &TrialSeries,
@@ -696,7 +721,9 @@ fn pbo_matrix<'a>(
             && trial.requested_start == candidate.requested_start
             && trial.requested_end == candidate.requested_end
             && series.len() == returns.len();
-        if !same_data {
+        // The candidate stands for its own version; another version enters only with the same inputs.
+        let own_version = trial.strategy_version_id == candidate.strategy_version_id;
+        if !same_data || !(own_version || same_inputs(trial, candidate)) {
             continue;
         }
         let entry = newest
@@ -786,7 +813,7 @@ fn holdout_gate(inputs: &ReportInputs) -> GateResult {
             NAME,
             None,
             None,
-            "the candidate's costs or symbols differ from those the holdout was looked at with",
+            "the candidate's inputs (costs, symbols, limits, starting cash or seed) differ from those the holdout was looked at with",
         );
     }
     // (e) and (f): a run that cannot be used, or that went flat, is not judged on its Sharpe.
@@ -798,7 +825,16 @@ fn holdout_gate(inputs: &ReportInputs) -> GateResult {
             &format!("the holdout run cannot be used: {reason}"),
         );
     }
-    // Before any Sharpe: a run that went flat has zero returns and no Sharpe ratio.
+    // Before any Sharpe: a run that went flat has zero returns and no Sharpe ratio. A run whose
+    // final mode is not recorded cannot be told apart from one that went flat.
+    if run.final_drawdown_mode.is_none() {
+        return undecided(
+            NAME,
+            None,
+            None,
+            "the holdout run's final drawdown mode is not recorded",
+        );
+    }
     if run.final_drawdown_mode.as_deref() == Some("flat") {
         return judged(
             NAME,
@@ -819,10 +855,10 @@ fn holdout_gate(inputs: &ReportInputs) -> GateResult {
             NAME,
             None,
             None,
-            "no usable ordinary run before the first holdout look has its costs and symbols",
+            "no usable ordinary run before the first holdout look has its inputs, start date, bar file and the same returns up to its end",
         );
     };
-    if !same_experiment(candidate, baseline) {
+    if !same_experiment(candidate, baseline) || !same_returns(candidate, baseline) {
         return undecided(
             NAME,
             None,
@@ -830,7 +866,16 @@ fn holdout_gate(inputs: &ReportInputs) -> GateResult {
             "the holdout look tested another experiment than the candidate (the last ordinary run before the look)",
         );
     }
-    // (j1): a baseline that ended flat after a drawdown has nothing to set a threshold.
+    // (j1): a baseline that ended flat after a drawdown has nothing to set a threshold, and one
+    // whose final mode is not recorded cannot be told apart from one that did.
+    if baseline.final_drawdown_mode.is_none() {
+        return undecided(
+            NAME,
+            None,
+            None,
+            "the holdout baseline's final drawdown mode is not recorded",
+        );
+    }
     if baseline.final_drawdown_mode.as_deref() == Some("flat") {
         return undecided(
             NAME,
@@ -1062,9 +1107,9 @@ fn candidate_run(inputs: &ReportInputs, candidate: Option<&TrialSeries>) -> Valu
 }
 
 /// The holdout run the holdout gate judges (the version's oldest holdout run): its annualised
-/// Sharpe over the holdout sessions (the figure the gate compares), its costs and symbols, its
-/// holdout baseline (`baseline`, null when there is none), and how many holdout runs the version
-/// has in all. Null without a holdout run of the version.
+/// Sharpe over the holdout sessions (the figure the gate compares), its costs, symbols, limits,
+/// starting cash and seed, its holdout baseline (`baseline`, null when there is none), and how many
+/// holdout runs the version has in all. Null without a holdout run of the version.
 fn holdout_run(inputs: &ReportInputs, baseline: Option<&TrialSeries>) -> Value {
     let ppy = inputs.gates.periods_per_year;
     judged_holdout_run(inputs).map_or(Value::Null, |run| {
@@ -1080,6 +1125,8 @@ fn holdout_run(inputs: &ReportInputs, baseline: Option<&TrialSeries>) -> Value {
             "costs": run.costs,
             "symbols": run.symbols,
             "limits_hash": run.limits_hash,
+            "starting_cash": run.starting_cash,
+            "seed": run.seed,
             "bars_file": run.bars_file,
             "baseline_trial_id": baseline.map(|t| t.trial_id),
             "holdout_runs_for_version": holdout_runs_for_version(inputs),
