@@ -414,9 +414,15 @@ fn judged_holdout_run(inputs: &ReportInputs) -> Option<&TrialSeries> {
         .min_by_key(|t| t.trial_id)
 }
 
-/// The holdout baseline of `run`: the newest usable ordinary run of the version registered
-/// before `run` with the same inputs.
-fn holdout_baseline<'a>(inputs: &'a ReportInputs, run: &TrialSeries) -> Option<&'a TrialSeries> {
+/// The holdout baseline of `run` for `candidate`: the newest usable ordinary run of the version
+/// registered before `run`, with the same inputs as `run` and the same experiment as the
+/// candidate (data snapshot, requested range, costs and symbols). The candidate itself
+/// qualifies when it was registered before `run`.
+fn holdout_baseline<'a>(
+    inputs: &'a ReportInputs,
+    candidate: &TrialSeries,
+    run: &TrialSeries,
+) -> Option<&'a TrialSeries> {
     inputs
         .trials
         .iter()
@@ -426,8 +432,18 @@ fn holdout_baseline<'a>(inputs: &'a ReportInputs, run: &TrialSeries) -> Option<&
                 && t.trial_id < run.trial_id
                 && t.usable(&inputs.gates).is_ok()
                 && same_inputs(t, run)
+                && same_experiment(t, candidate)
         })
         .max_by_key(|t| t.trial_id)
+}
+
+/// Whether two runs cover the same experiment: the same data snapshot and requested range,
+/// with the same inputs (costs and symbols).
+fn same_experiment(a: &TrialSeries, b: &TrialSeries) -> bool {
+    a.data_snapshot_id == b.data_snapshot_id
+        && a.requested_start == b.requested_start
+        && a.requested_end == b.requested_end
+        && same_inputs(a, b)
 }
 
 /// The annualised Sharpe of a run's returns from the first non-zero return on, or `None` when
@@ -762,12 +778,12 @@ fn holdout_gate(inputs: &ReportInputs) -> GateResult {
         Err(note) => return undecided(NAME, None, None, &note),
     };
     // (h) and (i): the threshold comes from the baseline, not the candidate.
-    let Some(baseline) = holdout_baseline(inputs, run) else {
+    let Some(baseline) = holdout_baseline(inputs, candidate, run) else {
         return undecided(
             NAME,
             None,
             None,
-            "no usable ordinary run before the first holdout look with the same costs and symbols",
+            "no usable ordinary run before the first holdout look matches the candidate's data, costs and symbols",
         );
     };
     let Some(baseline_sharpe) = baseline_active_sharpe(baseline, ppy) else {
@@ -778,6 +794,15 @@ fn holdout_gate(inputs: &ReportInputs) -> GateResult {
             "the holdout baseline's active Sharpe ratio is undefined",
         );
     };
+    // A zero or negative threshold would pass anything: nothing to hold the holdout up to.
+    if baseline_sharpe <= 0.0 {
+        return undecided(
+            NAME,
+            None,
+            None,
+            "the holdout baseline's Sharpe is not positive, so there is nothing for the holdout to hold up",
+        );
+    }
     let threshold = ((1.0 - gates.sharpe_haircut) * baseline_sharpe).max(0.0);
     // (j) and (k).
     let Some(value) = moments::sharpe(tail).map(|s| moments::annualise(s, ppy)) else {
@@ -915,6 +940,10 @@ fn info(inputs: &ReportInputs, candidate: Option<&TrialSeries>) -> Value {
     let sortino_interval =
         returns.and_then(|r| bootstrap::interval(r, annualised(moments::sortino, ppy), &config));
     let expectancy_interval = returns.and_then(|r| bootstrap::interval(r, moments::mean, &config));
+    let run = judged_holdout_run(inputs);
+    let baseline = candidate
+        .zip(run)
+        .and_then(|(candidate, run)| holdout_baseline(inputs, candidate, run));
     json!({
         "summary": candidate.map_or(Value::Null, |t| t.summary.clone()),
         "sharpe": finite(sharpe),
@@ -933,15 +962,13 @@ fn info(inputs: &ReportInputs, candidate: Option<&TrialSeries>) -> Value {
         "haircut_sharpe_note": "the limits file's haircut_sharpe may not exceed this",
         "active_sharpe": finite(active_sharpe),
         "holdout_baseline_active_sharpe": finite(
-            judged_holdout_run(inputs)
-                .and_then(|run| holdout_baseline(inputs, run))
-                .and_then(|baseline| baseline_active_sharpe(baseline, ppy))
+            baseline.and_then(|baseline| baseline_active_sharpe(baseline, ppy))
         ),
         "lifetime_trials": inputs.lifetime_trials,
         "trial_budget": gates.trial_budget,
         "candidate_trial_id": candidate.map(|t| t.trial_id),
         "candidate_run": candidate_run(inputs, candidate),
-        "holdout_run": holdout_run(inputs),
+        "holdout_run": holdout_run(inputs, baseline),
     })
 }
 
@@ -965,16 +992,15 @@ fn candidate_run(inputs: &ReportInputs, candidate: Option<&TrialSeries>) -> Valu
 
 /// The holdout run the holdout gate judges (the version's oldest holdout run): its annualised
 /// Sharpe over the holdout sessions (the figure the gate compares), its costs and symbols, its
-/// holdout baseline (null when there is none), and how many holdout runs the version has in all.
-/// Null without a holdout run of the version.
-fn holdout_run(inputs: &ReportInputs) -> Value {
+/// holdout baseline (`baseline`, null when there is none), and how many holdout runs the version
+/// has in all. Null without a holdout run of the version.
+fn holdout_run(inputs: &ReportInputs, baseline: Option<&TrialSeries>) -> Value {
     let ppy = inputs.gates.periods_per_year;
     judged_holdout_run(inputs).map_or(Value::Null, |run| {
         let sharpe = holdout_tail(run)
             .ok()
             .and_then(moments::sharpe)
             .map(|s| moments::annualise(s, ppy));
-        let baseline = holdout_baseline(inputs, run);
         json!({
             "trial_id": run.trial_id,
             "holdout_sessions": run.holdout_sessions,
