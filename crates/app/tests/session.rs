@@ -16,6 +16,7 @@ use nisse_app::{
     commands::{engage_kill_switch, release_kill},
     config::EngineConfig,
     ingest::bar_file_path,
+    kill_watch::{KILL_CANCEL_STEP, KILL_RUN_KEY},
     restore::take_engine_lock,
     session::{
         RESIZE_RUN_KEY, RESIZE_STEP, RebalanceStep, SessionCloseOutcome, session_close, tick,
@@ -35,8 +36,8 @@ use nisse_store::{
 };
 use serde_json::{Value, json};
 use support::{
-    FakeMarket, Scratch, broker, close_at, count, plus_minutes, session_bars, session_config,
-    setup, weekday_calendar,
+    CancelFails, FakeMarket, Scratch, broker, close_at, count, flattening_limits, plus_minutes,
+    session_bars, session_config, setup, weekday_calendar,
 };
 
 /// The universe of the paper config, in its order (the price path follows this order).
@@ -726,16 +727,6 @@ async fn an_attempt_that_failed_this_hour_is_tried_again() {
     f.db.drop_db().await.unwrap();
 }
 
-/// The repository limits with `flatten_on_kill` on, written into `dir`.
-fn flattening_limits(dir: &std::path::Path) -> std::path::PathBuf {
-    let mut limits: Value =
-        serde_json::from_str(&std::fs::read_to_string(support::repo_limits()).unwrap()).unwrap();
-    limits["flatten_on_kill"] = json!(true);
-    let path = dir.join("limits.json");
-    std::fs::write(&path, limits.to_string()).unwrap();
-    path
-}
-
 #[tokio::test]
 async fn a_flattening_kill_is_acted_on_within_the_hour_and_then_not_repeated() {
     let mut f = fixture().await;
@@ -760,9 +751,9 @@ async fn a_flattening_kill_is_acted_on_within_the_hour_and_then_not_repeated() {
     let decided = count(&f.store, "decision").await;
 
     // The switch is engaged four minutes later. The limits flatten on a kill, so the scale is
-    // now zero with orders working: the next tick acts although one has tried this hour. It
-    // does so through the rebalance (which cancels the waiting buys and would send exits),
-    // not through a blanket cancel, which on later runs would cancel the exits as well.
+    // now zero with orders working: the next tick acts although one has tried this hour. The
+    // kill cancels the waiting buys (only the buys: flatten keeps the exits), then the
+    // rebalance sends the exits.
     engage_kill_switch(&f.store, &first, "test").await.unwrap();
     let second = ManualClock::new(plus_minutes(at(next, 15), 6));
     let outcome = tick(
@@ -775,10 +766,13 @@ async fn a_flattening_kill_is_acted_on_within_the_hour_and_then_not_repeated() {
     )
     .await
     .unwrap();
-    assert!(!outcome.kill_cancelled, "{outcome:?}");
-    assert!(outcome.rebalance.is_some(), "{outcome:?}");
+    // The kill cancelled the waiting buys. Nothing is held and nothing is owed, so there is
+    // nothing to rebalance and nothing new is decided.
+    assert!(outcome.kill_cancelled, "{outcome:?}");
+    assert!(outcome.rebalance.is_none(), "{outcome:?}");
+    assert!(sim.open_orders().await.unwrap().orders.is_empty());
     let after_kill = count(&f.store, "decision").await;
-    assert!(after_kill > decided);
+    assert_eq!(after_kill, decided);
 
     // Same hour, same (zero) scale: whatever is still held, it is not decided again.
     let third = ManualClock::new(plus_minutes(at(next, 15), 8));
@@ -889,52 +883,6 @@ async fn a_deployment_that_must_be_signed_and_is_not_trades_nothing() {
     f.db.drop_db().await.unwrap();
 }
 
-/// The simulated broker, except that cancelling every open order fails.
-struct CancelFails<'a>(&'a SimBroker);
-
-impl Broker for CancelFails<'_> {
-    type Error = SimError;
-
-    async fn submit(&self, intent: &OrderIntent) -> Result<BrokerOrder, SubmitError<SimError>> {
-        self.0.submit(intent).await
-    }
-
-    async fn cancel(&self, venue_order_id: VenueOrderId) -> Result<(), SimError> {
-        self.0.cancel(venue_order_id).await
-    }
-
-    async fn cancel_all(&self) -> Result<(), SimError> {
-        Err(SimError("the broker refused the cancel".to_owned()))
-    }
-
-    async fn replace(
-        &self,
-        venue_order_id: VenueOrderId,
-        request: &ReplaceRequest,
-    ) -> Result<BrokerOrder, SubmitError<SimError>> {
-        self.0.replace(venue_order_id, request).await
-    }
-
-    async fn order_by_client_id(
-        &self,
-        client_order_id: ClientOrderId,
-    ) -> Result<Option<BrokerOrder>, SimError> {
-        self.0.order_by_client_id(client_order_id).await
-    }
-
-    async fn open_orders(&self) -> Result<OpenOrders, SimError> {
-        self.0.open_orders().await
-    }
-
-    async fn positions(&self) -> Result<Vec<BrokerPosition>, SimError> {
-        self.0.positions().await
-    }
-
-    async fn account(&self) -> Result<AccountSnapshot, SimError> {
-        self.0.account().await
-    }
-}
-
 /// Sends the month-end orders of 31 December 2025 (they rest at the simulated broker, since no
 /// session opens to fill them), then returns the session after that close.
 async fn month_end_orders_resting(f: &Fixture, sim: &SimBroker) -> Session {
@@ -1028,11 +976,25 @@ async fn no_cancel_without_the_switch() {
     f.db.drop_db().await.unwrap();
 }
 
+/// The number of kill-cancel step rows, under the kill run key.
+async fn kill_cancel_rows(store: &Store) -> i64 {
+    store
+        .client()
+        .query_one(
+            "SELECT count(*) FROM engine_step WHERE run_key = $1 AND step = $2",
+            &[&KILL_RUN_KEY, &KILL_CANCEL_STEP],
+        )
+        .await
+        .unwrap()
+        .get(0)
+}
+
 #[tokio::test]
-async fn session_close_records_the_kill_cancel_step() {
+async fn session_close_cancels_and_records_the_kill_cancel_step_under_the_kill_key() {
     let f = fixture().await;
     let sim = broker();
     let next = month_end_orders_resting(&f, &sim).await;
+    let open = sim.open_orders().await.unwrap().orders.len();
     let phone = ManualClock::new(at(next.date, 14));
     engage_kill_switch(&f.store, &phone, "phone").await.unwrap();
 
@@ -1055,13 +1017,21 @@ async fn session_close_records_the_kill_cancel_step() {
 
     let (status, detail) = f
         .store
-        .step_status(&run_key(later.date), "kill_cancel")
+        .step_status(KILL_RUN_KEY, KILL_CANCEL_STEP)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(status, StepStatus::Done);
-    assert_eq!(detail, json!({"cancelled": true}));
+    assert_eq!(detail, json!({"open_orders": open, "flatten": false}));
     assert!(sim.open_orders().await.unwrap().orders.is_empty());
+    // The session's own run key carries no kill step any more.
+    assert_eq!(
+        f.store
+            .step_status(&run_key(later.date), "kill_cancel")
+            .await
+            .unwrap(),
+        None
+    );
 
     f.db.drop_db().await.unwrap();
 }
@@ -1077,6 +1047,8 @@ async fn a_session_close_with_nothing_to_cancel_records_no_kill_cancel_step() {
     tick(&f.config, &f.market, &f.store, f.sink.clone(), &sim, &clock)
         .await
         .unwrap();
+    let rows = kill_cancel_rows(&f.store).await;
+    assert_eq!(rows, 1);
 
     let later = *f.calendar.next_session(next.close).unwrap();
     let clock = ManualClock::new(plus_minutes(later.close, 10));
@@ -1084,44 +1056,8 @@ async fn a_session_close_with_nothing_to_cancel_records_no_kill_cancel_step() {
         .await
         .unwrap();
 
-    assert_eq!(
-        f.store
-            .step_status(&run_key(later.date), "kill_cancel")
-            .await
-            .unwrap(),
-        None
-    );
-
-    f.db.drop_db().await.unwrap();
-}
-
-#[tokio::test]
-async fn a_refused_cancel_fails_the_tick_and_writes_no_heartbeat() {
-    let f = fixture().await;
-    let sim = broker();
-    let next = month_end_orders_resting(&f, &sim).await;
-    let phone = ManualClock::new(at(next.date, 14));
-    engage_kill_switch(&f.store, &phone, "phone").await.unwrap();
-    let open = sim.open_orders().await.unwrap().orders.len();
-
-    let clock = ManualClock::new(at(next.date, 15));
-    let err = tick(
-        &f.config,
-        &f.market,
-        &f.store,
-        f.sink.clone(),
-        CancelFails(&sim),
-        &clock,
-    )
-    .await
-    .unwrap_err();
-
-    assert!(
-        matches!(err, AppError::Engine(EngineError::Broker(_))),
-        "{err:?}"
-    );
-    assert_eq!(count(&f.store, "heartbeat").await, 1);
-    assert_eq!(sim.open_orders().await.unwrap().orders.len(), open);
+    // Nothing was open, so the session close sent no cancel and wrote no step.
+    assert_eq!(kill_cancel_rows(&f.store).await, rows);
 
     f.db.drop_db().await.unwrap();
 }
@@ -1153,13 +1089,172 @@ async fn a_refused_cancel_in_session_close_records_a_failed_step() {
     );
     let (status, detail) = f
         .store
-        .step_status(&run_key(later.date), "kill_cancel")
+        .step_status(KILL_RUN_KEY, KILL_CANCEL_STEP)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(status, StepStatus::Failed);
     assert!(detail["error"].as_str().unwrap().contains("refused"));
     assert_eq!(count(&f.store, "heartbeat").await, 1);
+
+    f.db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_kill_cancels_even_when_the_deployment_is_unsigned() {
+    let mut f = fixture().await;
+    let sim = broker();
+    let next = month_end_orders_resting(&f, &sim).await;
+    let phone = ManualClock::new(at(next.date, 14));
+    engage_kill_switch(&f.store, &phone, "phone").await.unwrap();
+    assert!(!sim.open_orders().await.unwrap().orders.is_empty());
+
+    // From now on the deployment must be signed, and it is not.
+    f.config.signature.required = true;
+    f.config.signature.manifest = f.scratch.path().join("no-such.manifest.json");
+    let clock = ManualClock::new(at(next.date, 15));
+    let err = tick(&f.config, &f.market, &f.store, f.sink.clone(), &sim, &clock)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, AppError::Unsigned(_)), "{err:?}");
+    // The kill ran first: nothing rests at the broker, and the run wrote no heartbeat.
+    assert!(sim.open_orders().await.unwrap().orders.is_empty());
+    assert_eq!(count(&f.store, "heartbeat").await, 1);
+
+    f.db.drop_db().await.unwrap();
+}
+
+/// The simulated broker, except that its first account read (the observe pass, which runs
+/// after restore) first writes an engaged kill switch row, as the phone would while the run
+/// is in flight.
+struct EngagesOnAccount<'a> {
+    sim: &'a SimBroker,
+    store: &'a Store,
+    ts: UnixNanos,
+}
+
+impl Broker for EngagesOnAccount<'_> {
+    type Error = SimError;
+
+    async fn submit(&self, intent: &OrderIntent) -> Result<BrokerOrder, SubmitError<SimError>> {
+        self.sim.submit(intent).await
+    }
+
+    async fn cancel(&self, venue_order_id: VenueOrderId) -> Result<(), SimError> {
+        self.sim.cancel(venue_order_id).await
+    }
+
+    async fn cancel_all(&self) -> Result<(), SimError> {
+        self.sim.cancel_all().await
+    }
+
+    async fn replace(
+        &self,
+        venue_order_id: VenueOrderId,
+        request: &ReplaceRequest,
+    ) -> Result<BrokerOrder, SubmitError<SimError>> {
+        self.sim.replace(venue_order_id, request).await
+    }
+
+    async fn order_by_client_id(
+        &self,
+        client_order_id: ClientOrderId,
+    ) -> Result<Option<BrokerOrder>, SimError> {
+        self.sim.order_by_client_id(client_order_id).await
+    }
+
+    async fn open_orders(&self) -> Result<OpenOrders, SimError> {
+        self.sim.open_orders().await
+    }
+
+    async fn positions(&self) -> Result<Vec<BrokerPosition>, SimError> {
+        self.sim.positions().await
+    }
+
+    async fn account(&self) -> Result<AccountSnapshot, SimError> {
+        let engaged = RiskEvent {
+            kind: RiskEventKind::KillSwitch,
+            detail: json!({ "engaged": true, "by": "phone" }),
+            ts: self.ts,
+        };
+        self.store
+            .record_risk_event(&engaged)
+            .await
+            .map_err(|err| SimError(err.to_string()))?;
+        self.sim.account().await
+    }
+}
+
+#[tokio::test]
+async fn a_switch_engaged_after_restore_stops_the_rebalance() {
+    let f = fixture().await;
+    let sim = broker();
+    // 31 December is a month end: the rebalance is due at this close.
+    let day = date(2025, 12, 31);
+    let close = ManualClock::new(plus_minutes(close_at(day), 10));
+    let wrapper = EngagesOnAccount {
+        sim: &sim,
+        store: &f.store,
+        ts: close.now(),
+    };
+
+    let outcome = session_close(
+        &f.config,
+        &f.market,
+        &f.store,
+        f.sink.clone(),
+        wrapper,
+        &close,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        matches!(
+            outcome,
+            SessionCloseOutcome::Ran {
+                rebalance: RebalanceStep::Halted,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(count(&f.store, "decision").await, 0);
+    assert!(sim.open_orders().await.unwrap().orders.is_empty());
+    // Owed, not lost: the first open tick that can trade makes it.
+    assert_eq!(owed_status(&f.store).await, Some(StepStatus::Started));
+
+    f.db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_flattening_kill_cancels_the_resting_buys_with_the_market_closed() {
+    let mut f = fixture().await;
+    let limits_dir = Scratch::new_dir();
+    f.config.limits_path = flattening_limits(limits_dir.path());
+    let sim = broker();
+    let next = month_end_orders_resting(&f, &sim).await;
+    let phone = ManualClock::new(at(next.date, 14));
+    engage_kill_switch(&f.store, &phone, "phone").await.unwrap();
+
+    // A tick before the open: the market is closed, so no rebalance can go out.
+    let pre_open = ManualClock::new(at(next.date, 10));
+    let outcome = tick(
+        &f.config,
+        &f.market,
+        &f.store,
+        f.sink.clone(),
+        &sim,
+        &pre_open,
+    )
+    .await
+    .unwrap();
+
+    assert!(!outcome.market_open, "{outcome:?}");
+    assert!(outcome.kill_cancelled, "{outcome:?}");
+    assert_eq!(outcome.rebalance, None);
+    assert!(sim.open_orders().await.unwrap().orders.is_empty());
 
     f.db.drop_db().await.unwrap();
 }

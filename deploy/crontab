@@ -10,6 +10,10 @@
 # Each line goes through deploy/run.sh, which reads /etc/nisse/nisse.env and appends the
 # command's output to log/<name>.log.
 
+# Every minute, around the clock: if the kill switch is engaged (from the phone, or by a row
+# written any other way), cancel what is open at the broker. One small query when it is off.
+* * * * *           /opt/nisse/deploy/run.sh killwatch target/release/nisse-engine kill-watch config/engine/paper.json
+
 # 13:30-21:00 UTC covers 09:30-16:00 New York all year: reconcile, watch the drawdown,
 # write a heartbeat. Every two minutes, so that one slow or skipped tick does not age the
 # heartbeat past `heartbeat_max_age_seconds` in the limits file (300).

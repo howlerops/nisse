@@ -11,6 +11,7 @@ pub mod config;
 pub mod deployment;
 mod error;
 pub mod ingest;
+pub mod kill_watch;
 pub mod market;
 pub mod restore;
 pub mod session;
