@@ -12,6 +12,7 @@ use chrono::DateTime;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
+use crate::hash::hex_value;
 use crate::{CoreError, Hash32, canonical_json, config_hash};
 
 /// Shortest key accepted, in bytes.
@@ -48,9 +49,9 @@ impl SigningKey {
         let (pairs, _) = text.as_chunks::<2>();
         let mut bytes = Vec::with_capacity(pairs.len());
         for &[hi_char, lo_char] in pairs {
-            let hi = hex_nibble(hi_char)
+            let hi = hex_value(hi_char)
                 .ok_or_else(|| invalid("signing key contains a non-hex character"))?;
-            let lo = hex_nibble(lo_char)
+            let lo = hex_value(lo_char)
                 .ok_or_else(|| invalid("signing key contains a non-hex character"))?;
             bytes.push((hi << 4) | lo);
         }
@@ -71,16 +72,6 @@ impl SigningKey {
 impl fmt::Debug for SigningKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "SigningKey({} bytes)", self.0.len())
-    }
-}
-
-/// The value of one hex digit (either case), or `None` if the byte is not a hex digit.
-const fn hex_nibble(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
     }
 }
 
