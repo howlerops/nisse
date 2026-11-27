@@ -45,6 +45,13 @@ impl PositionBook {
             .collect()
     }
 
+    /// Every held position, in symbol order.
+    pub fn iter(&self) -> impl Iterator<Item = (Symbol, Position)> + '_ {
+        self.positions
+            .iter()
+            .map(|(symbol, position)| (*symbol, *position))
+    }
+
     /// Applies one fill (`qty` and `px` positive; `side` gives the direction) and returns the
     /// row to record. Rules, with `signed = +qty` for a buy and `-qty` for a sell:
     ///
@@ -144,6 +151,23 @@ impl PositionBook {
             avg_cost: new_cost,
             ts,
         })
+    }
+
+    /// Puts back a position read from the store at start-up (the newest `position_event` row
+    /// for the symbol). Unlike `adopt` it returns no row: nothing changed, so nothing is
+    /// recorded. A zero `qty` removes the entry. `avg_cost` is stored normalized.
+    pub fn restore(&mut self, symbol: Symbol, qty: Decimal, avg_cost: Decimal) {
+        if qty.is_zero() {
+            self.positions.remove(&symbol);
+        } else {
+            self.positions.insert(
+                symbol,
+                Position {
+                    qty,
+                    avg_cost: avg_cost.normalize(),
+                },
+            );
+        }
     }
 }
 
@@ -509,5 +533,74 @@ mod tests {
         assert_eq!(book.get(spy), Position::default());
         assert_eq!(book.get(qqq), pos("2", "21"));
         assert_eq!(book.get(iwm), pos("0", "0"));
+    }
+
+    #[test]
+    fn restore_then_get_returns_the_position() {
+        let spy = Symbol::new("SPY");
+        let mut book = PositionBook::new();
+        book.restore(spy, d("-4"), d("12.50"));
+        assert_eq!(book.get(spy), pos("-4", "12.5"));
+        assert_eq!(book.get(spy).avg_cost.scale(), 1);
+    }
+
+    #[test]
+    fn restore_normalizes_the_average_cost() {
+        let spy = Symbol::new("SPY");
+        let mut book = PositionBook::new();
+        book.restore(spy, d("10"), d("105.00"));
+        assert_eq!(book.get(spy).avg_cost, d("105"));
+        assert_eq!(book.get(spy).avg_cost.scale(), 0);
+    }
+
+    #[test]
+    fn restore_with_zero_removes_an_existing_position() {
+        let spy = Symbol::new("SPY");
+        let mut book = PositionBook::new();
+        fill(&mut book, spy, OrderSide::Buy, "10", "100");
+        book.restore(spy, d("0"), d("100"));
+        assert_eq!(book.get(spy), Position::default());
+        assert!(book.quantities().is_empty());
+        assert_eq!(book.iter().count(), 0);
+    }
+
+    #[test]
+    fn restore_then_adopt_same_figures_is_none() {
+        let spy = Symbol::new("SPY");
+        let mut book = PositionBook::new();
+        book.restore(spy, d("10"), d("100.0"));
+        assert_eq!(book.adopt(spy, d("10"), Some(d("100")), ts()), None);
+        assert_eq!(book.get(spy), pos("10", "100"));
+    }
+
+    #[test]
+    fn restore_is_reflected_in_quantities() {
+        let spy = Symbol::new("SPY");
+        let qqq = Symbol::new("QQQ");
+        let mut book = PositionBook::new();
+        book.restore(qqq, d("-3"), d("20"));
+        book.restore(spy, d("10"), d("100"));
+        let quantities: Vec<(Symbol, Decimal)> = book.quantities().into_iter().collect();
+        assert_eq!(quantities, vec![(qqq, d("-3")), (spy, d("10"))]);
+    }
+
+    #[test]
+    fn iter_lists_positions_in_symbol_order() {
+        let spy = Symbol::new("SPY");
+        let qqq = Symbol::new("QQQ");
+        let iwm = Symbol::new("IWM");
+        let mut book = PositionBook::new();
+        book.restore(spy, d("10"), d("100"));
+        book.restore(iwm, d("2"), d("7"));
+        book.restore(qqq, d("-4"), d("50"));
+        let listed: Vec<(Symbol, Position)> = book.iter().collect();
+        assert_eq!(
+            listed,
+            vec![
+                (iwm, pos("2", "7")),
+                (qqq, pos("-4", "50")),
+                (spy, pos("10", "100")),
+            ]
+        );
     }
 }
