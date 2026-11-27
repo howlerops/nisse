@@ -1868,7 +1868,6 @@ dependencies = [
 name = "nisse-app"
 version = "0.0.0"
 dependencies = [
- "anyhow",
  "chrono",
  "nisse-alpaca-adapter",
  "nisse-bars",
@@ -1881,7 +1880,6 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
- "tokio-postgres",
  "tracing",
 ]
 

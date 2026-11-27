@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use chrono::NaiveDate;
 use nisse_app::{
-    commands::{KillOutcome, Status, kill, release_kill, status},
+    commands::{Status, kill, release_kill, status},
     config::EngineConfig,
     session::{RebalanceStep, SessionCloseOutcome, session_close, tick},
 };
@@ -117,11 +117,10 @@ async fn kill_records_the_switch_and_cancels_open_orders() {
     month_end_with_open_orders(&f.store, f.sink.clone(), &f.config, &f.market, &sim).await;
 
     let clock = ManualClock::new(plus_minutes(close_at(date(2025, 12, 31)), 20));
-    let outcome = kill(&f.store, &sim, &clock, "ana", SHORT_WAIT)
-        .await
-        .unwrap();
+    let outcome = kill(&f.store, Some(&sim), &clock, "ana", SHORT_WAIT).await;
 
-    assert_eq!(outcome, KillOutcome { engine_idle: true });
+    assert!(outcome.complete(), "{outcome:?}");
+    assert!(outcome.errors.is_empty());
     assert!(sim.open_orders().await.unwrap().orders.is_empty());
     assert!(
         status(&f.config, &f.store, &clock)
@@ -157,11 +156,15 @@ async fn kill_with_an_engine_in_flight_still_engages() {
     );
 
     let clock = ManualClock::new(plus_minutes(close_at(date(2025, 12, 31)), 20));
-    let outcome = kill(&f.store, &sim, &clock, "ana", SHORT_WAIT)
-        .await
-        .unwrap();
+    let outcome = kill(&f.store, Some(&sim), &clock, "ana", SHORT_WAIT).await;
 
-    assert_eq!(outcome, KillOutcome { engine_idle: false });
+    assert!(!outcome.engine_idle);
+    assert!(
+        outcome.switch_recorded && outcome.orders_cancelled,
+        "{outcome:?}"
+    );
+    assert!(!outcome.complete());
+    assert_eq!(outcome.errors.len(), 1, "{outcome:?}");
     assert_eq!(kill_switch_rows(&f.store).await, 1);
     assert!(
         status(&f.config, &f.store, &clock)
@@ -181,9 +184,7 @@ async fn release_kill_lowers_the_switch() {
     let sim = broker();
     let clock = ManualClock::new(plus_minutes(close_at(date(2025, 12, 31)), 20));
 
-    kill(&f.store, &sim, &clock, "ana", SHORT_WAIT)
-        .await
-        .unwrap();
+    kill(&f.store, Some(&sim), &clock, "ana", SHORT_WAIT).await;
     release_kill(&f.store, &clock, "ana").await.unwrap();
 
     assert!(
@@ -262,6 +263,31 @@ async fn status_is_stable_and_writes_nothing() {
 
     assert_eq!(first, second);
     assert_eq!(count(&f.store, "strategy_version").await, 1);
+
+    f.db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn kill_without_a_broker_still_records_the_switch() {
+    let f = fixture().await;
+    let clock = ManualClock::new(plus_minutes(close_at(date(2025, 12, 31)), 20));
+
+    let outcome =
+        kill::<nisse_engine::SimBroker, _>(&f.store, None, &clock, "ana", SHORT_WAIT).await;
+
+    assert!(
+        outcome.switch_recorded && outcome.engine_idle,
+        "{outcome:?}"
+    );
+    assert!(!outcome.orders_cancelled);
+    assert!(!outcome.complete());
+    assert_eq!(outcome.errors.len(), 1, "{outcome:?}");
+    assert!(
+        status(&f.config, &f.store, &clock)
+            .await
+            .unwrap()
+            .kill_switch
+    );
 
     f.db.drop_db().await.unwrap();
 }

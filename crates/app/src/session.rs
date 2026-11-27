@@ -113,13 +113,17 @@ pub async fn tick<M: Market, B: Broker, C: Clock>(
 
     let due = resize_owed(store).await? || trader.needs_flatten();
     let attempt_key = format!("tick/{}T{:02}", today, utc_hour(now));
+    // A step-down seen by this very tick is acted on at once. Anything older is tried once
+    // an hour: an attempt that completed (whatever its orders met) is not repeated within
+    // the hour, while one that failed part-way may be.
+    let tried_this_hour = matches!(
+        store.step_status(&attempt_key, TICK_ATTEMPT_STEP).await?,
+        Some((StepStatus::Done, _))
+    );
     let rebalance = if due
         && market_open
         && !halted(&trader, &observed)
-        && store
-            .step_status(&attempt_key, TICK_ATTEMPT_STEP)
-            .await?
-            .is_none()
+        && (observed.stepped_down || !tried_this_hour)
     {
         let report = step(
             store,
@@ -136,7 +140,7 @@ pub async fn tick<M: Market, B: Broker, C: Clock>(
         None
     };
 
-    finish(store, &sink, config, now).await?;
+    finish(store, &sink, config, trader.clock().now()).await?;
     Ok(TickOutcome {
         fills,
         mode_change: observed.mode_change,
@@ -240,7 +244,7 @@ pub async fn session_close<M: Market, B: Broker, C: Clock>(
     )
     .await?;
 
-    finish(store, &sink, config, now).await?;
+    finish(store, &sink, config, trader.clock().now()).await?;
     Ok(SessionCloseOutcome::Ran {
         session_date: session.date,
         ingest,
@@ -269,7 +273,16 @@ async fn rebalance_step<B: Broker, C: Clock>(
         return Ok(RebalanceStep::AlreadyDone);
     }
 
-    let month_end = calendar.is_last_session_of_month(session.date) == Some(true);
+    // `None` means the calendar does not reach the session after this one. Guessing "not a
+    // month end" would skip the monthly rebalance without a trace.
+    let month_end = calendar
+        .is_last_session_of_month(session.date)
+        .ok_or_else(|| {
+            AppError::Market(format!(
+                "the calendar does not say whether {} ends its month",
+                session.date
+            ))
+        })?;
     let due = month_end || resize_owed(store).await? || trader.needs_flatten();
     if !due {
         store
@@ -482,7 +495,8 @@ async fn settle_or_owe(
     Ok(())
 }
 
-/// Flushes the record queue, then writes this process's heartbeat.
+/// Flushes the record queue, then writes this process's heartbeat, stamped with the time of
+/// the write (`now`), not the time the run began: the dead-man check measures from it.
 async fn finish(
     store: &Store,
     sink: &StoreWriter,

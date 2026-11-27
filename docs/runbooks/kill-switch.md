@@ -26,9 +26,11 @@ nisse-engine release-kill config/engine/paper.json --by <your name>
 nisse-engine status config/engine/paper.json
 ```
 
-`kill` writes the flag, asks the broker to cancel every open order, then waits up to a minute
-for any engine run in flight to end and cancels once more. It does not need the engine's
-state to be readable. If it reports that a run was still in flight, run it again. Every
+`kill` asks the broker to cancel every open order, writes the flag, then waits up to a minute
+for any engine run in flight to end and cancels once more. It needs neither the engine's
+state nor its config file to be readable, and the cancel does not wait for the database. It
+prints which of the three were done (orders cancelled, switch recorded, engine idle) and
+exits 1 unless all were: then run it again, or go out of band. Every
 engine run reads the flag when it starts. `status` shows the flag, the drawdown mode,
 positions and the last heartbeat without changing anything.
 

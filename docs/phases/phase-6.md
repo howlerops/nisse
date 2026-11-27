@@ -32,10 +32,12 @@ Paper is a plumbing test, not a promotion signal. This phase has two halves:
 - `nisse-engine tick <config.json>`: every few minutes while the market is open, and once after
   the open.
 - `nisse-engine kill <config.json> --by <name>` and `nisse-engine release-kill <config.json>
-  --by <name>`. `kill` records the switch, cancels every open order, waits up to a minute
-  for a run in flight to end and cancels again. It sets up the store and the broker
-  independently: with the store unreachable it still cancels, with the broker keys missing
-  it still records the switch (either way it exits 1 and says which half was not done).
+  --by <name>`. `kill` cancels every open order, records the switch, waits up to a minute
+  for a run in flight to end and cancels again. It does not read the config file, the
+  cancel goes out before the store is contacted, and the store is given ten seconds per
+  step: with the store unreachable it still cancels, with the broker keys missing it still
+  records the switch. It prints which of the three (orders cancelled, switch recorded,
+  engine idle) were done and exits 1 unless all were.
 - `nisse-engine status <config.json>`: prints the risk state, open orders and positions the
   engine would start from. Reads only.
 
@@ -110,8 +112,9 @@ account. A halted run decides nothing, since every decision's order would be ref
 the rebalance stays owed. After `release-kill` the first tick that may decide makes it.
 
 A tick tries an owed rebalance at most once an hour (its attempt is the step `rebalance`
-under run key `tick/<UTC date>T<hour>`), so orders that stay blocked for another reason cost
-one set of decisions an hour, not one every five minutes.
+under run key `tick/<UTC date>T<hour>`; only a completed attempt counts), so orders that stay
+blocked for another reason cost one set of decisions an hour, not one every tick. A
+step-down seen by the tick itself is not held back by that: it is acted on at once.
 
 Not covered: orders that were sent by a completed rebalance and then cancelled by `kill` are
 not re-sent after `release-kill`; the book stays as it is until the next month end or owed
@@ -150,14 +153,14 @@ The calendar is fetched from `history_start` to ten days past today, so "last se
 month" is known.
 
 Exit codes: 0 done or nothing to do; 1 a step failed (re-run the command); 2 bad arguments;
-3 another engine holds the lock.
+3 another engine still held the lock after 45 seconds.
 
 ## Deployment (files in `deploy/`)
 
 - `deploy/crontab`: the schedule, in UTC (the host's time zone must be UTC; nothing depends
   on `CRON_TZ`). It covers both halves of the year by running a little too often: `tick`
-  every 5 minutes from 13:30 to 21:00 on weekdays, `session-close` at 20:10, 20:40, 21:10
-  and 21:40 (early and repeated runs do nothing), `nisse-score` at 23:00,
+  every 2 minutes from 13:30 to 21:00 on weekdays (the dead-man limit is 300 seconds),
+  `session-close` at 20:11, 20:41, 21:11 and 21:41 (early and repeated runs do nothing), `nisse-score` at 23:00,
   `scripts/replay.sh` at 23:30.
 - `deploy/run.sh`: what every cron line runs: reads the environment file, appends the
   command's output to `log/<name>.log`.

@@ -1,5 +1,7 @@
 //! What every command does first: rebuild the trader's state from the store and the bar files.
 
+use std::time::Duration;
+
 use nisse_bars::BarReader;
 use nisse_core::nautilus::{Symbol, UnixNanos};
 use nisse_core::{
@@ -41,6 +43,27 @@ pub async fn take_engine_lock(store: &Store) -> Result<(), AppError> {
         Ok(())
     } else {
         Err(AppError::Busy)
+    }
+}
+
+/// How often [`wait_for_engine_lock`] tries.
+const LOCK_RETRY: Duration = Duration::from_millis(500);
+
+/// Tries the engine lock every half second until `wait` has passed. `true` when taken (it is
+/// then held by the store's connection, and a later [`take_engine_lock`] on the same
+/// connection succeeds). Used where two scheduled commands may start close together: the
+/// later one waits its turn rather than giving up.
+pub async fn wait_for_engine_lock(store: &Store, wait: Duration) -> Result<bool, AppError> {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        if scoring::try_advisory_lock(store.client(), ENGINE_LOCK).await? {
+            return Ok(true);
+        }
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return Ok(false);
+        }
+        tokio::time::sleep(left.min(LOCK_RETRY)).await;
     }
 }
 

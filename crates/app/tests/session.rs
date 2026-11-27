@@ -645,3 +645,45 @@ async fn a_month_end_close_under_the_kill_switch_is_owed_not_lost() {
 
     f.db.drop_db().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_step_down_is_acted_on_at_once_even_after_an_attempt_this_hour() {
+    let f = fixture().await;
+    let sim = broker();
+    let day = date(2025, 12, 15);
+    let close = ManualClock::new(plus_minutes(close_at(day), 10));
+    session_close(&f.config, &f.market, &f.store, f.sink.clone(), &sim, &close)
+        .await
+        .unwrap();
+
+    // An owed rebalance is tried at 15:00; that is this hour's attempt.
+    let next = date(2025, 12, 16);
+    owe(&f.store, close.now()).await;
+    let first = ManualClock::new(at(next, 15));
+    let outcome = tick(&f.config, &f.market, &f.store, f.sink.clone(), &sim, &first)
+        .await
+        .unwrap();
+    assert!(outcome.rebalance.is_some(), "{outcome:?}");
+
+    // Five minutes later the equity is far under a peak (as if it had just fallen): the mode
+    // steps down in this tick, and the tick does not wait for the next hour to act on it.
+    risk_event::insert_many(f.store.client(), &[peak_event("200000", first.now())])
+        .await
+        .unwrap();
+    let second = ManualClock::new(plus_minutes(at(next, 15), 5));
+    let outcome = tick(
+        &f.config,
+        &f.market,
+        &f.store,
+        f.sink.clone(),
+        &sim,
+        &second,
+    )
+    .await
+    .unwrap();
+    let (from, to) = outcome.mode_change.expect("a step down");
+    assert!(to.scale() < from.scale());
+    assert!(outcome.rebalance.is_some(), "{outcome:?}");
+
+    f.db.drop_db().await.unwrap();
+}

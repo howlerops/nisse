@@ -11,16 +11,18 @@
 # command's output to log/<name>.log.
 
 # 13:30-21:00 UTC covers 09:30-16:00 New York all year: reconcile, watch the drawdown,
-# write a heartbeat.
-30-59/5 13 * * 1-5  /opt/nisse/deploy/run.sh tick target/release/nisse-engine tick config/engine/paper.json
-*/5 14-20 * * 1-5   /opt/nisse/deploy/run.sh tick target/release/nisse-engine tick config/engine/paper.json
+# write a heartbeat. Every two minutes, so that one slow or skipped tick does not age the
+# heartbeat past `heartbeat_max_age_seconds` in the limits file (300).
+30-59/2 13 * * 1-5  /opt/nisse/deploy/run.sh tick target/release/nisse-engine tick config/engine/paper.json
+*/2 14-20 * * 1-5   /opt/nisse/deploy/run.sh tick target/release/nisse-engine tick config/engine/paper.json
 
 # After the close (20:00 UTC in summer, 21:00 in winter; 13:00 New York on a half day, which
 # these runs still reach inside the six hours a close stays decidable): ingest the session's
 # bars, reconcile, rebalance on a month end. The later runs are no-ops when an earlier one
-# finished; they are there for the evening one failed.
-10,40 20 * * 1-5    /opt/nisse/deploy/run.sh session target/release/nisse-engine session-close config/engine/paper.json
-10,40 21 * * 1-5    /opt/nisse/deploy/run.sh session target/release/nisse-engine session-close config/engine/paper.json
+# finished; they are there for the evening one failed. On odd minutes, so they do not start
+# with a tick; a command that does find another one running waits up to 45 s for its turn.
+11,41 20 * * 1-5    /opt/nisse/deploy/run.sh session target/release/nisse-engine session-close config/engine/paper.json
+11,41 21 * * 1-5    /opt/nisse/deploy/run.sh session target/release/nisse-engine session-close config/engine/paper.json
 
 # Nightly jobs: score decisions, then replay every decision this build made.
 0 23 * * 1-5        /opt/nisse/deploy/run.sh score target/release/nisse-score config/eval/gates.json data/bars

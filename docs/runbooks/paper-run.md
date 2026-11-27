@@ -32,16 +32,16 @@ runs the engine against Alpaca.
    hand during market hours. The first
    `session-close` downloads the whole bar history.
 8. **Schedule**: `crontab deploy/crontab`. On the first day check `log/tick.log` gets a line
-   every five minutes between 13:30 and 21:00 UTC and `log/session.log` gets its lines
+   every two minutes between 13:30 and 21:00 UTC and `log/session.log` gets its lines
    after the close; if not, cron is not running the lines (wrong user, wrong time zone).
 9. **Dead-man check** on another machine: `nisse-deadman config/limits/limits.json` from cron
    every few minutes during market hours; a non-zero exit is the alert.
 
 ## Stopping
 
-`target/release/nisse-engine kill config/engine/paper.json --by <your name>` engages the kill
-switch, cancels every open order, waits for any engine run in flight to end and cancels once
-more. If it says a run was still in flight, run it again. `release-kill` with the same
+`target/release/nisse-engine kill config/engine/paper.json --by <your name>` cancels every
+open order, engages the kill switch, waits for any engine run in flight to end and cancels
+once more. It prints which of those were done; if any was not, it exits 1: run it again. `release-kill` with the same
 arguments lowers the switch; nothing else does. If the host is unreachable, use the
 out-of-band steps in `docs/runbooks/kill-switch.md`.
 

@@ -26,6 +26,7 @@ use nisse_app::{
     commands::{self, Command, USAGE},
     config::EngineConfig,
     market::AlpacaMarket,
+    restore::wait_for_engine_lock,
     session::{session_close, tick},
 };
 use nisse_core::SystemClock;
@@ -35,6 +36,8 @@ use nisse_store::{Store, StoreError, StoreWriter, WriterConfig};
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long `kill` waits for a run in flight to finish.
 const KILL_LOCK_WAIT: Duration = Duration::from_secs(60);
+/// How long `tick` and `session-close` wait for another engine command to finish.
+const ENGINE_LOCK_WAIT: Duration = Duration::from_secs(45);
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -46,6 +49,11 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // `kill` must work when the config file is broken, so it never reads it: the trading
+    // client needs nothing from it (this build only knows Alpaca's paper endpoints).
+    if let Command::Kill { by, .. } = &command {
+        return run_kill(by).await;
+    }
     let config = match EngineConfig::load(command.config_path()) {
         Ok(config) => config,
         Err(err) => {
@@ -53,16 +61,8 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let outcome = match &command {
-        Command::Kill { by, .. } => run_kill(&config, by).await,
-        _ => execute(&command, &config).await,
-    };
-    match outcome {
-        Ok(Done::Yes) => ExitCode::SUCCESS,
-        Ok(Done::EngineStillRunning) => {
-            println!("kill: engaged; an engine run is still in flight; run kill again");
-            ExitCode::FAILURE
-        }
+    match execute(&command, &config).await {
+        Ok(()) => ExitCode::SUCCESS,
         Err(RunError::App(AppError::Busy)) => {
             eprintln!("nisse-engine: another engine process is running");
             ExitCode::from(3)
@@ -72,13 +72,6 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
-}
-
-/// Whether a command finished its job.
-enum Done {
-    Yes,
-    /// `kill` engaged the switch, but a run was still in flight when the wait ran out.
-    EngineStillRunning,
 }
 
 /// Why a command failed: the store, the application, or the record writer.
@@ -92,11 +85,13 @@ enum RunError {
     Store(#[from] StoreError),
     #[error("record writer task failed: {0}")]
     WriterTask(String),
+    #[error("kill is handled before the other commands")]
+    KillNotDispatched,
 }
 
 /// Connects, runs the command, then waits for the record writer to commit what is queued. A
 /// command error wins over a writer error; a writer error fails an otherwise successful run.
-async fn execute(command: &Command, config: &EngineConfig) -> Result<Done, RunError> {
+async fn execute(command: &Command, config: &EngineConfig) -> Result<(), RunError> {
     let url = std::env::var("DATABASE_URL").map_err(|_| RunError::Env("DATABASE_URL"))?;
     // Deliberately not printed: the URL may contain a password.
     let store = Store::new(nisse_store::connect(&url).await?);
@@ -111,40 +106,76 @@ async fn execute(command: &Command, config: &EngineConfig) -> Result<Done, RunEr
         Err(err) => Err(RunError::WriterTask(err.to_string())),
     };
     match (result, written) {
-        (Ok(done), Ok(())) => Ok(done),
+        (Ok(()), Ok(())) => Ok(()),
         (Err(err), _) | (Ok(_), Err(err)) => Err(err),
     }
 }
 
-/// `kill`. The store and the broker are set up independently, so that whichever can be
-/// reached is used: with the store down the open orders are still cancelled, and with the
-/// broker keys missing the switch is still recorded. Either half failing is exit 1.
-async fn run_kill(config: &EngineConfig, by: &str) -> Result<Done, RunError> {
-    let store = connect_store().await;
-    let trading =
-        alpaca_http().map(|http| AlpacaTrading::new(http, &AlpacaConfig::paper(config.feed)));
-    match (store, trading) {
-        (Ok(store), Ok(trading)) => {
-            let outcome =
-                commands::kill(&store, &trading, &SystemClock, by, KILL_LOCK_WAIT).await?;
-            if outcome.engine_idle {
-                println!("kill: engaged; engine idle");
-                Ok(Done::Yes)
-            } else {
-                Ok(Done::EngineStillRunning)
+/// `kill`. Order matters: the broker cancel goes first and waits for nothing else, then the
+/// store is given a bounded time to connect, then the library's `kill` records the switch,
+/// waits for a run in flight and cancels again. Whatever could not be done is printed, one
+/// line each, and makes the exit code 1.
+async fn run_kill(by: &str) -> ExitCode {
+    // The feed only matters to market data, which `kill` never reads.
+    let trading = alpaca_http().map(|http| {
+        AlpacaTrading::new(http, &AlpacaConfig::paper(nisse_alpaca_adapter::Feed::Iex))
+    });
+    let mut first_cancel = false;
+    match &trading {
+        Ok(trading) => match commands::cancel_open_orders(trading).await {
+            Ok(()) => {
+                first_cancel = true;
+                println!("kill: open orders cancelled");
             }
+            Err(err) => eprintln!("nisse-engine: kill: open orders were NOT cancelled: {err}"),
+        },
+        Err(err) => eprintln!("nisse-engine: kill: no broker client: {err}"),
+    }
+
+    let store = match tokio::time::timeout(commands::KILL_STORE_TIMEOUT, connect_store()).await {
+        Ok(Ok(store)) => store,
+        Ok(Err(err)) => {
+            eprintln!("nisse-engine: kill: the switch was NOT recorded: {err}");
+            return ExitCode::FAILURE;
         }
-        (Ok(store), Err(err)) => {
-            commands::engage_kill_switch(&store, &SystemClock, by).await?;
-            println!("kill: engaged, but open orders were NOT cancelled (broker not reachable)");
-            Err(err.into())
+        Err(_) => {
+            eprintln!("nisse-engine: kill: the switch was NOT recorded: the store did not answer");
+            return ExitCode::FAILURE;
         }
-        (Err(err), Ok(trading)) => {
-            commands::cancel_open_orders(&trading).await?;
-            println!("kill: open orders cancelled, but the switch was NOT recorded (no store)");
-            Err(err)
-        }
-        (Err(err), Err(_)) => Err(err),
+    };
+    let outcome = commands::kill(
+        &store,
+        trading.as_ref().ok(),
+        &SystemClock,
+        by,
+        KILL_LOCK_WAIT,
+    )
+    .await;
+    for line in &outcome.errors {
+        eprintln!("nisse-engine: kill: {line}");
+    }
+    println!(
+        "kill: switch {}; orders {}; engine {}",
+        if outcome.switch_recorded {
+            "engaged"
+        } else {
+            "NOT recorded"
+        },
+        if outcome.orders_cancelled || (first_cancel && trading.is_err()) {
+            "cancelled"
+        } else {
+            "NOT cancelled"
+        },
+        if outcome.engine_idle {
+            "idle"
+        } else {
+            "possibly still running"
+        },
+    );
+    if outcome.complete() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }
 
@@ -161,32 +192,45 @@ async fn dispatch(
     config: &EngineConfig,
     store: &Store,
     sink: StoreWriter,
-) -> Result<Done, RunError> {
+) -> Result<(), RunError> {
     match command {
         Command::Status { .. } => {
             let status = commands::status(config, store, &SystemClock).await?;
             println!("{status}");
-            Ok(Done::Yes)
+            Ok(())
         }
         Command::ReleaseKill { by, .. } => {
             commands::release_kill(store, &SystemClock, by).await?;
             println!("release-kill: released by {by}");
-            Ok(Done::Yes)
+            Ok(())
         }
-        // Handled by `run_kill`, which must work with only one of the store and the broker.
-        Command::Kill { by, .. } => run_kill(config, by).await,
+        // `main` handles `kill` before any config or store is needed; this arm only keeps
+        // the match total.
+        Command::Kill { .. } => Err(RunError::KillNotDispatched),
         Command::Tick { .. } => {
             let (trading, market) = alpaca_trading_and_market(config)?;
+            wait_for_turn(store).await?;
             let outcome = tick(config, &market, store, sink, trading, SystemClock).await?;
             println!("{}", commands::describe_tick(&outcome));
-            Ok(Done::Yes)
+            Ok(())
         }
         Command::SessionClose { .. } => {
             let (trading, market) = alpaca_trading_and_market(config)?;
+            wait_for_turn(store).await?;
             let outcome = session_close(config, &market, store, sink, trading, SystemClock).await?;
             println!("{}", commands::describe_session_close(&outcome));
-            Ok(Done::Yes)
+            Ok(())
         }
+    }
+}
+
+/// Waits up to `ENGINE_LOCK_WAIT` for another engine command to finish (a tick and a
+/// session-close scheduled close together), then gives up as `Busy`.
+async fn wait_for_turn(store: &Store) -> Result<(), AppError> {
+    if wait_for_engine_lock(store, ENGINE_LOCK_WAIT).await? {
+        Ok(())
+    } else {
+        Err(AppError::Busy)
     }
 }
 

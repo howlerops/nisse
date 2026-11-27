@@ -13,17 +13,14 @@ use nisse_engine::{EngineError, RebalanceReport, SyncOptions};
 use nisse_risk::{DrawdownMode, RiskState};
 use nisse_store::{
     Store,
-    tables::{
-        engine_step::StepStatus,
-        heartbeat,
-        scoring::{self, ENGINE_LOCK},
-    },
+    tables::{engine_step::StepStatus, heartbeat},
 };
 use rust_decimal::Decimal;
 use serde_json::json;
 
 use crate::AppError;
 use crate::config::EngineConfig;
+use crate::restore::wait_for_engine_lock;
 use crate::session::{
     RESIZE_RUN_KEY, RESIZE_STEP, RebalanceStep, SessionCloseOutcome, TickOutcome,
 };
@@ -33,9 +30,6 @@ pub const USAGE: &str = "usage: nisse-engine <session-close|tick|status> <config
 
 /// The longest name `--by` accepts.
 const MAX_BY_CHARS: usize = 64;
-/// How often `kill` retries the engine lock while it waits.
-const LOCK_RETRY: Duration = Duration::from_millis(500);
-
 /// One parsed command line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -128,49 +122,129 @@ fn require_by(by: Option<String>) -> Result<String, String> {
     Ok(by)
 }
 
-/// What `kill` did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How long `kill` waits for one store statement before giving up on it. The broker half
+/// never waits for the store.
+pub const KILL_STORE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What `kill` did, half by half, so the caller can say exactly what is and is not done.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KillOutcome {
+    /// The broker accepted a cancel of every open order (the last one sent).
+    pub orders_cancelled: bool,
+    /// The `kill_switch` event is in the store: every later engine run starts halted.
+    pub switch_recorded: bool,
     /// No engine process was running by the end (the engine lock could be taken), and open
     /// orders were cancelled once more after that. `false`: an engine run was still in
-    /// flight when the wait ran out; run the command again.
+    /// flight when the wait ran out, or the store could not say; run the command again.
     pub engine_idle: bool,
+    /// What went wrong, one line per failure. Empty when all three are true.
+    pub errors: Vec<String>,
+}
+
+impl KillOutcome {
+    /// Everything `kill` is for was done.
+    #[must_use]
+    pub const fn complete(&self) -> bool {
+        self.orders_cancelled && self.switch_recorded && self.engine_idle
+    }
 }
 
 /// Engages the kill switch. Deliberately does not restore a trader and does not need the
 /// engine lock first: it must work when the risk state is unreadable or a run is in flight.
+/// Every half is attempted whatever happened to the others, and none is reported as an
+/// error return: the outcome says what was done.
 ///
-/// 1. Record a `kill_switch` risk event (`engaged: true`, `by`) with `store.record_risk_event`.
-/// 2. `broker.cancel_all()`.
-/// 3. Try to take the engine lock, retrying every 500 ms until `lock_wait` has passed
-///    (tokio::time::sleep). Once taken, no engine run is in flight and any later run will read
-///    the switch as engaged: call `cancel_all()` again and return `engine_idle: true`.
-///    Not taken in time: `engine_idle: false`.
-///
-/// Step 2 is attempted even when step 1 failed; if both fail the store error is returned.
+/// 1. `broker.cancel_all()`, first, because it does not depend on the store. `broker` is
+///    `None` when the broker client could not be built (missing keys).
+/// 2. Record a `kill_switch` risk event (`engaged: true`, `by`), giving the store
+///    [`KILL_STORE_TIMEOUT`].
+/// 3. Try to take the engine lock, retrying until `lock_wait` has passed. Once taken, no
+///    engine run is in flight and any later run will read the switch as engaged: cancel
+///    again and report `engine_idle: true`.
 pub async fn kill<B: Broker, C: Clock>(
     store: &Store,
-    broker: &B,
+    broker: Option<&B>,
     clock: &C,
     by: &str,
     lock_wait: Duration,
-) -> Result<KillOutcome, AppError> {
-    let recorded = engage_kill_switch(store, clock, by).await;
-    let cancelled = cancel_open_orders(broker).await;
+) -> KillOutcome {
+    let mut errors = Vec::new();
+    let mut orders_cancelled = cancel_for_kill(broker, &mut errors).await;
 
-    let engine_idle = wait_for_engine_lock(store, lock_wait).await?;
-    // The lock is held by this connection from here on, so no run is in flight. Cancel what
-    // a run placed before it could see the switch. The lock goes with the process.
-    let final_cancelled = if engine_idle {
-        cancel_open_orders(broker).await
-    } else {
-        Ok(())
+    let switch_recorded = match tokio::time::timeout(
+        KILL_STORE_TIMEOUT,
+        engage_kill_switch(store, clock, by),
+    )
+    .await
+    {
+        Ok(Ok(())) => true,
+        Ok(Err(err)) => {
+            errors.push(format!("the switch was NOT recorded: {err}"));
+            false
+        }
+        Err(_) => {
+            errors.push("the switch was NOT recorded: the store did not answer".to_owned());
+            false
+        }
     };
 
-    recorded?;
-    cancelled?;
-    final_cancelled?;
-    Ok(KillOutcome { engine_idle })
+    // The lock wait is itself bounded: each try is one statement, given the same timeout.
+    let waited = tokio::time::timeout(
+        lock_wait.saturating_add(KILL_STORE_TIMEOUT),
+        wait_for_engine_lock(store, lock_wait),
+    )
+    .await;
+    let engine_idle = match waited {
+        Ok(Ok(idle)) => {
+            if !idle {
+                errors.push("an engine run is still in flight; run kill again".to_owned());
+            }
+            idle
+        }
+        Ok(Err(err)) => {
+            errors.push(format!(
+                "could not tell whether an engine run is in flight: {err}"
+            ));
+            false
+        }
+        Err(_) => {
+            errors.push(
+                "could not tell whether an engine run is in flight: the store did not answer"
+                    .to_owned(),
+            );
+            false
+        }
+    };
+    // The lock is held by this connection from here on, so no run is in flight. Cancel what
+    // a run placed before it could see the switch. The lock goes with the process.
+    if engine_idle {
+        orders_cancelled = cancel_for_kill(broker, &mut errors).await;
+    }
+
+    KillOutcome {
+        orders_cancelled,
+        switch_recorded,
+        engine_idle,
+        errors,
+    }
+}
+
+/// One cancel-everything for `kill`; a failure becomes a line in `errors`.
+async fn cancel_for_kill<B: Broker>(broker: Option<&B>, errors: &mut Vec<String>) -> bool {
+    let Some(broker) = broker else {
+        let line = "open orders were NOT cancelled: no broker client";
+        if !errors.iter().any(|known| known == line) {
+            errors.push(line.to_owned());
+        }
+        return false;
+    };
+    match cancel_open_orders(broker).await {
+        Ok(()) => true,
+        Err(err) => {
+            errors.push(format!("open orders were NOT cancelled: {err}"));
+            false
+        }
+    }
 }
 
 /// Records the kill switch as engaged: the first half of [`kill`], on its own for when the
@@ -197,21 +271,6 @@ pub async fn cancel_open_orders<B: Broker>(broker: &B) -> Result<(), AppError> {
         .await
         .map_err(|err| EngineError::Broker(Box::new(err)))?;
     Ok(())
-}
-
-/// Tries the engine lock every `LOCK_RETRY` until `lock_wait` has passed. `true` when taken.
-async fn wait_for_engine_lock(store: &Store, lock_wait: Duration) -> Result<bool, AppError> {
-    let deadline = tokio::time::Instant::now() + lock_wait;
-    loop {
-        if scoring::try_advisory_lock(store.client(), ENGINE_LOCK).await? {
-            return Ok(true);
-        }
-        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if left.is_zero() {
-            return Ok(false);
-        }
-        tokio::time::sleep(left.min(LOCK_RETRY)).await;
-    }
 }
 
 /// Releases the kill switch: one `kill_switch` risk event with `engaged: false`. Nothing else.

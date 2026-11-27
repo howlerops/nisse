@@ -17,6 +17,8 @@ log_name="$1"
 shift
 
 cd "$(dirname "$0")/.."
+# cron starts with a bare PATH; the replay script needs cargo, git and psql.
+export PATH="$HOME/.cargo/bin:/usr/local/bin:$PATH"
 set -a
 # shellcheck disable=SC1090
 . "${NISSE_ENV:-/etc/nisse/nisse.env}"
