@@ -578,6 +578,35 @@ fn deflated_sharpe_counts_runs_by_experiment_not_by_range() {
 }
 
 #[test]
+fn a_rerun_that_changes_only_the_seed_is_not_a_new_trial_sharpe() {
+    let cand = drift(500, 0.001, 0.010);
+    let alt = drift(500, 0.0005, 0.010);
+    let alt_sharpe = moments::sharpe(&alt).unwrap();
+    let cand_sharpe = moments::sharpe(&cand).unwrap();
+
+    // Version 2 ran once, then three more times with other seeds. The strategy ignores the
+    // seed, so the returns are identical: one Sharpe for version 2, not four.
+    let mut trials = vec![series(1, 2, false, alt.clone())];
+    for (id, seed) in [(2_i64, 11_u64), (3, 12), (4, 13)] {
+        trials.push(TrialSeries {
+            seed: Some(seed),
+            ..series(id, 2, false, alt.clone())
+        });
+    }
+    trials.push(series(5, 1, false, cand.clone()));
+    // Four of five lifetime trials would be usable Sharpes if the re-runs counted; they do
+    // not, so there are two.
+    let report = build_report(&inputs(1, trials, 4));
+    let gate = find(&report, "deflated_sharpe");
+    assert_eq!(
+        gate.value,
+        dsr::deflated_sharpe(&cand, &[alt_sharpe, cand_sharpe], 4),
+        "{}",
+        gate.note
+    );
+}
+
+#[test]
 fn pbo_with_a_dominated_alternative_passes_at_zero() {
     let cand = drift(500, 0.011, 0.010);
     let alts = alternatives(9);

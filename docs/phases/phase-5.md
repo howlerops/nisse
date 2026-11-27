@@ -77,8 +77,9 @@ All Sharpes are per period. `psr` is `None` when `n < 2` or the radicand is not 
 `expected_max_sharpe` is `0` for `N = 1` (nothing was selected), and `None` for `N = 0` or a
 negative or non-finite variance. `N` is the lifetime trial count from `trial_registry` (every
 kind, every strategy; it never resets). The variance is the sample variance of the per-period
-Sharpes of every backtest trial that has a stored result; with `N ≥ 2` and fewer than two
-such Sharpes the deflated Sharpe is `not_evaluated`.
+Sharpes of the usable trials, one per experiment (the gate table below says which trials are
+usable and how repeats are collapsed); with `N ≥ 2` and fewer than two such Sharpes the
+deflated Sharpe is `not_evaluated`.
 
 **Probability of backtest overfitting** (`pbo.rs`; CSCV, Bailey, Borwein, López de Prado and
 Zhu). Input: `N ≥ 2` return series of equal length `T`, one per configuration, over the same
@@ -90,8 +91,9 @@ counts as `−∞`); `n* =` the in-sample best (ties: the lowest index); `rank =
 out-of-sample rank of `n*` among the `N` (1 = worst; ties share the average rank);
 `ω = rank / (N + 1)`; `λ = ln(ω / (1 − ω))`. `pbo =` the fraction of combinations with
 `λ ≤ 0`. `None` when `N < 2`, the lengths differ, or `T < 32`. Which trials form the matrix:
-every backtest trial with a stored result whose `data_snapshot_id`, `requested_start` and
-`requested_end` equal the candidate trial's and whose return series has the same length.
+the candidate, and each other version's newest usable run with the candidate's data
+snapshot, requested range, costs, symbols, limits, cash and seed and a return series of
+the same length.
 
 **Bootstrap** (`bootstrap.rs`). Stationary bootstrap (Politis and Romano): a resample of
 length `n` starts at a uniform index; each next element is the following one (wrapping
@@ -146,7 +148,7 @@ under another gates file cannot be judged as if it had not.
 | Gate | Value | Pass when |
 |---|---|---|
 | `trial_budget` | lifetime trial count | `≤ trial_budget` |
-| `deflated_sharpe` | as above, on the candidate | `≥ deflated_sharpe_min`. The trial Sharpes are those of usable trials, one per experiment (strategy version, data snapshot, requested range, costs, symbols, limits, cash and seed), the newest. `not_evaluated` when the candidate is not usable, or, with more than one lifetime trial, when fewer than half the lifetime trials have a usable Sharpe or their variance is zero (nothing to deflate with). |
+| `deflated_sharpe` | as above, on the candidate | `≥ deflated_sharpe_min`. The trial Sharpes are those of usable trials, one per experiment (strategy version, data snapshot, requested range, costs, symbols, limits, cash and seed), the newest. A run of the same version with exactly the same returns as one already counted is a repeat too (a re-run that changes only an input the strategy ignores, such as the seed). `not_evaluated` when the candidate is not usable, or, with more than one lifetime trial, when fewer than half the lifetime trials have a usable Sharpe or their variance is zero (nothing to deflate with). |
 | `pbo` | as above | `≤ pbo_max`, over at least `pbo_min_configs` configurations (else `not_evaluated`) |
 | `holdout` | annualised Sharpe of the version's first holdout run over the holdout sessions only | The run judged is the version's **oldest** holdout run with a stored result, whatever its inputs: the first look counts and no later look, re-run or change of costs can replace it. It is compared with the **holdout baseline**, which depends on nothing registered after the look (a run registered before the look but still running when the report is made can still become the baseline once it stores its result): the newest usable ordinary run of the version registered before that look with the holdout run's inputs (defined below) whose returns are exactly the first returns of the holdout run. That last condition is what ties the look to the run it tests: with the same inputs and the same bars before the boundary, a deterministic engine produces the same returns session for session, so any difference means the bars or an unrecorded input differed. The report's candidate must be that same experiment, else `not_evaluated` (the look tested another experiment). Two runs are the same experiment when their data snapshot, requested range, costs, symbols, limits hash, starting cash and seed are all recorded and equal; the holdout run must share all of those with the baseline except the snapshot and requested end (it covers more data), must start on the same requested date, and must have read a bar file of the same name. The candidate's returns must equal the baseline's exactly. The same definition is used wherever runs are compared: the deflated Sharpe counts one Sharpe per experiment, and the overfitting matrix takes other versions' runs only when their costs, symbols, limits, cash and seed equal the candidate's. So the last ordinary run before a holdout look is what the look tests; make the look right after the run you mean to judge. Looks `> holdout_max_looks` → `fail`. No holdout run, or no baseline → `not_evaluated`. The run ended `flat` → `fail`. Otherwise `pass` when its Sharpe `≥` the haircut of the baseline's annualised Sharpe measured from its first non-zero return (the flat warm-up would understate it), over at least 60 holdout sessions. A baseline whose Sharpe is not positive, that ended `flat` (or whose final mode is not recorded), or with fewer than 252 sessions of non-zero return → `not_evaluated`: a short or mostly idle baseline has too noisy a Sharpe to set a threshold. (A weak but long baseline is judged; the deflated Sharpe gate is what stops a weak candidate.) Because the snapshot id is a hash of the bars, a re-run after the bar history has been corrected is a different experiment: the holdout gate then stays `not_evaluated` for that version, and judging the new data takes a new strategy version and another look. A later identical ordinary re-run does not disturb a judged holdout. |
 | `replay` | decisions of this version whose newest `replay_match` score is 0 | `= 0` (no scored decision → `not_evaluated`) |

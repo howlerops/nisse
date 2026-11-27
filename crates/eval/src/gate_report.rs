@@ -635,7 +635,10 @@ fn deflated_sharpe(inputs: &ReportInputs, candidate: Option<&TrialSeries>) -> Ga
     };
 
     // One Sharpe per experiment (see `same_experiment`) from usable ordinary runs: the newest of
-    // each. Newest first, a run is kept unless a kept run of its version is the same experiment.
+    // each. Newest first, a run is kept unless a kept run of its version is the same experiment
+    // or has exactly the same returns. The second test matters: a re-run that changes only an
+    // input the strategy ignores (the seed, for one) is the same result again, and counting it
+    // as a new trial Sharpe would shrink their variance and so flatter the deflated Sharpe.
     let mut usable: Vec<&TrialSeries> = inputs
         .trials
         .iter()
@@ -649,7 +652,8 @@ fn deflated_sharpe(inputs: &ReportInputs, candidate: Option<&TrialSeries>) -> Ga
             continue;
         };
         let repeat = kept.iter().any(|k| {
-            k.strategy_version_id == trial.strategy_version_id && same_experiment(k, trial)
+            k.strategy_version_id == trial.strategy_version_id
+                && (same_experiment(k, trial) || same_returns(k, trial))
         });
         if !repeat {
             kept.push(trial);

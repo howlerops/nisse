@@ -1303,14 +1303,17 @@ async fn a_real_holdout_look_is_judged_against_the_ordinary_run_it_extends() {
     let client = db.client().await.unwrap();
     let store = Store::new(db.client().await.unwrap());
     let dir = bars_dir("e2e-holdout", &market());
-    // The boundary 2021-03-15 leaves 80 synthetic sessions after it (at least 60) and 50 before
-    // it (at least 2). The helpers' 2021-05-03 would leave only 42. The ordinary run ends on
-    // 2021-03-12, the last session before the boundary; the look runs over the whole range.
+    // The boundary 2021-04-01 leaves 67 synthetic sessions after it (at least 60). The ordinary
+    // run ends on 2021-03-31, the last session of March, as a real baseline ends on the last
+    // session of a month (the default holdout starts on 1 January). That is the hard case for
+    // the prefix rule: the ordinary run cannot know its final session is a month end and does
+    // not rebalance there, while the look does. The returns still agree session for session,
+    // because equity is recorded before the rebalance and its orders fill at the next open.
     let mut early = job(dir.path(), strategy_params());
-    early.end = utc(2021, 3, 12, 23, 59, 59, 999_999_999);
+    early.end = utc(2021, 3, 31, 23, 59, 59, 999_999_999);
     // Jobs in one directory share the gates file, so the boundary is set after the last `job`.
     let full = job(dir.path(), strategy_params());
-    set_holdout(&full, "2021-03-15", 10);
+    set_holdout(&full, "2021-04-01", 10);
 
     let ordinary = run_backtest_job(&store, &early, options(true, false, false), now())
         .await
