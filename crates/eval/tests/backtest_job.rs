@@ -246,12 +246,26 @@ fn tracking_options() -> RunOptions {
 }
 
 /// Runs an ordinary backtest of `job` (which creates its strategy version) and registers a paper
-/// `live` trial for that version starting at `live_from`. Returns the version. Call it before
-/// `set_holdout` moves the boundary inside the bars, since an ordinary run cannot reach it.
+/// `live` trial for that version trading the job's symbols (sorted, as the engine stores them)
+/// starting at `live_from`. Returns the version. Call it before `set_holdout` moves the boundary
+/// inside the bars, since an ordinary run cannot reach it.
 async fn traded(
     store: &Store,
     client: &Client,
     job: &BacktestJob,
+    live_from: UnixNanos,
+) -> StrategyVersionId {
+    let mut symbols = job.symbols.clone();
+    symbols.sort_unstable();
+    trading(store, client, job, &symbols, live_from).await
+}
+
+/// Like `traded`, but the paper `live` trial lists `symbols` as given.
+async fn trading(
+    store: &Store,
+    client: &Client,
+    job: &BacktestJob,
+    symbols: &[String],
     live_from: UnixNanos,
 ) -> StrategyVersionId {
     let ordinary = run_backtest_job(store, job, options(true, false, false), now())
@@ -261,6 +275,7 @@ async fn traded(
         client,
         ordinary.strategy_version_id,
         "paper",
+        symbols,
         live_from,
         now(),
     )
@@ -1546,11 +1561,9 @@ async fn a_tracking_run_is_left_out_of_backtest_results() {
     let results = scoring::backtest_results(&client).await.unwrap();
     assert!(results.iter().all(|r| r.trial_id != tracking.trial_id));
     assert!(results.iter().any(|r| r.trial_id == ordinary.trial_id));
-    let found = scoring::tracking_result(&client, version)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(found.trial_id, tracking.trial_id);
+    let found = scoring::tracking_results(&client, version).await.unwrap();
+    let first = found.first().expect("a tracking result");
+    assert_eq!(first.trial_id, tracking.trial_id);
     db.drop_db().await.unwrap();
 }
 
@@ -1868,5 +1881,83 @@ async fn a_real_holdout_look_is_judged_against_the_ordinary_run_it_extends() {
         json!(ordinary.trial_id)
     );
     assert_eq!(report.info["holdout_run"]["trial_id"], json!(look.trial_id));
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_tracking_run_with_other_symbols_than_the_engine_trades_is_refused() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let store = Store::new(db.client().await.unwrap());
+    let dir = bars_dir("tracking-other-symbols", &market());
+    let job = job(dir.path(), strategy_params());
+    trading(&store, &client, &job, &["FALL".to_owned()], live_from()).await;
+    let before = trial_count(&client).await;
+
+    let err = run_backtest_job(&store, &job, tracking_options(), now())
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, EvalError::InvalidJob(ref m) if m.contains("must have the symbols the engine trades")),
+        "{err}"
+    );
+    assert_eq!(trial_count(&client).await, before);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_tracking_run_matches_symbols_whatever_their_order() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let store = Store::new(db.client().await.unwrap());
+    let dir = bars_dir("tracking-symbol-order", &market());
+    let mut reversed = job(dir.path(), strategy_params());
+    reversed.symbols.reverse();
+    assert_eq!(reversed.symbols, vec!["RISE".to_owned(), "FALL".to_owned()]);
+    // The live trial stores the symbols sorted: ["FALL", "RISE"].
+    traded(&store, &client, &reversed, live_from()).await;
+
+    let outcome = run_backtest_job(&store, &reversed, tracking_options(), now())
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.result["tracking"], json!(true));
+    assert_eq!(outcome.result["symbols"], json!(["RISE", "FALL"]));
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_tracking_run_follows_the_engines_newest_live_trial() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let store = Store::new(db.client().await.unwrap());
+    let dir = bars_dir("tracking-newest-live", &market());
+    let full = job(dir.path(), strategy_params());
+    // An older live trial with other symbols and an early start ...
+    let older_start = utc(2021, 1, 4, 0, 0, 0, 0);
+    let version = trading(&store, &client, &full, &["FALL".to_owned()], older_start).await;
+    // ... then a newer one with the job's symbols and a later start.
+    trial_registry::insert_live(
+        &client,
+        version,
+        "paper",
+        &["FALL".to_owned(), "RISE".to_owned()],
+        live_from(),
+        now(),
+    )
+    .await
+    .unwrap();
+
+    let outcome = run_backtest_job(&store, &full, tracking_options(), now())
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.result["tracking"], json!(true));
+    assert_eq!(
+        outcome.result["tracking_start"],
+        json!(date_of(live_from()))
+    );
+    assert_eq!(outcome.result["tracking_start"], json!("2021-02-01"));
     db.drop_db().await.unwrap();
 }
