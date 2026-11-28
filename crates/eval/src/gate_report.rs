@@ -256,24 +256,40 @@ pub struct ReportInputs {
     pub live: Option<TrackingInput>,
 }
 
+/// One gap-free run of paired sessions: the engine's and the tracking run's returns over the same
+/// sessions, from `first` to `last`. A stretch has at least one pair.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrackingStretch {
+    /// The first paired session.
+    pub first: NaiveDate,
+    /// The last paired session.
+    pub last: NaiveDate,
+    /// The engine's returns, one per paired session, ascending.
+    pub live: Vec<f64>,
+    /// The tracking run's returns for the same sessions.
+    pub backtest: Vec<f64>,
+}
+
 /// What the tracking gate judges: the engine's daily returns and a tracking run's over the same
 /// sessions, and what is needed to say whether the comparison is sound.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrackingInput {
     /// `paper` or `live`: whose equity was read.
     pub environment: &'static str,
-    /// The paired returns (equal lengths, session by session). Empty when nothing could be paired.
-    pub live: Vec<f64>,
-    pub backtest: Vec<f64>,
-    /// First and last paired session. `None` when nothing was paired.
-    pub span: Option<(NaiveDate, NaiveDate)>,
-    /// The newest session that the tracking run has and the equity series lacks (or the reverse),
-    /// if any: sessions up to it are left out of the comparison.
-    pub gap: Option<NaiveDate>,
+    /// The gap-free runs of paired sessions, oldest first (see [`pair_tracking`]). Empty when
+    /// nothing could be paired.
+    pub stretches: Vec<TrackingStretch>,
+    /// The sessions that could not be paired, ascending (see [`pair_tracking`]).
+    pub gaps: Vec<NaiveDate>,
+    /// Equity rows skipped before the engine first traded (see [`pair_tracking`]).
+    pub leading_skipped: usize,
     /// Equity rows dated after the tracking run's last session.
     pub lag_sessions: usize,
     /// Whether the tracking run has the same inputs as the version's candidate backtest.
     pub same_experiment: bool,
+    /// Whether the tracking run was made from a build with no uncommitted changes (its stored
+    /// `dirty_build` is `false`).
+    pub clean_build: bool,
     /// Why the series could not be read at all (a malformed or incomplete tracking result).
     pub unreadable: bool,
 }
@@ -423,34 +439,35 @@ fn tracking_input(
     if equity.len() < 2 {
         return None;
     }
-    let same_experiment = candidate.is_some_and(|c| same_inputs(c, &TrialSeries::from_stored(run)));
+    let run_series = TrialSeries::from_stored(run);
+    let same_experiment = candidate.is_some_and(|c| same_inputs(c, &run_series));
+    let clean_build = run_series.dirty_build == Some(false);
     let parsed = tracking_series(&run.result);
     // Every equity row is newer than a run with no session at all.
     let lag_sessions = match parsed.as_ref().and_then(|(dates, _)| dates.last()) {
         Some(last) => equity.iter().filter(|(day, _)| day > last).count(),
         None => equity.len(),
     };
-    let (live, backtest, span, gap, unreadable) = match parsed {
-        None => (Vec::new(), Vec::new(), None, None, true),
+    let (stretches, gaps, leading_skipped, unreadable) = match parsed {
+        None => (Vec::new(), Vec::new(), 0, true),
         Some((dates, returns)) => {
             let pairing = pair_tracking(equity, &dates, &returns)?;
             (
-                pairing.live,
-                pairing.backtest,
-                pairing.span,
-                pairing.gap,
+                pairing.stretches,
+                pairing.gaps,
+                pairing.leading_skipped,
                 pairing.malformed,
             )
         }
     };
     Some(TrackingInput {
         environment,
-        live,
-        backtest,
-        span,
-        gap,
+        stretches,
+        gaps,
+        leading_skipped,
         lag_sessions,
         same_experiment,
+        clean_build,
         unreadable,
     })
 }
@@ -471,37 +488,78 @@ fn tracking_series(result: &Value) -> Option<(Vec<NaiveDate>, Vec<f64>)> {
     Some((dates, returns))
 }
 
-/// The paired returns of a tracking run and the equity series, as [`pair_tracking`] gives them.
+/// The gap-free stretches of paired returns of a tracking run and the equity series, as
+/// [`pair_tracking`] gives them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrackingPairing {
-    /// The engine's returns, one per paired session, ascending.
-    pub live: Vec<f64>,
-    /// The tracking run's returns for the same sessions.
-    pub backtest: Vec<f64>,
-    /// First and last paired session. `None` when nothing was paired.
-    pub span: Option<(NaiveDate, NaiveDate)>,
-    /// The newest session the two series do not both have, if any.
-    pub gap: Option<NaiveDate>,
-    /// The inputs are malformed (see [`pair_tracking`]); the series are then empty.
+    /// The gap-free runs of paired sessions, oldest first. Empty when nothing could be paired.
+    pub stretches: Vec<TrackingStretch>,
+    /// The sessions that could not be paired, ascending.
+    pub gaps: Vec<NaiveDate>,
+    /// Equity rows skipped before the engine first traded: after the first equity row, the rows
+    /// up to and including the first change in equity (see [`pair_tracking`]).
+    pub leading_skipped: usize,
+    /// The inputs are malformed (see [`pair_tracking`]); the stretches and gaps are then empty.
     pub malformed: bool,
 }
 
-impl TrackingPairing {
-    /// Drops every pair so far: the sessions up to `gap` are left out.
-    fn leave_out(&mut self, gap: NaiveDate) {
-        self.live.clear();
-        self.backtest.clear();
-        self.span = None;
-        self.gap = Some(gap);
+/// The pairing under way: the stretches so far, and whether the newest one still takes pairs. A
+/// gap closes it, so the next pair starts a new stretch.
+struct Walk {
+    out: TrackingPairing,
+    open: bool,
+}
+
+impl Walk {
+    fn new(leading_skipped: usize) -> Self {
+        Self {
+            out: TrackingPairing {
+                stretches: Vec::new(),
+                gaps: Vec::new(),
+                leading_skipped,
+                malformed: false,
+            },
+            open: false,
+        }
     }
 
-    fn push(&mut self, day: NaiveDate, live: f64, backtest: f64) {
-        self.live.push(live);
-        self.backtest.push(backtest);
-        self.span = Some(match self.span {
-            Some((first, _)) => (first, day),
-            None => (day, day),
-        });
+    /// A session that could not be paired: it closes the open stretch. Gaps stay ascending and
+    /// a session named twice is recorded once.
+    fn gap(&mut self, day: NaiveDate) {
+        self.open = false;
+        if self.out.gaps.last() != Some(&day) {
+            self.out.gaps.push(day);
+        }
+    }
+
+    /// A paired session: it extends the open stretch, or starts a new one.
+    fn pair(&mut self, day: NaiveDate, live: f64, backtest: f64) {
+        match self.out.stretches.last_mut() {
+            Some(stretch) if self.open => {
+                stretch.last = day;
+                stretch.live.push(live);
+                stretch.backtest.push(backtest);
+            }
+            _ => {
+                self.out.stretches.push(TrackingStretch {
+                    first: day,
+                    last: day,
+                    live: vec![live],
+                    backtest: vec![backtest],
+                });
+                self.open = true;
+            }
+        }
+    }
+}
+
+/// A pairing with nothing paired and nothing named.
+fn empty_pairing(leading_skipped: usize, malformed: bool) -> TrackingPairing {
+    TrackingPairing {
+        stretches: Vec::new(),
+        gaps: Vec::new(),
+        leading_skipped,
+        malformed,
     }
 }
 
@@ -512,19 +570,29 @@ impl TrackingPairing {
 /// (one date per return, ascending). The comparison covers the sessions up to the earlier of the
 /// last equity row and the last tracking date.
 ///
+/// Before the engine first traded there is nothing to compare. The first equity row is the start.
+/// Each later row whose equity equals the row before it is a leading unchanged session. The first
+/// row whose equity differs from the row before it is the first change (positions were being
+/// built that day). The leading unchanged rows and the first change are skipped: they are not
+/// paired and not gaps, and `leading_skipped` counts them. Pairing starts with the row after the
+/// first change, whose previous row is the first change. A tracking session on or before the first
+/// change is not a gap either. If the equity never changes nothing is paired.
+///
 /// A session pairs when its equity row and its tracking date are the same session, the tracking
 /// run's session before it is the previous equity row, and the previous equity is positive with a
-/// finite return. A session that cannot be paired is a gap: its date is recorded as `gap`, every
-/// pair so far is dropped, and pairing resumes from the next equity row. The result is therefore
-/// the longest gap-free run ending at the end of the span, and `gap` is the newest gap. Gaps are:
-/// a tracking session the equity lacks (recorded as that session), an equity row the tracking run
-/// lacks, a previous equity row the tracking run lacks, and a previous equity that is not positive
-/// or a return that is not finite (recorded as the row's session).
+/// finite return. A session that cannot be paired is a gap: its date is recorded in `gaps`, and it
+/// ends the open stretch. The next pair starts a new stretch. A stretch is kept when it has at
+/// least one pair. Gaps are: a tracking session the equity lacks (recorded as that session, every
+/// one of them), an equity row the tracking run lacks, a previous equity row the tracking run lacks
+/// (recorded as that row's session), and a previous equity that is not positive or a return that is
+/// not finite (recorded as the row's session). The first pair after the first change is the one
+/// exception: when its tracking session does not follow the first change, the row itself is
+/// recorded, since the first change is not a gap.
 ///
 /// Returns `None` only when there are fewer than two equity rows. Malformed input (`dates` and
 /// `returns` differ in length, `dates` not strictly ascending, equity not strictly ascending by
-/// date) gives empty series with `malformed` set. No tracking date at all gives empty series and
-/// no gap. Runs in O(n log n) with the vectors sized up front.
+/// date) gives no stretches with `malformed` set. No tracking date at all gives no stretches and no
+/// gap.
 #[must_use]
 pub fn pair_tracking(
     equity: &[(NaiveDate, Decimal)],
@@ -538,72 +606,78 @@ pub fn pair_tracking(
         || dates.windows(2).any(|w| w[0] >= w[1])
         || equity.windows(2).any(|w| w[0].0 >= w[1].0)
     {
-        return Some(TrackingPairing {
-            live: Vec::new(),
-            backtest: Vec::new(),
-            span: None,
-            gap: None,
-            malformed: true,
-        });
+        return Some(empty_pairing(0, true));
     }
+    // The first row whose equity differs from the row before it. Rows up to and including it
+    // are skipped.
+    let Some(first) = equity
+        .windows(2)
+        .position(|w| matches!(w, [a, b] if a.1 != b.1))
+        .map(|i| i + 1)
+    else {
+        return Some(empty_pairing(equity.len() - 1, false));
+    };
+    let Some(&first_row) = equity.get(first) else {
+        return Some(empty_pairing(first, false));
+    };
     let Some(&last_tracked) = dates.last() else {
-        return Some(TrackingPairing {
-            live: Vec::new(),
-            backtest: Vec::new(),
-            span: None,
-            gap: None,
-            malformed: false,
-        });
+        return Some(empty_pairing(first, false));
     };
-    let end = equity[equity.len() - 1].0.min(last_tracked);
-    let capacity = (equity.len() - 1).min(dates.len());
-    let mut out = TrackingPairing {
-        live: Vec::with_capacity(capacity),
-        backtest: Vec::with_capacity(capacity),
-        span: None,
-        gap: None,
-        malformed: false,
+    let Some(&(last_equity, _)) = equity.last() else {
+        return Some(empty_pairing(first, false));
     };
-    let mut last_day = equity[0].0;
-    for (index, &(day, today)) in equity.iter().enumerate().skip(1) {
+    let end = last_equity.min(last_tracked);
+    let mut walk = Walk::new(first);
+    let mut previous = first_row;
+    for (index, &(day, today)) in equity.iter().enumerate().skip(first + 1) {
         if day > end {
             break;
         }
-        let (previous_day, previous_equity) = equity[index - 1];
+        let (previous_day, previous_equity) = previous;
         // The tracking sessions on or before the previous equity row, and those before `day`.
         let known = dates.partition_point(|tracked| *tracked <= previous_day);
         let before = dates.partition_point(|tracked| *tracked < day);
+        let first_pairing = index == first + 1;
         if known < before {
             // Tracking sessions between the two equity rows: the equity series lacks them.
-            out.leave_out(dates[before - 1]);
+            if let Some(missing) = dates.get(known..before) {
+                for &session in missing {
+                    walk.gap(session);
+                }
+            }
         } else if dates.get(before) != Some(&day) {
             // An equity row the tracking run lacks.
-            out.leave_out(day);
+            walk.gap(day);
         } else {
             // The tracking session before `day` must be the previous equity row, or the two
             // returns span different sessions. Before the first equity row of the span there
             // may be none (a run that starts later).
-            let predecessor_ok = match before.checked_sub(1).map(|i| dates[i]) {
-                Some(tracked) => tracked == previous_day,
-                None => index == 1,
+            let predecessor_ok = match before.checked_sub(1).and_then(|i| dates.get(i)) {
+                Some(&tracked) => tracked == previous_day,
+                None => first_pairing,
             };
             if !predecessor_ok {
-                out.leave_out(previous_day);
-            } else if let Some(live) = live_return(today, previous_equity) {
-                out.push(day, live, returns[before]);
+                walk.gap(if first_pairing { day } else { previous_day });
+            } else if let (Some(live), Some(&backtest)) =
+                (live_return(today, previous_equity), returns.get(before))
+            {
+                walk.pair(day, live, backtest);
             } else {
-                out.leave_out(day);
+                walk.gap(day);
             }
         }
-        last_day = day;
+        previous = (day, today);
     }
     // Tracking sessions after the last equity row walked, up to `end`, have no equity row.
+    let (last_day, _) = previous;
     let upto = dates.partition_point(|tracked| *tracked <= end);
     let from = dates.partition_point(|tracked| *tracked <= last_day);
-    if upto > from {
-        out.leave_out(dates[upto - 1]);
+    if let Some(missing) = dates.get(from..upto) {
+        for &session in missing {
+            walk.gap(session);
+        }
     }
-    Some(out)
+    Some(walk.out)
 }
 
 /// The return of `equity` over `previous`, in `Decimal` and converted to `f64` last. `None` when
@@ -1247,25 +1321,67 @@ fn risk_gate(breaches: u64, sent: u64) -> GateResult {
     )
 }
 
-/// The tracking gate's note sentence for a gap, or nothing when there was none.
-fn gap_sentence(gap: Option<NaiveDate>) -> String {
-    gap.map_or_else(String::new, |day| {
-        format!(
-            "; sessions up to {day} are left out: the equity and tracking series do not both have {day}"
-        )
-    })
+/// A stretch's sessions as `first to last`.
+fn stretch_span(stretch: &TrackingStretch) -> String {
+    format!("{} to {}", stretch.first, stretch.last)
 }
 
-/// The first and last paired session as `first to last`, or `no sessions`.
-fn span_text(span: Option<(NaiveDate, NaiveDate)>) -> String {
-    span.map_or_else(
-        || "no sessions".to_owned(),
-        |(first, last)| format!("{first} to {last}"),
-    )
+/// Whether a tracking error and largest gap are both within their limits.
+fn in_band(t: tracking::Tracking, max_error: f64, max_gap: f64) -> bool {
+    t.tracking_error <= max_error && t.max_gap <= max_gap
 }
 
-/// Judges the tracking gate in this order: no live returns, unreadable, not the same experiment,
-/// stale, too few sessions, then the tracking error and largest gap.
+/// The parts of the tracking gate's note that apply to every verdict after the floor check: the
+/// leading sessions left out, the newest five gaps (and how many earlier ones), and the earlier
+/// stretches too short to judge. Each part is present only when it applies.
+fn left_out_text(input: &TrackingInput) -> String {
+    let mut parts = Vec::new();
+    if input.leading_skipped > 0 {
+        parts.push(format!(
+            "; {} leading sessions before the engine first traded are left out",
+            input.leading_skipped
+        ));
+    }
+    if !input.gaps.is_empty() {
+        let newest: Vec<String> = input
+            .gaps
+            .iter()
+            .rev()
+            .take(5)
+            .rev()
+            .map(ToString::to_string)
+            .collect();
+        let names = newest.join(", ");
+        let earlier = input.gaps.len().saturating_sub(5);
+        parts.push(if earlier > 0 {
+            format!("; no equity and tracking pair for {names} and {earlier} earlier")
+        } else {
+            format!("; no equity and tracking pair for {names}")
+        });
+    }
+    let unjudged = input.stretches.split_last().map_or(0, |(_, earlier)| {
+        earlier
+            .iter()
+            .filter(|stretch| stretch.live.len() < MIN_TRACKING_SESSIONS)
+            .count()
+    });
+    if unjudged == 1 {
+        parts.push(format!(
+            "; 1 earlier stretch of fewer than {MIN_TRACKING_SESSIONS} sessions is not judged"
+        ));
+    } else if unjudged > 1 {
+        parts.push(format!(
+            "; {unjudged} earlier stretches of fewer than {MIN_TRACKING_SESSIONS} sessions are not judged"
+        ));
+    }
+    parts.concat()
+}
+
+/// Judges the tracking gate in this order: no live returns, unreadable, a build with uncommitted
+/// changes, not the same experiment, stale, the newest stretch too short, then every stretch of at
+/// least `MIN_TRACKING_SESSIONS` pairs against the tracking error and largest gap limits. The gate
+/// fails when any judged stretch is out of band, and the value is the worst tracking error among
+/// the judged stretches. The note names the newest stretch and each earlier judged stretch.
 fn tracking_gate(inputs: &ReportInputs) -> GateResult {
     const NAME: &str = "tracking";
     let max_error = inputs.gates.tracking_error_max;
@@ -1279,6 +1395,14 @@ fn tracking_gate(inputs: &ReportInputs) -> GateResult {
             None,
             Some(max_error),
             "could not be computed: the tracking run's result is incomplete or malformed",
+        );
+    }
+    if !input.clean_build {
+        return undecided(
+            NAME,
+            None,
+            Some(max_error),
+            "the tracking run was made from a build with uncommitted changes; make one from a clean build",
         );
     }
     if !input.same_experiment {
@@ -1300,40 +1424,98 @@ fn tracking_gate(inputs: &ReportInputs) -> GateResult {
             ),
         );
     }
-    let sessions = input.live.len();
-    if sessions < MIN_TRACKING_SESSIONS {
+    let (newest, earlier) = match input.stretches.split_last() {
+        Some((newest, earlier)) if newest.live.len() >= MIN_TRACKING_SESSIONS => (newest, earlier),
+        newest => {
+            let sessions = newest.map_or(0, |(stretch, _)| stretch.live.len());
+            let since = newest.map_or_else(
+                || "the start".to_owned(),
+                |(stretch, _)| stretch.first.to_string(),
+            );
+            return undecided(
+                NAME,
+                None,
+                Some(max_error),
+                &format!(
+                    "{sessions} paired sessions since {since}; at least {MIN_TRACKING_SESSIONS} are needed{}",
+                    left_out_text(input)
+                ),
+            );
+        }
+    };
+    let ppy = inputs.gates.periods_per_year;
+    let newest_t = tracking::tracking(&newest.live, &newest.backtest, ppy);
+    let judged_earlier: Vec<(&TrackingStretch, Option<tracking::Tracking>)> = earlier
+        .iter()
+        .filter(|stretch| stretch.live.len() >= MIN_TRACKING_SESSIONS)
+        .map(|stretch| {
+            (
+                stretch,
+                tracking::tracking(&stretch.live, &stretch.backtest, ppy),
+            )
+        })
+        .collect();
+    let newest_out = matches!(newest_t, Some(t) if !in_band(t, max_error, max_gap));
+    let earlier_out = judged_earlier
+        .iter()
+        .any(|(_, t)| matches!(t, Some(t) if !in_band(*t, max_error, max_gap)));
+    let uncomputed = newest_t.is_none() || judged_earlier.iter().any(|(_, t)| t.is_none());
+    let worst = std::iter::once(newest_t)
+        .chain(judged_earlier.iter().map(|(_, t)| *t))
+        .flatten()
+        .map(|t| t.tracking_error)
+        .reduce(f64::max);
+
+    let sessions = newest.live.len();
+    let mut parts = vec![match newest_t {
+        Some(t) => format!(
+            "{} equity, {}, {sessions} sessions: tracking error {:.4} against {max_error} and largest gap {:.4} against {max_gap}",
+            input.environment,
+            stretch_span(newest),
+            t.tracking_error,
+            t.max_gap
+        ),
+        None => format!(
+            "{} equity, {}, {sessions} sessions: tracking error and largest gap could not be computed",
+            input.environment,
+            stretch_span(newest)
+        ),
+    }];
+    parts.extend(judged_earlier.iter().map(|(stretch, t)| match t {
+        Some(t) => format!(
+            "; earlier stretch ({}, {} sessions: tracking error {:.4}, largest gap {:.4})",
+            stretch_span(stretch),
+            stretch.live.len(),
+            t.tracking_error,
+            t.max_gap
+        ),
+        None => format!(
+            "; earlier stretch ({}, {} sessions: could not be computed)",
+            stretch_span(stretch),
+            stretch.live.len()
+        ),
+    }));
+    if earlier_out {
+        parts.push("; an earlier stretch is out of band".to_owned());
+    }
+    parts.push(left_out_text(input));
+    let note = parts.concat();
+
+    if newest_out || earlier_out {
+        return judged(NAME, false, worst, Some(max_error), note);
+    }
+    if uncomputed {
         return undecided(
             NAME,
             None,
             Some(max_error),
             &format!(
-                "{sessions} paired sessions; at least {MIN_TRACKING_SESSIONS} are needed{}",
-                gap_sentence(input.gap)
+                "could not be computed: live and backtest returns must cover the same sessions{}",
+                left_out_text(input)
             ),
         );
     }
-    match tracking::tracking(&input.live, &input.backtest, inputs.gates.periods_per_year) {
-        None => undecided(
-            NAME,
-            None,
-            Some(max_error),
-            "could not be computed: live and backtest returns must cover the same sessions",
-        ),
-        Some(t) => judged(
-            NAME,
-            t.tracking_error <= max_error && t.max_gap <= max_gap,
-            Some(t.tracking_error),
-            Some(max_error),
-            format!(
-                "{} equity, {}, {sessions} sessions: tracking error {:.4} against {max_error} and largest gap {:.4} against {max_gap}{}",
-                input.environment,
-                span_text(input.span),
-                t.tracking_error,
-                t.max_gap,
-                gap_sentence(input.gap)
-            ),
-        ),
-    }
+    judged(NAME, true, worst, Some(max_error), note)
 }
 
 /// An annualised per-period ratio as a statistic for the bootstrap.

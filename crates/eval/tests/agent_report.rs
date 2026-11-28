@@ -499,12 +499,12 @@ fn the_tracking_gate_is_in_the_gate_report_so_the_report_can_leave_it_out() {
         sent_orders: 0,
         live: Some(TrackingInput {
             environment: "paper",
-            live: vec![0.01, 0.02],
-            backtest: vec![0.01, 0.02],
-            span: None,
-            gap: None,
+            stretches: Vec::new(),
+            gaps: Vec::new(),
+            leading_skipped: 0,
             lag_sessions: 0,
             same_experiment: true,
+            clean_build: true,
             unreadable: false,
         }),
     };
