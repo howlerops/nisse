@@ -25,10 +25,7 @@ use crate::ingest::{IngestOutcome, ingest_session};
 use crate::kill_watch::{enforce_kill, flatten_on_kill};
 use crate::market::Market;
 use crate::restore::{EngineTrader, Restored, restore, take_engine_lock};
-use crate::{
-    AppError,
-    config::{EngineConfig, PAPER},
-};
+use crate::{AppError, config::EngineConfig};
 
 /// How long after a session's close `session-close` still decides for it.
 pub const MAX_CLOSE_AGE_NANOS: u64 = 6 * 3_600 * 1_000_000_000;
@@ -48,8 +45,8 @@ pub const TICK_ATTEMPT_STEP: &str = "rebalance";
 const INGEST_STEP: &str = "ingest";
 const RECONCILE_STEP: &str = "reconcile";
 const OBSERVE_STEP: &str = "observe";
-/// The step recording the session's account equity, and registering the engine's `live` trial
-/// for the strategy config the first time. Once `done` for a run it is skipped. See
+/// The step recording the session's account equity. Once `done` for a run it is skipped. The
+/// engine's `live` trial is registered by [`ensure_live_trial`], before the run acts. See
 /// `docs/phases/phase-9a.md`.
 const EQUITY_STEP: &str = "equity";
 const REBALANCE_STEP: &str = "rebalance";
@@ -104,8 +101,8 @@ pub enum SessionCloseOutcome {
 }
 
 /// Runs one `tick`. Order: enforce the kill switch → verify the signature → lock → restore →
-/// reconcile → observe → (re-read the switch) → rebalance if the market is open and one is
-/// owed → finish. The kill switch is enforced first, from the store and the broker alone, so
+/// register the engine's trial (if it has none) → reconcile → observe → (re-read the switch) →
+/// rebalance if the market is open and one is owed → finish. The kill switch is enforced first, from the store and the broker alone, so
 /// it holds whatever the deployment or the engine's state. Any error returns before the
 /// heartbeat.
 pub async fn tick<M: Market, B: Broker, C: Clock>(
@@ -127,7 +124,12 @@ pub async fn tick<M: Market, B: Broker, C: Clock>(
     verify_from_env(config)?;
     let now = clock.now();
     take_engine_lock(store).await?;
-    let Restored { mut trader, .. } = restore(config, store, sink.clone(), broker, clock).await?;
+    let Restored {
+        mut trader,
+        strategy_version_id,
+        ..
+    } = restore(config, store, sink.clone(), broker, clock).await?;
+    ensure_live_trial(store, strategy_version_id, config.environment, now).await?;
 
     let fills = reconcile_pass(&mut trader).await?.fills.len();
     let observed = observe_pass(&mut trader, store, now).await?;
@@ -194,8 +196,8 @@ pub async fn tick<M: Market, B: Broker, C: Clock>(
 /// `MAX_CLOSE_AGE_NANOS` before now. See `docs/phases/phase-6.md`, "session-close".
 ///
 /// Order: enforce the kill switch → verify the signature → lock → ingest → restore →
-/// reconcile → observe → record equity → (re-read the switch) → rebalance on a month end or
-/// when one is owed → finish. The kill switch is enforced first, as in [`tick`].
+/// register the engine's trial (if it has none) → reconcile → observe → record equity →
+/// (re-read the switch) → rebalance on a month end or when one is owed → finish. The kill switch is enforced first, as in [`tick`].
 pub async fn session_close<M: Market, B: Broker, C: Clock>(
     config: &EngineConfig,
     market: &M,
@@ -259,6 +261,7 @@ pub async fn session_close<M: Market, B: Broker, C: Clock>(
         strategy_version_id,
         ..
     } = restore(config, store, sink.clone(), broker, clock).await?;
+    ensure_live_trial(store, strategy_version_id, config.environment, now).await?;
 
     let reconciled = step(
         store,
@@ -302,13 +305,12 @@ pub async fn session_close<M: Market, B: Broker, C: Clock>(
             equity_pass(
                 store,
                 strategy_version_id,
+                config.environment,
                 session.date,
                 observed.equity,
                 now,
             ),
-            |registered| {
-                json!({"equity": observed.equity.to_string(), "trial_registered": registered})
-            },
+            |()| json!({"equity": observed.equity.to_string()}),
         )
         .await?;
     }
@@ -334,26 +336,44 @@ pub async fn session_close<M: Market, B: Broker, C: Clock>(
     })
 }
 
-/// Registers the engine's trial for this strategy config if it has none, then records the
-/// session's account equity. See `docs/phases/phase-9a.md`.
-async fn equity_pass(
+/// Registers the engine's trial for this strategy config and environment if it has none: a trial
+/// is registered before its run does anything. See `docs/phases/phase-9a.md`.
+async fn ensure_live_trial(
     store: &Store,
     version: StrategyVersionId,
-    session_date: NaiveDate,
-    equity: Decimal,
+    environment: &str,
     now: UnixNanos,
-) -> Result<bool, AppError> {
+) -> Result<(), AppError> {
     let client = store.client();
-    let mut registered = false;
-    if trial_registry::live_start(client, version, Some(PAPER))
+    if trial_registry::live_start(client, version, Some(environment))
         .await?
         .is_none()
     {
-        trial_registry::insert_live(client, version, PAPER, now, now).await?;
-        registered = true;
+        trial_registry::insert_live(client, version, environment, now, now).await?;
     }
-    account_equity::insert(client, version, PAPER, session_date, equity, now).await?;
-    Ok(registered)
+    Ok(())
+}
+
+/// Records the session's account equity for this strategy config and environment. The trial is
+/// registered by [`ensure_live_trial`], not here.
+async fn equity_pass(
+    store: &Store,
+    version: StrategyVersionId,
+    environment: &str,
+    session_date: NaiveDate,
+    equity: Decimal,
+    now: UnixNanos,
+) -> Result<(), AppError> {
+    account_equity::insert(
+        store.client(),
+        version,
+        environment,
+        session_date,
+        equity,
+        now,
+    )
+    .await?;
+    Ok(())
 }
 
 /// The rebalance step of a session-close run: skipped when already `done`, recorded `done`

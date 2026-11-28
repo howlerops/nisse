@@ -20,7 +20,7 @@ use chrono::{Datelike, NaiveDate, Weekday};
 use nisse_alpaca_adapter::{Feed, VENUE};
 use nisse_app::{
     AppError,
-    config::{EngineConfig, SignatureRule},
+    config::{EngineConfig, PAPER, SignatureRule},
     market::Market,
 };
 use nisse_core::nautilus::{
@@ -150,6 +150,7 @@ pub fn config(bars_dir: PathBuf, limits_path: PathBuf) -> EngineConfig {
             manifest: PathBuf::from("research/signed/trend-v1.manifest.json"),
             required: false,
         },
+        environment: PAPER,
     }
 }
 
