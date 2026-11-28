@@ -4,6 +4,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, reason = "integration test")]
 
 use std::{
+    collections::BTreeSet,
     path::{Path, PathBuf},
     str::FromStr,
     sync::atomic::{AtomicU64, Ordering},
@@ -12,7 +13,7 @@ use std::{
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use nisse_bars::{BarReader, write_bars};
 use nisse_core::{
-    StrategyVersionId, bars_snapshot_id,
+    StrategyVersionId, bars_snapshot_id, config_hash,
     nautilus::{
         AggregationSource, Bar, BarAggregation, BarSpecification, BarType, InstrumentId, Price,
         PriceType, Quantity, Symbol, UnixNanos, Venue,
@@ -21,7 +22,7 @@ use nisse_core::{
 use nisse_engine::CostModel;
 use nisse_eval::{
     EvalError,
-    backtest_job::{BacktestJob, RunOptions, run_backtest_job},
+    backtest_job::{BacktestJob, RunOptions, TRACKING_KEPT_KEYS, run_backtest_job},
 };
 use nisse_risk::Limits;
 use nisse_store::{
@@ -1648,44 +1649,90 @@ async fn a_tracking_run_stores_no_whole_span_figures() {
     let job = job(dir.path(), strategy_params());
     traded(&store, &client, &job, live_from()).await;
 
+    let ordinary = run_backtest_job(&store, &job, options(true, false, false), now())
+        .await
+        .unwrap();
     let outcome = run_backtest_job(&store, &job, tracking_options(), now())
         .await
         .unwrap();
 
-    for key in [
-        "summary",
-        "final_equity",
-        "fees_paid",
-        "final_drawdown_mode",
-        "orders_blocked",
-        "risk_events",
-        "decisions",
-        "fills",
-    ] {
-        assert_eq!(outcome.result.get(key), Some(&Value::Null), "{key}");
-    }
-    for key in [
-        "symbols",
-        "costs",
-        "limits_hash",
-        "limits",
-        "data_snapshot_id",
-        "bars_file",
-        "starting_cash",
-        "seed",
-        "git_sha",
-        "requested_start",
-        "requested_end",
-        "data_end",
-    ] {
-        assert!(
-            outcome.result.get(key).is_some_and(|v| !v.is_null()),
-            "{key} must stay"
-        );
-    }
+    // The tracking result has the ordinary result's keys, plus the two tracking-only keys.
+    let ordinary_keys: BTreeSet<&str> = ordinary
+        .result
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let tracking_keys: BTreeSet<&str> = outcome
+        .result
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let mut expected_keys = ordinary_keys;
+    expected_keys.insert("session_dates");
+    expected_keys.insert("tracking_start");
+    assert_eq!(tracking_keys, expected_keys, "a key is not classified");
+
+    // Exact partition: the non-null keys are the kept keys and the tracking keys. None of the
+    // kept keys is null in this fixture (the bars file and holdout start are always present),
+    // so every other key, the whole-span figures, must be null.
+    let tracking_only = [
+        "returns",
+        "returns_complete",
+        "session_dates",
+        "tracking_start",
+        "sessions",
+    ];
+    let expected_non_null: BTreeSet<&str> = TRACKING_KEPT_KEYS
+        .iter()
+        .copied()
+        .chain(tracking_only)
+        .collect();
+    let non_null: BTreeSet<&str> = outcome
+        .result
+        .as_object()
+        .unwrap()
+        .iter()
+        .filter(|(_, value)| !value.is_null())
+        .map(|(key, _)| key.as_str())
+        .collect();
+    assert_eq!(non_null, expected_non_null);
+
     assert_eq!(outcome.result["symbols"], json!(["FALL", "RISE"]));
     let kept = outcome.result["returns"].as_array().unwrap().len();
     assert_eq!(outcome.result["sessions"], json!(kept));
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_job_hashes_exactly_the_strategy_object() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let store = Store::new(db.client().await.unwrap());
+    let dir = bars_dir("config-hash", &market());
+    let job = job(dir.path(), strategy_params());
+
+    let outcome = run_backtest_job(&store, &job, options(true, false, false), now())
+        .await
+        .unwrap();
+
+    // The engine hashes its config's strategy object the same way (crates/app/src/restore.rs); the
+    // live trial, the equity series and a tracking run meet through this hash.
+    let stored: Vec<u8> = client
+        .query_one(
+            "SELECT config_hash FROM strategy_version WHERE id = $1",
+            &[&outcome.strategy_version_id.0],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        stored,
+        config_hash(&job.strategy_params).as_bytes().to_vec()
+    );
     db.drop_db().await.unwrap();
 }
 

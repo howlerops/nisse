@@ -482,16 +482,30 @@ fn utc_day(ts: UnixNanos) -> u64 {
     ts.as_u64() / NANOS_PER_DAY
 }
 
-/// The keys a tracking run must not store: each is computed over the whole span.
-const WHOLE_SPAN_KEYS: [&str; 8] = [
-    "summary",
-    "final_equity",
-    "fees_paid",
-    "final_drawdown_mode",
-    "orders_blocked",
-    "risk_events",
-    "decisions",
-    "fills",
+/// The keys of an ordinary result that a tracking run keeps as they are. Each describes the run's
+/// inputs (code, bars, costs, limits, holdout fields) or its classification, and none depends on
+/// prices or equity over the whole span. This is an allow-list on purpose: a key added to the
+/// result later is nulled in a tracking run and is left out unless it is added here deliberately,
+/// after checking that it reveals nothing about the span.
+pub const TRACKING_KEPT_KEYS: [&str; 18] = [
+    "holdout",
+    "tracking",
+    "holdout_start",
+    "holdout_sessions",
+    "git_sha",
+    "dirty_build",
+    "data_snapshot_id",
+    "bars_file",
+    "symbols",
+    "requested_start",
+    "requested_end",
+    "data_end",
+    "costs",
+    "summary_includes_warm_up",
+    "starting_cash",
+    "seed",
+    "limits_hash",
+    "limits",
 ];
 
 /// Reduces a tracking run's result to what it may show. A tracking run is allowed to read bars
@@ -500,9 +514,9 @@ const WHOLE_SPAN_KEYS: [&str; 8] = [
 /// whole span would therefore be an uncounted look at the holdout, and so would returns from
 /// before the engine first ran. So the stored result keeps only the returns of the sessions whose
 /// UTC date is on or after the date of `live_start` (the engine's first day), with one
-/// `session_dates` entry each and `tracking_start` giving that date. Every whole-span figure is
-/// `null`, and `sessions` counts the returns kept. Inputs (git SHA, bar file, costs, limits,
-/// holdout fields and so on) are left as they are.
+/// `session_dates` entry each and `tracking_start` giving that date. Every key of the result that
+/// is not in [`TRACKING_KEPT_KEYS`] is `null`, and `sessions` counts the returns kept. The kept
+/// keys (git SHA, bar file, costs, limits, holdout fields and so on) are left as they are.
 ///
 /// A return needs the equity of the session before it, so the first kept return is computed from
 /// the last curve point before `live_start`, which is the only point before the engine's first
@@ -520,8 +534,10 @@ fn redact_for_tracking(result: &mut Value, curve: &[(UnixNanos, Decimal)], live_
     let (returns, returns_complete) = returns_json(tail);
     let kept = tail.len().saturating_sub(1);
     if let Some(object) = result.as_object_mut() {
-        for key in WHOLE_SPAN_KEYS {
-            object.insert(key.to_owned(), Value::Null);
+        for (key, value) in object.iter_mut() {
+            if !TRACKING_KEPT_KEYS.contains(&key.as_str()) {
+                *value = Value::Null;
+            }
         }
         object.insert("returns".to_owned(), returns);
         object.insert("returns_complete".to_owned(), json!(returns_complete));
@@ -735,5 +751,20 @@ mod tests {
         let end = day_nanos(date, true, "end").unwrap().as_u64();
         assert_eq!(start, 1_672_531_200 * 1_000_000_000);
         assert_eq!(end, start + 86_400 * 1_000_000_000 - 1);
+    }
+
+    #[test]
+    fn a_key_that_is_not_on_the_kept_list_is_nulled() {
+        let mut result = json!({
+            "summary": 1,
+            "max_drawdown": "0.5",
+            "symbols": ["SPY"],
+            "returns": [],
+        });
+        redact_for_tracking(&mut result, &curve(&["100", "110"]), UnixNanos::from(0));
+        assert_eq!(result["max_drawdown"], Value::Null);
+        assert_eq!(result["summary"], Value::Null);
+        assert_eq!(result["symbols"], json!(["SPY"]));
+        assert_eq!(result["returns"], json!([0.1]));
     }
 }
