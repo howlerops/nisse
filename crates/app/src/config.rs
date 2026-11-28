@@ -15,7 +15,7 @@ use serde_json::Value;
 use crate::AppError;
 
 /// The only environment this build runs against.
-const PAPER: &str = "paper";
+pub const PAPER: &str = "paper";
 /// The longest symbol accepted. Alpaca tickers are short; this bounds the input.
 const MAX_SYMBOL_LEN: usize = 12;
 /// The earliest first day of bar history. Bars before 2000 are not fetched.
