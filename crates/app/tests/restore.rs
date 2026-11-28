@@ -20,7 +20,7 @@ use nisse_app::{
 };
 use nisse_bars::write_bars;
 use nisse_core::nautilus::UnixNanos;
-use nisse_core::{ManualClock, PositionEvent, RiskEvent, RiskEventKind};
+use nisse_core::{ManualClock, PositionEvent, RiskEvent, RiskEventKind, config_hash};
 use nisse_store::{
     Store,
     tables::{position_event, risk_event},
@@ -373,6 +373,43 @@ async fn an_unknown_strategy_stops_the_restore() {
     assert!(
         matches!(outcome, Some(AppError::Engine(_))),
         "got {outcome:?}"
+    );
+
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_engine_hashes_exactly_the_strategy_object() {
+    let (db, store, sink) = setup().await;
+    let scratch = Scratch::new();
+    let cfg = config(scratch.path().join("no-bars-yet"), repo_limits());
+
+    let restored = restore(
+        &cfg,
+        &store,
+        sink.clone(),
+        broker(),
+        ManualClock::new(close_of(9)),
+    )
+    .await
+    .unwrap();
+
+    // The backtest job hashes its job's strategy object the same way
+    // (crates/eval/src/backtest_job.rs); the live trial, the equity series and a tracking run
+    // meet through this hash.
+    let row = store
+        .client()
+        .query_one(
+            "SELECT config_hash FROM strategy_version WHERE id = $1",
+            &[&restored.strategy_version_id.0],
+        )
+        .await
+        .unwrap();
+    let stored: Vec<u8> = row.get(0);
+    assert_eq!(stored.len(), 32);
+    assert_eq!(
+        stored.as_slice(),
+        config_hash(&cfg.strategy).as_bytes().as_slice()
     );
 
     db.drop_db().await.unwrap();
