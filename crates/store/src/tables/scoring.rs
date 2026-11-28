@@ -282,15 +282,15 @@ pub async fn backtest_results<C: GenericClient>(
     Ok(out)
 }
 
-/// The newest tracking run with a stored result for `version`'s strategy config: the `backtest`
-/// trial with the highest id that was registered with `"tracking": true`, among every strategy
-/// version with the same `config_hash`. `None` when there is none. One statement.
-pub async fn tracking_result<C: GenericClient>(
+/// Every tracking run with a stored result for `version`'s strategy config, newest first: the
+/// `backtest` trials registered with `"tracking": true`, among every strategy version with the
+/// same `config_hash`. One statement.
+pub async fn tracking_results<C: GenericClient>(
     client: &C,
     version: StrategyVersionId,
-) -> Result<Option<TrialWithResult>, StoreError> {
-    let row = client
-        .query_opt(
+) -> Result<Vec<TrialWithResult>, StoreError> {
+    let rows = client
+        .query(
             &format!(
                 "SELECT {TRIAL_RESULT_COLUMNS} \
                  FROM trial_registry t \
@@ -299,12 +299,16 @@ pub async fn tracking_result<C: GenericClient>(
                  WHERE t.kind = 'backtest' \
                    AND t.result @> '{{\"tracking\": true}}' \
                    AND v.config_hash = (SELECT config_hash FROM strategy_version WHERE id = $1) \
-                 ORDER BY t.id DESC LIMIT 1"
+                 ORDER BY t.id DESC"
             ),
             &[&version.0],
         )
         .await?;
-    row.as_ref().map(trial_with_result).transpose()
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        out.push(trial_with_result(row)?);
+    }
+    Ok(out)
 }
 
 /// Decisions of `version` whose NEWEST `replay_match` score (by `eval_score.id`) is 0, as

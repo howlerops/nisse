@@ -36,12 +36,23 @@ pub async fn insert<C: GenericClient>(client: &C, trial: &Trial) -> Result<i64, 
     Ok(row.try_get(0)?)
 }
 
+/// One engine run as registered: when it started and what it trades.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveRun {
+    pub start: UnixNanos,
+    /// The symbols the engine trades, sorted. Empty for a trial registered without them.
+    pub symbols: Vec<String>,
+}
+
 /// Registers the trial of an engine run: kind `live`, a `data_range` from `start` with no end
-/// (the run is still going), and the result `{"environment": <environment>}`. Returns its id.
+/// (the run is still going), and the result
+/// `{"environment": <environment>, "symbols": [<symbols>]}`. `symbols` is stored as given: pass
+/// it sorted. Returns the trial's id.
 pub async fn insert_live<C: GenericClient>(
     client: &C,
     version: StrategyVersionId,
     environment: &str,
+    symbols: &[String],
     start: UnixNanos,
     ts: UnixNanos,
 ) -> Result<i64, StoreError> {
@@ -52,41 +63,73 @@ pub async fn insert_live<C: GenericClient>(
         .query_one(
             "INSERT INTO trial_registry (strategy_version_id, kind, data_range, result, event_ts) \
              VALUES ($1, 'live', tstzrange($2, NULL, '[)'), \
-                     jsonb_build_object('environment', $3::text), $4) \
+                     jsonb_build_object('environment', $3::text, 'symbols', to_jsonb($4::text[])), \
+                     $5) \
              RETURNING id",
-            &[&version.0, &data_start, &environment, &event_ts],
+            &[&version.0, &data_start, &environment, &symbols, &event_ts],
         )
         .await?;
     Ok(row.try_get(0)?)
 }
 
-/// When the engine first ran `version`'s strategy config: the start of the oldest `live` trial
-/// of any strategy version with the same `config_hash`. With `environment` given, only trials
+/// The engine's current run of `version`'s strategy config: the newest `live` trial of any
+/// strategy version with the same `config_hash`. With `environment` given, only trials
 /// registered for that environment count. `None` when there is none. One statement.
-pub async fn live_start<C: GenericClient>(
+///
+/// The engine registers a new `live` trial when the symbols it trades change, so the newest one
+/// says what is running now and since when.
+pub async fn latest_live<C: GenericClient>(
     client: &C,
     version: StrategyVersionId,
     environment: Option<&str>,
-) -> Result<Option<UnixNanos>, StoreError> {
+) -> Result<Option<LiveRun>, StoreError> {
     let row = client
         .query_opt(
-            "SELECT lower(t.data_range) FROM trial_registry t \
+            "SELECT lower(t.data_range) AS start, \
+                    COALESCE(ARRAY(SELECT jsonb_array_elements_text(t.result -> 'symbols')), \
+                             ARRAY[]::text[]) AS symbols \
+             FROM trial_registry t \
              JOIN strategy_version v ON v.id = t.strategy_version_id \
              WHERE t.kind = 'live' \
                AND v.config_hash = (SELECT config_hash FROM strategy_version WHERE id = $1) \
                AND ($2::text IS NULL OR t.result ->> 'environment' = $2) \
-             ORDER BY t.id LIMIT 1",
+             ORDER BY t.id DESC LIMIT 1",
             &[&version.0, &environment],
         )
         .await?;
     let Some(row) = row else {
         return Ok(None);
     };
-    let start: Option<DateTime<Utc>> = row.try_get(0)?;
-    start.map(from_ts).transpose()
+    let start: Option<DateTime<Utc>> = row.try_get("start")?;
+    let Some(start) = start else {
+        return Err(StoreError::Data(
+            "a live trial has no start to its data range".to_owned(),
+        ));
+    };
+    Ok(Some(LiveRun {
+        start: from_ts(start)?,
+        symbols: row.try_get("symbols")?,
+    }))
 }
 
-/// The lifetime trial count: every row, of every kind and every strategy version.
+/// The number of trials that can select a strategy: every `backtest` and `shadow` trial except
+/// tracking runs (registered with `"tracking": true`). This is the count the trial budget and
+/// the deflated Sharpe use. A `live` trial and a tracking run are registered and kept, but they
+/// judge a config that is already running and choose nothing (owner's decision, 2026-11-28).
+pub async fn selection_count<C: GenericClient>(client: &C) -> Result<i64, StoreError> {
+    let row = client
+        .query_one(
+            r#"SELECT COUNT(*) FROM trial_registry
+               WHERE kind IN ('backtest', 'shadow')
+                 AND NOT COALESCE(result @> '{"tracking": true}'::jsonb, false)"#,
+            &[],
+        )
+        .await?;
+    Ok(row.try_get(0)?)
+}
+
+/// The lifetime trial count: every row, of every kind and every strategy version. The gates
+/// count with [`selection_count`]; this is the size of the whole record.
 pub async fn lifetime_count<C: GenericClient>(client: &C) -> Result<i64, StoreError> {
     let row = client
         .query_one("SELECT COUNT(*) FROM trial_registry", &[])

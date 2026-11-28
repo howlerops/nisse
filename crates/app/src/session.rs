@@ -131,7 +131,7 @@ pub async fn tick<M: Market, B: Broker, C: Clock>(
         strategy_version_id,
         ..
     } = restore(config, store, sink.clone(), broker, clock).await?;
-    ensure_live_trial(store, strategy_version_id, config.environment, now).await?;
+    ensure_live_trial(store, strategy_version_id, config, now).await?;
 
     let fills = reconcile_pass(&mut trader).await?.fills.len();
     let observed = observe_pass(&mut trader, store, now).await?;
@@ -266,7 +266,7 @@ pub async fn session_close<M: Market, B: Broker, C: Clock>(
         strategy_version_id,
         ..
     } = restore(config, store, sink.clone(), broker, clock).await?;
-    ensure_live_trial(store, strategy_version_id, config.environment, now).await?;
+    ensure_live_trial(store, strategy_version_id, config, now).await?;
 
     let reconciled = step(
         store,
@@ -350,20 +350,23 @@ pub async fn session_close<M: Market, B: Broker, C: Clock>(
     })
 }
 
-/// Registers the engine's trial for this strategy config and environment if it has none: a trial
-/// is registered before its run does anything. See `docs/phases/phase-9a.md`.
+/// Registers the engine's trial for this strategy config and environment, before the run does
+/// anything: when it has none, and again when the symbols it trades differ from those of its
+/// newest trial (a changed universe is a new run: the equity series before it does not belong
+/// to what is traded now). See `docs/phases/phase-9a.md`.
 async fn ensure_live_trial(
     store: &Store,
     version: StrategyVersionId,
-    environment: &str,
+    config: &EngineConfig,
     now: UnixNanos,
 ) -> Result<(), AppError> {
     let client = store.client();
-    if trial_registry::live_start(client, version, Some(environment))
-        .await?
-        .is_none()
-    {
-        trial_registry::insert_live(client, version, environment, now, now).await?;
+    let mut symbols: Vec<String> = config.symbols.iter().map(ToString::to_string).collect();
+    symbols.sort_unstable();
+    let current = trial_registry::latest_live(client, version, Some(config.environment)).await?;
+    if current.is_none_or(|run| run.symbols != symbols) {
+        trial_registry::insert_live(client, version, config.environment, &symbols, now, now)
+            .await?;
     }
     Ok(())
 }

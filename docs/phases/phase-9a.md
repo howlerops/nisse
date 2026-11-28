@@ -9,7 +9,8 @@ None of this enables live trading: the engine still runs against paper only.
 |---|---|
 | Where live daily returns come from | A new append-only table, `account_equity`: session-close writes the broker's account equity once per session |
 | The backtest the tracking gate compares with | Its own kind of run, a **tracking run**: allowed only for a strategy config the engine has traded, registers a trial (it counts toward the lifetime budget), is not a holdout look, and is never shown to research agents |
-| Whether the paper engine registers a trial | Yes: one `live`-kind trial per strategy config and environment, the first time the engine runs a session close for it |
+| Whether the paper engine registers a trial | Yes: one `live`-kind trial per strategy config, environment and universe, before the engine first acts on it |
+| What counts toward the trial budget and the deflated Sharpe | Only runs that can select a strategy: ordinary and holdout backtests, and shadow runs. Tracking runs and the engine's `live` trials are registered and kept (the record never resets) but are not counted: they judge a config that is already running and choose nothing. Otherwise routine tracking checks would use up the budget of 100 and weaken the Sharpe gate |
 | Orders only through the risk gate | A test that reads the source and fails when a new non-test use of the order-sending functions appears (`crates/app/tests/order_path.rs`). It is a tripwire for honest mistakes, not a proof: the functions stay public for the engine's integration tests, and a determined change could still route around a text search. Review of every change to a sensitive path remains the control. |
 
 "Strategy config" means `strategy_version.config_hash`. A strategy version is a config at one
@@ -32,7 +33,11 @@ change that adds live.
 `tick` and `session-close` register the trial right after the engine's state is restored
 and before anything else is done with it: if the config has no `live` trial for the engine's
 environment, one is registered (`data_range` from now, open-ended; result
-`{"environment": "paper"}`). The environment is the engine config's, not a constant.
+`{"environment": "paper", "symbols": [...]}`). The environment is the engine config's, not a
+constant. The strategy config's hash does not cover the universe, so the trial records the
+symbols: when the engine's symbols differ from those of its newest trial, a new trial is
+registered. The newest `live` trial is "the engine's current run": everything below (what a
+tracking run may be, where the compared series starts) refers to it.
 
 Session close gains a step, `equity`, after `observe`: it writes the session's
 `account_equity` row from the equity it has just observed. A re-run of the same session
@@ -48,8 +53,10 @@ before a late run adds noise to the comparison.
 
 `nisse-backtest <job.json> --tracking`:
 
-- refused unless the job's strategy config has a `live` trial, and unless the bars reach the
-  day the engine first ran (compared by UTC date);
+- refused unless the job's strategy config has a `live` trial, unless the job's symbols are
+  exactly those of the engine's current run, and unless the bars reach the day that run
+  started (compared by UTC date; a first run late in the US evening falls on the next UTC
+  date, so the session of that evening is not part of the comparison);
 - **shows nothing about the days before the engine ran.** A config can be put on paper
   before it has passed the holdout gate, so a tracking run must not become a free look at
   the holdout. Its stored result holds returns and session dates only for sessions on or
@@ -73,7 +80,11 @@ before a late run adds noise to the comparison.
 ### The tracking gate
 
 `nisse-gate-report` loads, for the version's config: the daily equity (the `live`
-environment's if it has any rows, else paper's) and the newest tracking run. The live return
+environment's if it has any rows, else paper's), from the day the engine's current run
+started, and the newest **usable** tracking run: made from a clean build, with the symbols
+of the engine's current run and the same inputs as the candidate backtest. A newer run that
+is not usable does not replace an older one that is, so a failed comparison cannot be set
+aside by making a run that will not be judged. The live return
 of a session is `equity / previous session's equity - 1`. The two series are compared
 session by session up to the earlier of the last equity row and the last tracking session.
 
@@ -84,6 +95,10 @@ session by session up to the earlier of the last equity row and the last trackin
   day), are left out, and the note says how many. **Known limit:** the engine starts with a
   fresh risk state, so if the backtest is in a drawdown step-down at that moment the two
   hold different sizes until it ends.
+- **A failure outranks everything else.** Every stretch long enough to judge is judged
+  first. If any is out of band the gate is `fail`, even when the tracking run is stale or
+  the newest stretch is still short. `not_evaluated` is only ever reported when nothing
+  judged has failed.
 - **A gap is reported, not hidden, and cannot hide a failure.** A session the backtest has
   and the equity series lacks (a missed session close) cannot be made up by the engine. A
   gap splits the comparison into stretches. The newest stretch is the one that must reach
@@ -94,7 +109,10 @@ session by session up to the earlier of the last equity row and the last trackin
 - **A floor.** Fewer than 20 paired sessions in the newest stretch: `not_evaluated`. Two
   flat series a few days long would otherwise pass.
 - **A clean build.** A tracking run made from a build with uncommitted changes
-  (`--allow-dirty`) is never judged: `not_evaluated`.
+  (`--allow-dirty`) is never used.
+- **Known limit: the risk limits are not tied.** The engine's limits file can change while
+  it runs; the gate ties the tracking run to the candidate backtest's limits, not to what
+  the engine had loaded on each day.
 - **Not stale.** More than 5 equity rows after the tracking run's last session:
   `not_evaluated`, with a note to make a new tracking run.
 - **The same experiment.** The tracking run must have the same inputs (costs, symbols,

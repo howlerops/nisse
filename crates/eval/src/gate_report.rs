@@ -406,7 +406,11 @@ pub async fn load_inputs<C: GenericClient>(
             (LIVE_ENVIRONMENT, live)
         }
     };
-    let live = match scoring::tracking_result(client, version).await? {
+    let live = match scoring::tracking_results(client, version)
+        .await?
+        .into_iter()
+        .next()
+    {
         None => None,
         Some(run) => tracking_input(
             &run,

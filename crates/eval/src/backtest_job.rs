@@ -307,10 +307,13 @@ pub async fn run_backtest_job(
         let registered = register_trial(
             store,
             &version,
-            (data_start, data_end),
+            &RunSpan {
+                data: (data_start, data_end),
+                last_session,
+                symbols: &job.symbols,
+            },
             options,
             gates.holdout_max_looks,
-            last_session,
             now,
         )
         .await;
@@ -322,10 +325,13 @@ pub async fn run_backtest_job(
         register_trial(
             store,
             &version,
-            (data_start, data_end),
+            &RunSpan {
+                data: (data_start, data_end),
+                last_session,
+                symbols: &job.symbols,
+            },
             options,
             gates.holdout_max_looks,
-            last_session,
             now,
         )
         .await?
@@ -410,6 +416,14 @@ pub async fn run_backtest_job(
         result,
     })
 }
+/// What a run covers, as [`register_trial`] needs it.
+struct RunSpan<'a> {
+    /// `[first session, last session + 1ns)`, the trial's `data_range`.
+    data: (UnixNanos, UnixNanos),
+    last_session: UnixNanos,
+    /// The job's symbols, in the order given.
+    symbols: &'a [String],
+}
 
 /// The look-count check (a holdout run only), then the strategy version, the tracking check (a
 /// tracking run only) and the trial. A holdout run is refused here, before anything is written,
@@ -422,10 +436,9 @@ pub async fn run_backtest_job(
 async fn register_trial(
     store: &Store,
     version: &StrategyVersion,
-    span: (UnixNanos, UnixNanos),
+    span: &RunSpan<'_>,
     options: RunOptions,
     max_looks: u32,
-    last_session: UnixNanos,
     now: UnixNanos,
 ) -> Result<(StrategyVersionId, i64, Option<UnixNanos>), EvalError> {
     if options.holdout {
@@ -439,21 +452,35 @@ async fn register_trial(
     }
     let strategy_version_id = store.ensure_strategy_version(version).await?;
     let tracking_start = if options.tracking {
-        match trial_registry::live_start(store.client(), strategy_version_id, None).await? {
-            None => {
-                return Err(EvalError::InvalidJob(
-                    "a tracking run needs a strategy config the engine has traded: no live trial is registered for it"
-                        .to_owned(),
-                ));
-            }
-            Some(start) if utc_day(last_session) < utc_day(start) => {
-                return Err(EvalError::InvalidJob(
-                    "a tracking run must reach the engine's first session: the bars end before it"
-                        .to_owned(),
-                ));
-            }
-            Some(start) => Some(start),
+        let Some(run) =
+            trial_registry::latest_live(store.client(), strategy_version_id, None).await?
+        else {
+            return Err(EvalError::InvalidJob(
+                "a tracking run needs a strategy config the engine has traded: no live trial is registered for it"
+                    .to_owned(),
+            ));
+        };
+        // The strategy config's hash does not cover the universe, so it is checked here: a
+        // tracking run of other symbols would be a look at a portfolio that was never traded.
+        let mut symbols: Vec<&str> = span.symbols.iter().map(String::as_str).collect();
+        symbols.sort_unstable();
+        if !symbols
+            .iter()
+            .copied()
+            .eq(run.symbols.iter().map(String::as_str))
+        {
+            return Err(EvalError::InvalidJob(format!(
+                "a tracking run must have the symbols the engine trades: {}",
+                run.symbols.join(", ")
+            )));
         }
+        if utc_day(span.last_session) < utc_day(run.start) {
+            return Err(EvalError::InvalidJob(
+                "a tracking run must reach the engine's first session: the bars end before it"
+                    .to_owned(),
+            ));
+        }
+        Some(run.start)
     } else {
         None
     };
@@ -465,8 +492,8 @@ async fn register_trial(
     let trial = Trial {
         strategy_version_id,
         kind: TrialKind::Backtest,
-        data_start: span.0,
-        data_end: span.1,
+        data_start: span.data.0,
+        data_end: span.data.1,
         result: registered_result,
         ts: now,
     };
