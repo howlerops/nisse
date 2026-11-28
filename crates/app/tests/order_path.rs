@@ -4,7 +4,8 @@
 //! production call that sends or replaces an order, or a new network client dependency. A determined
 //! change could route around a text search (an alias, a macro, a re-export under another name), so a
 //! pass here does not prove the rule holds. Review of the sensitive paths (`crates/risk/`,
-//! `crates/alpaca-adapter/`, `config/limits/`, `.github/`) remains the control.
+//! `crates/alpaca-adapter/`, `config/limits/`, `.github/`) remains the control. Transitive dependencies
+//! are not checked, so a crate that pulls in an HTTP client indirectly is not caught.
 //!
 //! The functions that send orders are public (the engine's own integration tests need them), so a
 //! new production caller fails this test. If it fails because you added one on purpose, that is a
@@ -15,9 +16,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Crate dependencies that open network connections. A crate other than `alpaca-adapter` that
-/// depends on one of these fails the network test.
-const NETWORK_CLIENTS: [&str; 8] = [
+/// Crate dependencies that open network connections or call an LLM SDK. A crate other than
+/// `alpaca-adapter` that depends on one of these fails the network test.
+const NETWORK_CLIENTS: [&str; 16] = [
     "reqwest",
     "tungstenite",
     "tokio-tungstenite",
@@ -26,6 +27,14 @@ const NETWORK_CLIENTS: [&str; 8] = [
     "isahc",
     "surf",
     "curl",
+    "async-openai",
+    "openai",
+    "anthropic",
+    "anthropic-sdk",
+    "ollama-rs",
+    "llm",
+    "rig-core",
+    "genai",
 ];
 
 fn root() -> PathBuf {
@@ -191,12 +200,63 @@ fn files_where(sources: &[(String, String)], pred: impl Fn(&str) -> bool) -> Vec
         .collect()
 }
 
-/// The dependency name at the start of a manifest line, or "" when the line has none.
-fn dependency_name(line: &str) -> &str {
-    let end = line
-        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
-        .unwrap_or(line.len());
-    &line[..end]
+/// Whether a manifest declares a dependency named `name`, or renames one to it. Matches `name = ...`
+/// and `name.key = ...`, a table header `[dependencies.name]` (also `dev-`, `build-` and
+/// `target.<cfg>.` forms), and `package = "name"` anywhere on a line. Comment lines never match.
+fn names_client(manifest_text: &str, name: &str) -> bool {
+    manifest_text.lines().any(|line| {
+        let t = line.trim();
+        if t.starts_with('#') {
+            return false;
+        }
+        declares_key(t, name) || declares_header(t, name) || renames_to(t, name)
+    })
+}
+
+/// `name = ...` or `name.key = ...`, with optional spaces before the `=` or `.`.
+fn declares_key(line: &str, name: &str) -> bool {
+    line.strip_prefix(name).is_some_and(|rest| {
+        let rest = rest.trim_start_matches(' ');
+        rest.starts_with('=') || rest.starts_with('.')
+    })
+}
+
+/// `[dependencies.name]` and its `dev-`, `build-` and `target.<cfg>.` variants.
+fn declares_header(line: &str, name: &str) -> bool {
+    let Some(inner) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) else {
+        return false;
+    };
+    let Some(table) = inner.strip_suffix(name).and_then(|h| h.strip_suffix('.')) else {
+        return false;
+    };
+    table == "dependencies"
+        || table == "dev-dependencies"
+        || table == "build-dependencies"
+        || table.ends_with(".dependencies")
+        || table.ends_with(".dev-dependencies")
+        || table.ends_with(".build-dependencies")
+}
+
+/// `package = "name"` (either quote style) anywhere on the line, where `package` is a whole key.
+fn renames_to(line: &str, name: &str) -> bool {
+    line.match_indices("package").any(|(at, _)| {
+        let key_start = line[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '_' || c == '-'));
+        let after_key = line[at + "package".len()..].trim_start_matches(' ');
+        let Some(value) = after_key.strip_prefix('=') else {
+            return false;
+        };
+        let value = value.trim_start_matches(' ');
+        key_start
+            && ['"', '\''].iter().any(|&q| {
+                value
+                    .strip_prefix(q)
+                    .and_then(|v| v.strip_prefix(name))
+                    .is_some_and(|v| v.starts_with(q))
+            })
+    })
 }
 
 #[test]
@@ -363,12 +423,20 @@ fn only_the_broker_adapter_can_reach_the_network() {
         let text = fs::read_to_string(dir.join("Cargo.toml")).expect("read crate Cargo.toml");
         manifests.push((name, text));
     }
+    // The phone app's Rust module is its own workspace, so its manifests are read here too.
+    for (name, dir) in subdirs(&root().join("ui/ext")) {
+        if dir.join("Cargo.toml").is_file() {
+            let text = fs::read_to_string(dir.join("Cargo.toml")).expect("read ui/ext Cargo.toml");
+            manifests.push((format!("ui/ext/{name}"), text));
+        }
+    }
     manifests.sort_by(|a, b| a.0.cmp(&b.0));
     let networked: Vec<&str> = manifests
         .iter()
         .filter(|(_, text)| {
-            text.lines()
-                .any(|line| NETWORK_CLIENTS.contains(&dependency_name(line.trim_start())))
+            NETWORK_CLIENTS
+                .iter()
+                .any(|client| names_client(text, client))
         })
         .map(|(name, _)| name.as_str())
         .collect();
@@ -377,4 +445,70 @@ fn only_the_broker_adapter_can_reach_the_network() {
         ["alpaca-adapter"],
         "only the broker adapter may depend on a network client"
     );
+}
+
+#[test]
+fn a_plain_dependency_line_matches() {
+    assert!(names_client(
+        "[dependencies]\nreqwest = \"0.13\"\n",
+        "reqwest"
+    ));
+    assert!(names_client(
+        "[dependencies]\nreqwest= \"0.13\"\n",
+        "reqwest"
+    ));
+}
+
+#[test]
+fn a_dotted_key_matches() {
+    assert!(names_client(
+        "[dependencies]\nreqwest.workspace = true\n",
+        "reqwest"
+    ));
+}
+
+#[test]
+fn a_table_header_matches() {
+    assert!(names_client(
+        "[dependencies.reqwest]\nversion = \"1\"\n",
+        "reqwest"
+    ));
+    assert!(names_client("[dev-dependencies.reqwest]\n", "reqwest"));
+    assert!(names_client("[build-dependencies.reqwest]\n", "reqwest"));
+    assert!(names_client(
+        "[target.'cfg(unix)'.dependencies.reqwest]\n",
+        "reqwest"
+    ));
+    assert!(!names_client(
+        "[dependencies.reqwest-middleware]\n",
+        "reqwest"
+    ));
+}
+
+#[test]
+fn a_rename_matches() {
+    assert!(names_client(
+        "[dependencies]\nhttp = { package = \"reqwest\", version = \"1\" }\n",
+        "reqwest"
+    ));
+    assert!(names_client("x = { package='reqwest' }\n", "reqwest"));
+    assert!(!names_client("my-package = \"reqwest\"\n", "reqwest"));
+    assert!(!names_client(
+        "package = \"reqwest-middleware\"\n",
+        "reqwest"
+    ));
+}
+
+#[test]
+fn a_comment_line_does_not_match() {
+    assert!(!names_client("# reqwest = \"0.13\"\n", "reqwest"));
+    assert!(!names_client("  # package = \"reqwest\"\n", "reqwest"));
+}
+
+#[test]
+fn a_longer_name_does_not_match_the_shorter_one() {
+    assert!(!names_client("reqwest-middleware = \"1\"\n", "reqwest"));
+    assert!(!names_client("llm-chain = \"1\"\n", "llm"));
+    assert!(!names_client("[dependencies.llm-chain]\n", "llm"));
+    assert!(names_client("llm = \"1\"\n", "llm"));
 }
