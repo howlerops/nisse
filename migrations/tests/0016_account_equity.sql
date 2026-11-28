@@ -28,9 +28,9 @@ SELECT pg_temp.assert_true(
   EXISTS (
     SELECT 1 FROM pg_indexes
     WHERE schemaname = 'public'
-      AND indexname = 'account_equity_version_session_idx'
-      AND indexdef LIKE '%(strategy_version_id, session_date, id DESC)%'),
-  'account_equity_version_session_idx must exist');
+      AND indexname = 'account_equity_environment_session_idx'
+      AND indexdef LIKE '%(environment, session_date, id DESC)%'),
+  'account_equity_environment_session_idx must exist');
 
 -- 3. Constraints: unknown environment, negative equity, unknown strategy version, nulls.
 SELECT pg_temp.assert_raises($q$

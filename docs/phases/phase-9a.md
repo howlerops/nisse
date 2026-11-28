@@ -36,7 +36,11 @@ environment, one is registered (`data_range` from now, open-ended; result
 
 Session close gains a step, `equity`, after `observe`: it writes the session's
 `account_equity` row from the equity it has just observed. A re-run of the same session
-skips the step once it is `done`. **Known limit:** the value is the broker's equity when the
+skips the step once it is `done`. The step is bookkeeping and never stops the run: if the
+write fails the step is recorded `failed`, the error is logged, and the rebalance and the
+heartbeat go ahead; the next run of the same session tries again. A session close that
+never got as far as this step (the bar ingest failed all evening, say) leaves no row, which
+the tracking gate reports as a gap. **Known limit:** the value is the broker's equity when the
 step runs, up to six hours after the close, not at the close itself; an after-hours move
 before a late run adds noise to the comparison.
 
@@ -50,7 +54,9 @@ before a late run adds noise to the comparison.
   before it has passed the holdout gate, so a tracking run must not become a free look at
   the holdout. Its stored result holds returns and session dates only for sessions on or
   after the day the engine first ran, and no summary, final equity or other figure computed
-  over the whole span; the binary prints nothing more than that;
+  over the whole span; the binary prints nothing more than that. The result is built from a
+  fixed list of keys that may be kept, so a figure added to backtest results later is left
+  out of a tracking run unless someone adds it to that list on purpose;
 - may read past `holdout_start` (it must: the engine runs today), is not marked `holdout`, and
   does not count toward `holdout_max_looks`. It is not a look in the sense the holdout
   protects: the config is already chosen and running, and the run only says how far the
@@ -71,13 +77,24 @@ environment's if it has any rows, else paper's) and the newest tracking run. The
 of a session is `equity / previous session's equity - 1`. The two series are compared
 session by session up to the earlier of the last equity row and the last tracking session.
 
-- **A gap is reported, not hidden, and does not end the gate for good.** A session the
-  backtest has and the equity series lacks (a missed session close) cannot be made up by the
-  engine. The comparison then covers the sessions after the newest gap, and the gate's note
-  names the gap. To include the earlier sessions, the owner inserts the missing day's equity
-  by hand (`docs/runbooks/paper-run.md`).
-- **A floor.** Fewer than 20 paired sessions: `not_evaluated`. Two flat series a few days
-  long would otherwise pass.
+- **Before the engine first traded.** A fresh deployment holds cash until its first
+  rebalance (a month end), while the backtest is already invested. The comparison starts
+  after the first session in which the account's equity changed: the leading sessions with
+  an unchanged equity, and the session of the first change (positions were being built that
+  day), are left out, and the note says how many. **Known limit:** the engine starts with a
+  fresh risk state, so if the backtest is in a drawdown step-down at that moment the two
+  hold different sizes until it ends.
+- **A gap is reported, not hidden, and cannot hide a failure.** A session the backtest has
+  and the equity series lacks (a missed session close) cannot be made up by the engine. A
+  gap splits the comparison into stretches. The newest stretch is the one that must reach
+  the floor; every earlier stretch that reaches the floor is judged too, and the gate fails
+  if any judged stretch is out of band. Earlier stretches shorter than the floor are named
+  as not judged. To join two stretches, the owner inserts the missing day's equity by hand
+  (`docs/runbooks/paper-run.md`).
+- **A floor.** Fewer than 20 paired sessions in the newest stretch: `not_evaluated`. Two
+  flat series a few days long would otherwise pass.
+- **A clean build.** A tracking run made from a build with uncommitted changes
+  (`--allow-dirty`) is never judged: `not_evaluated`.
 - **Not stale.** More than 5 equity rows after the tracking run's last session:
   `not_evaluated`, with a note to make a new tracking run.
 - **The same experiment.** The tracking run must have the same inputs (costs, symbols,

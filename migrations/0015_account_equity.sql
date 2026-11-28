@@ -14,8 +14,8 @@ CREATE TABLE account_equity (
   event_ts             TIMESTAMPTZ NOT NULL,
   ingest_ts            TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
-CREATE INDEX account_equity_version_session_idx
-  ON account_equity (strategy_version_id, session_date, id DESC);
+CREATE INDEX account_equity_environment_session_idx
+  ON account_equity (environment, session_date, id DESC);
 COMMENT ON TABLE account_equity IS 'The broker account''s equity at the close of one session; the newest row per environment, strategy config and session is that session''s equity.';
 SELECT nisse_make_append_only('account_equity');
 
