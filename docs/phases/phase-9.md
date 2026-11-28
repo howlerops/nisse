@@ -42,10 +42,9 @@ not worked around:
   checks the stage only when `signature.required` is true; `config/engine/paper.json` has
   it false today, so the paper engine checks no signature at all.
 - The only place that sends an order is the trader, after the risk gate's check
-  (`crates/engine/src/trader.rs`). This is by convention: the gateway's submit functions
-  are public, and nothing would stop a new binary calling them directly. A change that
-  adds live should close that (make them crate-private or add a test that fails on a
-  second caller).
+  (`crates/engine/src/trader.rs`). The gateway's submit functions are public (the
+  engine's integration tests need them), so the rule is held by a test that reads the
+  source and fails when a new non-test caller appears (`crates/app/tests/order_path.rs`).
 - There is no LLM or HTTP client outside the broker adapter.
 
 ## Order of work for going live
@@ -60,14 +59,11 @@ not worked around:
    keyed by account, which is unbuilt.
 3. **The promotion decision.** `nisse-gate-report` must show every gate except `tracking`
    passing for the champion's strategy version, including the one deliberate look at the
-   holdout. If it does not, there is no live phase yet. The tracking gate cannot pass
-   before live: the report loads no live returns today (`live: None` in
-   `crates/eval/src/gate_report.rs`), so it reports `not_evaluated` and the report exits 3,
-   not 0. Two pieces of unbuilt work follow, both needed before step 5:
-   - load live returns into the tracking gate, so steps 4 and 7 can be checked by the
-     report and not by hand;
-   - state the pre-live rule exactly ("every gate passes except `tracking`, which is
-     `not_evaluated`") so the `live` signer checks that, and not a loosened exit code.
+   holdout. If it does not, there is no live phase yet. The tracking gate is judged
+   from the engine's own equity and a tracking run (`docs/phases/phase-9a.md`): before live
+   it is `not_evaluated`, or judged on the paper run. One piece of unbuilt work remains,
+   needed before step 5: the `live` signer must check the pre-live rule exactly ("every
+   gate passes except `tracking`"), not a loosened exit code.
 4. **Pre-declare the tracking band** before the first live order: the backtest replayed
    over the same period, and the band live results must stay inside
    (`tracking_error_max` and `tracking_gap_max` in `config/eval/gates.json`, both 0.05
@@ -79,8 +75,8 @@ not worked around:
      live unsigned;
    - limits for the live account in a file outside the repository;
    - the same kill switch, watcher and dead-man check as paper, rehearsed on paper first.
-   - a `live` row in `trial_registry` for the live run: only the backtest job registers
-     trials today, and the paper engine registers none.
+   - the session-close `equity` step writing the `live` environment (it writes `paper`
+     today), and a record of deposits and withdrawals, which `account_equity` lacks.
    It is merged under the same rule as the other build phases (decided 2026-11-28): the
    Claude lead may merge it after the independent review and green CI, with every change
    under a sensitive path called out. It is never a change a research agent proposes.

@@ -78,6 +78,11 @@ The exit criterion is two consecutive weeks with none.
 
 - Dates covered, feed, build (`git_sha`).
 - Sessions run, rebalances, orders sent, fills, orders blocked by the gate (and by which rule).
+- Tracking: session close records the account's equity each day. At the end, run one
+  tracking run of the same strategy config over bars that reach the last session
+  (`nisse-backtest <job.json> --tracking`; it uses one trial of the lifetime budget and is
+  not a holdout look), then `nisse-gate-report`: quote the `tracking` gate's line. Two weeks
+  is a short sample, and the first days differ while the account builds its positions.
 - Breaks, each with what happened and what was changed.
 - Slippage: the distribution of `shortfall_bps` against the model's assumption.
 - Anything that had to be done by hand.
