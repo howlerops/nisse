@@ -80,7 +80,8 @@ fn key_from_hex(hex: &str, what: &str) -> Result<[u8; KEY_BYTES], CoreError> {
     })
 }
 
-/// The secret signing key. `Debug` never prints its bytes; they are zeroed on drop.
+/// The secret signing key. `Debug` never prints its bytes. The key held here is zeroed on
+/// drop; the hex text it was parsed from is the caller's and is not.
 pub struct SigningKey(ed25519_dalek::SigningKey);
 
 impl SigningKey {

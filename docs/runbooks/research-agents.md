@@ -33,8 +33,12 @@ Still open:
    fork only. A pull request from a fork is treated as an agent pull request by CI, with the
    strictest rules.
 2. **Signing key.** Generate the secret key, 32 random bytes as hex
-   (`openssl rand -hex 32`), and print its public key:
-   `NISSE_SIGNING_KEY=<secret> target/release/nisse-sign --public-key`. Put the secret in
+   (`openssl rand -hex 32`), and print its public key with
+   `target/release/nisse-sign --public-key`, giving it the secret in the environment variable
+   `NISSE_SIGNING_KEY` without typing the value on a command line (for example
+   `read -rs NISSE_SIGNING_KEY && export NISSE_SIGNING_KEY`, and close that shell after).
+   Use a fresh value: never reuse a key from the earlier shared-key scheme, and if a host
+   was set up under it, delete `NISSE_SIGNING_KEY` from its `/etc/nisse/nisse.env`. Put the secret in
    this repository's Actions secrets as `NISSE_SIGNING_KEY` **in an environment named
    `signing`**, and configure that environment with (a) deployment branches: `main` only,
    and (b) a required reviewer: you. Both matter: the signing job runs the code on `main`
@@ -55,7 +59,8 @@ Still open:
 6. **Agent report.** Add to the host's crontab, after the scoring job:
    `deploy/run.sh report target/release/nisse-agent-report config/eval/gates.json research/configs/trend-v1.json data/bars data/agent-report.json`.
    Research is public, the report is not: give it to the agents through something private
-   (a secret gist, a bucket) and never commit it to this repository or the fork.
+   (a private repository or an access-controlled bucket; a "secret" gist is only unlisted, not
+   private) and never commit it to this repository or the fork.
 7. **Scheduled tasks.** Create three Claude Code scheduled tasks, each starting a fresh
    session, each given the matching file from `research/agents/` as its instructions and
    the token from step 5: pre-market (before 13:30 UTC on weekdays), post-close (after the
