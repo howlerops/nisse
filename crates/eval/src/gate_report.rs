@@ -8,7 +8,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate, Utc};
 use nisse_core::nautilus::UnixNanos;
 use nisse_core::{EvalScore, StrategyVersionId, SubjectType};
 use nisse_store::StoreError;
@@ -239,8 +239,11 @@ fn parse_returns(result: &Value) -> Option<Vec<f64>> {
 pub struct ReportInputs {
     pub version: StrategyVersionId,
     pub gates: Gates,
-    /// Lifetime trial count (`trial_registry`, every kind).
+    /// Every registered trial, of every kind. Reported, not judged.
     pub lifetime_trials: u64,
+    /// Trials that can select a strategy: backtests and shadow runs, without tracking runs. What
+    /// the trial budget and the deflated Sharpe count.
+    pub selection_trials: u64,
     /// Holdout trials registered, all versions.
     pub holdout_looks: u64,
     /// Every backtest trial with a stored result, in trial id order.
@@ -270,8 +273,12 @@ pub struct TrackingStretch {
     pub backtest: Vec<f64>,
 }
 
-/// What the tracking gate judges: the engine's daily returns and a tracking run's over the same
-/// sessions, and what is needed to say whether the comparison is sound.
+/// What the tracking gate judges: the engine's daily returns and the usable tracking run's over the
+/// same sessions, and what is needed to say whether the comparison is sound.
+///
+/// The tracking run is the newest one that is usable (see [`load_inputs`]). When none is, the
+/// series are empty, `lag_sessions` and `leading_skipped` are 0, and `unusable` says why the newest
+/// run is not usable.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrackingInput {
     /// `paper` or `live`: whose equity was read.
@@ -285,11 +292,10 @@ pub struct TrackingInput {
     pub leading_skipped: usize,
     /// Equity rows dated after the tracking run's last session.
     pub lag_sessions: usize,
-    /// Whether the tracking run has the same inputs as the version's candidate backtest.
-    pub same_experiment: bool,
-    /// Whether the tracking run was made from a build with no uncommitted changes (its stored
-    /// `dirty_build` is `false`).
-    pub clean_build: bool,
+    /// `None` when a usable tracking run was found. Otherwise the fixed reason the newest tracking
+    /// run is not usable: it has uncommitted changes in its build, it does not have the candidate's
+    /// inputs, or it does not have the symbols the engine trades.
+    pub unusable: Option<&'static str>,
     /// Why the series could not be read at all (a malformed or incomplete tracking result).
     pub unreadable: bool,
 }
@@ -376,17 +382,40 @@ pub fn build_report(inputs: &ReportInputs) -> GateReport {
     }
 }
 
-/// Loads the inputs for `version` from the store. The tracking input (see [`TrackingInput`])
-/// compares the daily equity (the `live` environment's rows if it has any, else `paper`'s) with
-/// the newest tracking run, paired by [`pair_tracking`]. It is `None` when there is no tracking
-/// run or fewer than two equity rows. A tracking run whose result is incomplete or malformed
-/// gives `unreadable: true`, so the tracking gate says it could not be computed. The candidate
-/// is found from the trials already loaded, not queried again.
+/// The text of [`TrackingInput::unusable`] when the newest tracking run has uncommitted changes.
+const UNUSABLE_DIRTY: &str =
+    "the newest tracking run was made from a build with uncommitted changes";
+
+/// The text of [`TrackingInput::unusable`] when the newest tracking run does not have the
+/// candidate's inputs.
+const UNUSABLE_INPUTS: &str = "the newest tracking run does not have the same inputs as the candidate backtest (costs, symbols, limits, starting cash, seed)";
+
+/// The text of [`TrackingInput::unusable`] when the newest tracking run does not have the symbols
+/// the engine trades.
+const UNUSABLE_SYMBOLS: &str =
+    "the newest tracking run does not have the symbols the engine trades";
+
+/// Loads the inputs for `version` from the store.
+///
+/// The equity is the `live` environment's rows if it has any, else `paper`'s. The engine's current
+/// run is the newest `live` trial of the config in that environment (see
+/// [`trial_registry::latest_live`]). When there is one, equity rows dated before the UTC date of its
+/// start are left out: they belong to another universe. When there is none (hand-inserted equity),
+/// every row is kept and the engine's symbols are unknown.
+///
+/// The tracking run is the newest usable one, in `runs` order (newest first): from a clean build,
+/// with the candidate's inputs (see [`same_inputs`]) and, when the engine's symbols are known,
+/// with exactly those symbols. A newer run that is not usable does not replace an older usable
+/// one. The tracking input (see [`TrackingInput`]) pairs the equity with that run by
+/// [`pair_tracking`]. It is `None` when there is no tracking run or fewer than two equity rows after
+/// the cut. A usable run whose result is incomplete or malformed gives `unreadable: true`. The
+/// candidate is found from the trials already loaded, not queried again.
 pub async fn load_inputs<C: GenericClient>(
     client: &C,
     version: StrategyVersionId,
     gates: Gates,
 ) -> Result<ReportInputs, EvalError> {
+    let selection = trial_registry::selection_count(client).await?;
     let lifetime = trial_registry::lifetime_count(client).await?;
     let holdouts = trial_registry::holdout_count(client).await?;
     let trials: Vec<TrialSeries> = scoring::backtest_results(client)
@@ -406,22 +435,26 @@ pub async fn load_inputs<C: GenericClient>(
             (LIVE_ENVIRONMENT, live)
         }
     };
-    let live = match scoring::tracking_results(client, version)
-        .await?
-        .into_iter()
-        .next()
-    {
-        None => None,
-        Some(run) => tracking_input(
-            &run,
-            environment,
-            &equity,
-            newest_candidate(&trials, version),
-        ),
+    let engine = trial_registry::latest_live(client, version, Some(environment)).await?;
+    let equity: Vec<(NaiveDate, Decimal)> = match engine.as_ref() {
+        Some(run) => {
+            let from = utc_date(run.start)?;
+            equity.into_iter().filter(|(day, _)| *day >= from).collect()
+        }
+        None => equity,
     };
+    let runs = scoring::tracking_results(client, version).await?;
+    let live = tracking_input(
+        &runs,
+        environment,
+        &equity,
+        engine.as_ref().map(|run| run.symbols.as_slice()),
+        newest_candidate(&trials, version),
+    );
     Ok(ReportInputs {
         version,
         gates,
+        selection_trials: count(selection)?,
         lifetime_trials: count(lifetime)?,
         holdout_looks: count(holdouts)?,
         trials,
@@ -432,20 +465,75 @@ pub async fn load_inputs<C: GenericClient>(
     })
 }
 
-/// The tracking input of one tracking run against the equity of `environment`. `None` when there
-/// are fewer than two equity rows. `candidate` is the version's candidate trial, if any.
+/// The UTC date of an engine time.
+fn utc_date(ts: UnixNanos) -> Result<NaiveDate, EvalError> {
+    i64::try_from(ts.as_u64())
+        .ok()
+        .map(DateTime::<Utc>::from_timestamp_nanos)
+        .map(|time| time.date_naive())
+        .ok_or_else(|| EvalError::Store(StoreError::Data(format!("time {ts} out of range"))))
+}
+
+/// The tracking input of the newest usable run in `runs` (newest first) against the `equity` of
+/// `environment`. `engine_symbols` are the engine's symbols, when known, and `candidate` is the
+/// version's candidate trial, if any. `None` when there is no tracking run or fewer than two equity
+/// rows. When no run is usable the input has nothing paired and carries the newest run's reason.
 fn tracking_input(
+    runs: &[TrialWithResult],
+    environment: &'static str,
+    equity: &[(NaiveDate, Decimal)],
+    engine_symbols: Option<&[String]>,
+    candidate: Option<&TrialSeries>,
+) -> Option<TrackingInput> {
+    if equity.len() < 2 || runs.is_empty() {
+        return None;
+    }
+    let mut newest_reason = None;
+    for (index, run) in runs.iter().enumerate() {
+        let series = TrialSeries::from_stored(run);
+        match unusable_reason(&series, candidate, engine_symbols) {
+            None => return paired_input(run, environment, equity),
+            Some(reason) if index == 0 => newest_reason = Some(reason),
+            Some(_) => {}
+        }
+    }
+    Some(TrackingInput {
+        environment,
+        stretches: Vec::new(),
+        gaps: Vec::new(),
+        leading_skipped: 0,
+        lag_sessions: 0,
+        unusable: newest_reason,
+        unreadable: false,
+    })
+}
+
+/// Why a tracking run cannot be used, or `None` when it can: it was made from a build with no
+/// uncommitted changes, it has the candidate's inputs (see [`same_inputs`]) and, when the engine's
+/// symbols are known, exactly those symbols as a set.
+fn unusable_reason(
+    run: &TrialSeries,
+    candidate: Option<&TrialSeries>,
+    engine_symbols: Option<&[String]>,
+) -> Option<&'static str> {
+    if run.dirty_build != Some(false) {
+        return Some(UNUSABLE_DIRTY);
+    }
+    if !candidate.is_some_and(|c| same_inputs(c, run)) {
+        return Some(UNUSABLE_INPUTS);
+    }
+    let symbols = engine_symbols?;
+    let engine: BTreeSet<&str> = symbols.iter().map(String::as_str).collect();
+    (symbol_set(&run.symbols) != Some(engine)).then_some(UNUSABLE_SYMBOLS)
+}
+
+/// The tracking input of a usable tracking run: its sessions paired with `equity` by
+/// [`pair_tracking`]. `None` only when `equity` has fewer than two rows.
+fn paired_input(
     run: &TrialWithResult,
     environment: &'static str,
     equity: &[(NaiveDate, Decimal)],
-    candidate: Option<&TrialSeries>,
 ) -> Option<TrackingInput> {
-    if equity.len() < 2 {
-        return None;
-    }
-    let run_series = TrialSeries::from_stored(run);
-    let same_experiment = candidate.is_some_and(|c| same_inputs(c, &run_series));
-    let clean_build = run_series.dirty_build == Some(false);
     let parsed = tracking_series(&run.result);
     // Every equity row is newer than a run with no session at all.
     let lag_sessions = match parsed.as_ref().and_then(|(dates, _)| dates.last()) {
@@ -470,8 +558,7 @@ fn tracking_input(
         gaps,
         leading_skipped,
         lag_sessions,
-        same_experiment,
-        clean_build,
+        unusable: None,
         unreadable,
     })
 }
@@ -951,8 +1038,10 @@ fn holdout_tail(run: &TrialSeries) -> Result<&[f64], String> {
         .ok_or_else(|| "more holdout sessions than the holdout run has returns".to_owned())
 }
 
+/// The trial budget: the selecting trials (see [`ReportInputs::selection_trials`]) against the
+/// budget. The note also gives every registered trial, which is reported and not judged.
 fn trial_budget(inputs: &ReportInputs) -> GateResult {
-    let value = inputs.lifetime_trials as f64;
+    let value = inputs.selection_trials as f64;
     let threshold = f64::from(inputs.gates.trial_budget);
     judged(
         "trial_budget",
@@ -960,8 +1049,8 @@ fn trial_budget(inputs: &ReportInputs) -> GateResult {
         Some(value),
         Some(threshold),
         format!(
-            "{} lifetime trials against a budget of {}",
-            inputs.lifetime_trials, inputs.gates.trial_budget
+            "{} selecting trials against a budget of {} ({} registered in all)",
+            inputs.selection_trials, inputs.gates.trial_budget, inputs.lifetime_trials
         ),
     )
 }
@@ -1011,16 +1100,17 @@ fn deflated_sharpe(inputs: &ReportInputs, candidate: Option<&TrialSeries>) -> Ga
     // Oldest first, as the trials were registered.
     sharpes.reverse();
 
-    let lifetime = inputs.lifetime_trials;
-    if lifetime >= 2 {
+    // The selecting trials (see `ReportInputs::selection_trials`) are the trials this gate counts.
+    let selection = inputs.selection_trials;
+    if selection >= 2 {
         let usable = u64::try_from(sharpes.len()).unwrap_or(u64::MAX);
-        if usable.saturating_mul(2) < lifetime {
+        if usable.saturating_mul(2) < selection {
             return undecided(
                 NAME,
                 None,
                 threshold,
                 &format!(
-                    "fewer than half the lifetime trials have a usable Sharpe: {usable} of {lifetime}"
+                    "fewer than half the selecting trials have a usable Sharpe: {usable} of {selection}"
                 ),
             );
         }
@@ -1035,7 +1125,7 @@ fn deflated_sharpe(inputs: &ReportInputs, candidate: Option<&TrialSeries>) -> Ga
     }
 
     let minimum = inputs.gates.deflated_sharpe_min;
-    match dsr::deflated_sharpe(returns, &sharpes, lifetime) {
+    match dsr::deflated_sharpe(returns, &sharpes, selection) {
         None => undecided(
             NAME,
             None,
@@ -1335,9 +1425,9 @@ fn in_band(t: tracking::Tracking, max_error: f64, max_gap: f64) -> bool {
     t.tracking_error <= max_error && t.max_gap <= max_gap
 }
 
-/// The parts of the tracking gate's note that apply to every verdict after the floor check: the
-/// leading sessions left out, the newest five gaps (and how many earlier ones), and the earlier
-/// stretches too short to judge. Each part is present only when it applies.
+/// The suffix of the tracking gate's notes, for every verdict that is not an unusable run or an
+/// unreadable one: the leading sessions left out, the newest five gaps (and how many earlier ones),
+/// and the earlier stretches too short to judge. Each part is present only when it applies.
 fn left_out_text(input: &TrackingInput) -> String {
     let mut parts = Vec::new();
     if input.leading_skipped > 0 {
@@ -1381,10 +1471,79 @@ fn left_out_text(input: &TrackingInput) -> String {
     parts.concat()
 }
 
-/// Judges the tracking gate in this order: no live returns, unreadable, a build with uncommitted
-/// changes, not the same experiment, stale, the newest stretch too short, then every stretch of at
-/// least `MIN_TRACKING_SESSIONS` pairs against the tracking error and largest gap limits. The gate
-/// fails when any judged stretch is out of band, and the value is the worst tracking error among
+/// The tracking gate's note: the newest stretch (judged, or named as under the floor), each judged
+/// earlier stretch, a remark when an earlier stretch is out of band, and the suffix (see
+/// [`left_out_text`]).
+fn tracking_note(
+    input: &TrackingInput,
+    newest: Option<&TrackingStretch>,
+    newest_t: Option<Option<tracking::Tracking>>,
+    judged_earlier: &[(&TrackingStretch, Option<tracking::Tracking>)],
+    max_error: f64,
+    max_gap: f64,
+) -> String {
+    let environment = input.environment;
+    let sessions = newest.map_or(0, |stretch| stretch.live.len());
+    let mut parts = vec![match (newest, newest_t) {
+        (Some(stretch), Some(Some(t))) => format!(
+            "{environment} equity, {}, {sessions} sessions: tracking error {:.4} against {max_error} and largest gap {:.4} against {max_gap}",
+            stretch_span(stretch),
+            t.tracking_error,
+            t.max_gap
+        ),
+        (Some(stretch), Some(None)) => format!(
+            "{environment} equity, {}, {sessions} sessions: tracking error and largest gap could not be computed",
+            stretch_span(stretch)
+        ),
+        (Some(stretch), None) => format!(
+            "{environment} equity, {}, {sessions} sessions: under the {MIN_TRACKING_SESSIONS}-session floor, not judged",
+            stretch_span(stretch)
+        ),
+        (None, _) => format!("{environment} equity: no paired sessions"),
+    }];
+    parts.extend(judged_earlier.iter().map(|(stretch, t)| match t {
+        Some(t) => format!(
+            "; earlier stretch ({}, {} sessions: tracking error {:.4}, largest gap {:.4})",
+            stretch_span(stretch),
+            stretch.live.len(),
+            t.tracking_error,
+            t.max_gap
+        ),
+        None => format!(
+            "; earlier stretch ({}, {} sessions: could not be computed)",
+            stretch_span(stretch),
+            stretch.live.len()
+        ),
+    }));
+    if judged_earlier
+        .iter()
+        .any(|(_, t)| matches!(t, Some(t) if !in_band(*t, max_error, max_gap)))
+    {
+        parts.push("; an earlier stretch is out of band".to_owned());
+    }
+    parts.push(left_out_text(input));
+    parts.concat()
+}
+
+/// The largest tracking error among the judged stretches that could be computed, `None` when none
+/// could be.
+fn worst_error(
+    newest_t: Option<Option<tracking::Tracking>>,
+    judged_earlier: &[(&TrackingStretch, Option<tracking::Tracking>)],
+) -> Option<f64> {
+    newest_t
+        .flatten()
+        .into_iter()
+        .chain(judged_earlier.iter().filter_map(|(_, t)| *t))
+        .map(|t| t.tracking_error)
+        .reduce(f64::max)
+}
+
+/// Judges the tracking gate, in this order: no live returns; unreadable; no usable tracking run
+/// (the reason is the note); every stretch of at least `MIN_TRACKING_SESSIONS` pairs is judged and
+/// any out of band fails the gate, whatever the staleness or the newest stretch's length; a run more
+/// than `MAX_TRACKING_LAG_SESSIONS` equity rows behind is not evaluated; a newest stretch under the
+/// floor is not evaluated; otherwise the gate passes. The value is the worst tracking error among
 /// the judged stretches. The note names the newest stretch and each earlier judged stretch.
 fn tracking_gate(inputs: &ReportInputs) -> GateResult {
     const NAME: &str = "tracking";
@@ -1401,54 +1560,22 @@ fn tracking_gate(inputs: &ReportInputs) -> GateResult {
             "could not be computed: the tracking run's result is incomplete or malformed",
         );
     }
-    if !input.clean_build {
+    if let Some(why) = input.unusable {
         return undecided(
             NAME,
             None,
             Some(max_error),
-            "the tracking run was made from a build with uncommitted changes; make one from a clean build",
+            &format!("{why}; make a tracking run from a clean build with the candidate's inputs"),
         );
     }
-    if !input.same_experiment {
-        return undecided(
-            NAME,
-            None,
-            Some(max_error),
-            "the tracking run does not have the same inputs as the candidate backtest (costs, symbols, limits, starting cash, seed)",
-        );
-    }
-    if input.lag_sessions > MAX_TRACKING_LAG_SESSIONS {
-        return undecided(
-            NAME,
-            None,
-            Some(max_error),
-            &format!(
-                "the tracking run is {} sessions older than the newest equity row; make a new tracking run",
-                input.lag_sessions
-            ),
-        );
-    }
-    let (newest, earlier) = match input.stretches.split_last() {
-        Some((newest, earlier)) if newest.live.len() >= MIN_TRACKING_SESSIONS => (newest, earlier),
-        newest => {
-            let sessions = newest.map_or(0, |(stretch, _)| stretch.live.len());
-            let since = newest.map_or_else(
-                || "the start".to_owned(),
-                |(stretch, _)| stretch.first.to_string(),
-            );
-            return undecided(
-                NAME,
-                None,
-                Some(max_error),
-                &format!(
-                    "{sessions} paired sessions since {since}; at least {MIN_TRACKING_SESSIONS} are needed{}",
-                    left_out_text(input)
-                ),
-            );
-        }
-    };
     let ppy = inputs.gates.periods_per_year;
-    let newest_t = tracking::tracking(&newest.live, &newest.backtest, ppy);
+    let (newest, earlier) = match input.stretches.split_last() {
+        Some((newest, earlier)) => (Some(newest), earlier),
+        None => (None, [].as_slice()),
+    };
+    let newest_t = newest
+        .filter(|stretch| stretch.live.len() >= MIN_TRACKING_SESSIONS)
+        .map(|stretch| tracking::tracking(&stretch.live, &stretch.backtest, ppy));
     let judged_earlier: Vec<(&TrackingStretch, Option<tracking::Tracking>)> = earlier
         .iter()
         .filter(|stretch| stretch.live.len() >= MIN_TRACKING_SESSIONS)
@@ -1459,55 +1586,45 @@ fn tracking_gate(inputs: &ReportInputs) -> GateResult {
             )
         })
         .collect();
-    let newest_out = matches!(newest_t, Some(t) if !in_band(t, max_error, max_gap));
+    let newest_out = matches!(newest_t, Some(Some(t)) if !in_band(t, max_error, max_gap));
     let earlier_out = judged_earlier
         .iter()
         .any(|(_, t)| matches!(t, Some(t) if !in_band(*t, max_error, max_gap)));
-    let uncomputed = newest_t.is_none() || judged_earlier.iter().any(|(_, t)| t.is_none());
-    let worst = std::iter::once(newest_t)
-        .chain(judged_earlier.iter().map(|(_, t)| *t))
-        .flatten()
-        .map(|t| t.tracking_error)
-        .reduce(f64::max);
-
-    let sessions = newest.live.len();
-    let mut parts = vec![match newest_t {
-        Some(t) => format!(
-            "{} equity, {}, {sessions} sessions: tracking error {:.4} against {max_error} and largest gap {:.4} against {max_gap}",
-            input.environment,
-            stretch_span(newest),
-            t.tracking_error,
-            t.max_gap
-        ),
-        None => format!(
-            "{} equity, {}, {sessions} sessions: tracking error and largest gap could not be computed",
-            input.environment,
-            stretch_span(newest)
-        ),
-    }];
-    parts.extend(judged_earlier.iter().map(|(stretch, t)| match t {
-        Some(t) => format!(
-            "; earlier stretch ({}, {} sessions: tracking error {:.4}, largest gap {:.4})",
-            stretch_span(stretch),
-            stretch.live.len(),
-            t.tracking_error,
-            t.max_gap
-        ),
-        None => format!(
-            "; earlier stretch ({}, {} sessions: could not be computed)",
-            stretch_span(stretch),
-            stretch.live.len()
-        ),
-    }));
-    if earlier_out {
-        parts.push("; an earlier stretch is out of band".to_owned());
-    }
-    parts.push(left_out_text(input));
-    let note = parts.concat();
-
     if newest_out || earlier_out {
+        let worst = worst_error(newest_t, &judged_earlier);
+        let note = tracking_note(input, newest, newest_t, &judged_earlier, max_error, max_gap);
         return judged(NAME, false, worst, Some(max_error), note);
     }
+    if input.lag_sessions > MAX_TRACKING_LAG_SESSIONS {
+        return undecided(
+            NAME,
+            None,
+            Some(max_error),
+            &format!(
+                "the tracking run is {} sessions older than the newest equity row; make a new tracking run{}",
+                input.lag_sessions,
+                left_out_text(input)
+            ),
+        );
+    }
+    if newest_t.is_none() {
+        let sessions = newest.map_or(0, |stretch| stretch.live.len());
+        let since = newest.map_or_else(
+            || "the start".to_owned(),
+            |stretch| stretch.first.to_string(),
+        );
+        return undecided(
+            NAME,
+            None,
+            Some(max_error),
+            &format!(
+                "{sessions} paired sessions since {since}; at least {MIN_TRACKING_SESSIONS} are needed{}",
+                left_out_text(input)
+            ),
+        );
+    }
+    let uncomputed =
+        matches!(newest_t, Some(None)) || judged_earlier.iter().any(|(_, t)| t.is_none());
     if uncomputed {
         return undecided(
             NAME,
@@ -1519,6 +1636,8 @@ fn tracking_gate(inputs: &ReportInputs) -> GateResult {
             ),
         );
     }
+    let worst = worst_error(newest_t, &judged_earlier);
+    let note = tracking_note(input, newest, newest_t, &judged_earlier, max_error, max_gap);
     judged(NAME, true, worst, Some(max_error), note)
 }
 
@@ -1599,6 +1718,7 @@ fn info(inputs: &ReportInputs, candidate: Option<&TrialSeries>) -> Value {
             baseline.and_then(|baseline| baseline_active_sharpe(baseline, ppy))
         ),
         "lifetime_trials": inputs.lifetime_trials,
+        "selection_trials": inputs.selection_trials,
         "trial_budget": gates.trial_budget,
         "candidate_trial_id": candidate.map(|t| t.trial_id),
         "candidate_run": candidate_run(inputs, candidate),

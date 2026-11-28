@@ -128,10 +128,12 @@ fn expected_pbo(cand: &[f64], alts: &[Vec<f64>]) -> Option<f64> {
     pbo::pbo(&matrix)
 }
 
+/// Inputs whose registered and selecting trial counts are both `lifetime` (every trial selects).
 fn inputs(version: i64, trials: Vec<TrialSeries>, lifetime: u64) -> ReportInputs {
     ReportInputs {
         version: StrategyVersionId(version),
         gates: gates(),
+        selection_trials: lifetime,
         lifetime_trials: lifetime,
         holdout_looks: 0,
         trials,
@@ -348,6 +350,42 @@ fn more_than_the_trial_budget_fails_the_budget_gate() {
 }
 
 #[test]
+fn the_budget_counts_selecting_trials_only() {
+    let mut i = inputs(1, vec![], 500);
+    i.selection_trials = 100;
+    let report = build_report(&i);
+    let gate = find(&report, "trial_budget");
+    assert_eq!(gate.status, GateStatus::Pass, "{}", gate.note);
+    assert_eq!(
+        gate.note,
+        "100 selecting trials against a budget of 100 (500 registered in all)"
+    );
+
+    i.selection_trials = 101;
+    assert_eq!(status(&build_report(&i), "trial_budget"), GateStatus::Fail);
+}
+
+#[test]
+fn the_deflated_sharpe_uses_the_selection_count() {
+    let r = drift(500, 0.001, 0.010);
+    let other = drift(500, 0.0005, 0.010);
+    let trials = vec![
+        series(1, 2, false, other.clone()),
+        series(2, 1, false, r.clone()),
+    ];
+    let mut i = inputs(1, trials, 2);
+    let base = find(&build_report(&i), "deflated_sharpe").clone();
+    i.lifetime_trials = 50;
+    let raised = find(&build_report(&i), "deflated_sharpe").clone();
+    assert_eq!(base.value, raised.value);
+    let sharpes = [
+        moments::sharpe(&other).unwrap(),
+        moments::sharpe(&r).unwrap(),
+    ];
+    assert_eq!(base.value, dsr::deflated_sharpe(&r, &sharpes, 2));
+}
+
+#[test]
 fn a_candidate_that_cannot_be_used_leaves_the_statistics_not_evaluated() {
     let candidate = TrialSeries {
         returns: None,
@@ -475,7 +513,7 @@ fn deflated_sharpe_needs_usable_sharpes_for_half_the_lifetime_trials() {
     assert_eq!(gate.status, GateStatus::NotEvaluated);
     assert!(
         gate.note
-            .contains("fewer than half the lifetime trials have a usable Sharpe: 2 of 100"),
+            .contains("fewer than half the selecting trials have a usable Sharpe: 2 of 100"),
         "{}",
         gate.note
     );
@@ -2156,8 +2194,8 @@ fn stretch(first: u32, live: Vec<f64>, backtest: Vec<f64>) -> TrackingStretch {
     }
 }
 
-/// A tracking input that passes every check but the sessions: paper equity, the same experiment as
-/// the candidate, a clean build, no gap, no lag, nothing skipped at the start. The sessions are one
+/// A tracking input that passes every check but the sessions: paper equity, a usable tracking run,
+/// no gap, no lag, nothing skipped at the start. The sessions are one
 /// stretch from day 1 (none when `live` is empty).
 fn tracking_input(live: Vec<f64>, backtest: Vec<f64>) -> TrackingInput {
     let stretches = if live.is_empty() {
@@ -2171,8 +2209,7 @@ fn tracking_input(live: Vec<f64>, backtest: Vec<f64>) -> TrackingInput {
         gaps: Vec::new(),
         leading_skipped: 0,
         lag_sessions: 0,
-        same_experiment: true,
-        clean_build: true,
+        unusable: None,
         unreadable: false,
     }
 }
@@ -2270,7 +2307,7 @@ fn a_tracking_run_lagging_five_equity_rows_is_judged() {
 fn a_tracking_run_with_other_inputs_than_the_candidate_is_not_evaluated() {
     let r = drift(30, 0.001, 0.010);
     let input = TrackingInput {
-        same_experiment: false,
+        unusable: Some(UNUSABLE_INPUTS),
         ..tracking_input(r.clone(), r.clone())
     };
     let gate = tracking_gate_of(&r, input);
@@ -2280,6 +2317,85 @@ fn a_tracking_run_with_other_inputs_than_the_candidate_is_not_evaluated() {
         "{}",
         gate.note
     );
+}
+
+/// The three texts of `TrackingInput::unusable`, as the gate reports them.
+const UNUSABLE_DIRTY: &str =
+    "the newest tracking run was made from a build with uncommitted changes";
+const UNUSABLE_INPUTS: &str = "the newest tracking run does not have the same inputs as the candidate backtest (costs, symbols, limits, starting cash, seed)";
+const UNUSABLE_SYMBOLS: &str =
+    "the newest tracking run does not have the symbols the engine trades";
+
+#[test]
+fn an_unusable_newest_run_is_not_evaluated_with_its_reason() {
+    let r = drift(30, 0.001, 0.010);
+    for why in [UNUSABLE_DIRTY, UNUSABLE_INPUTS, UNUSABLE_SYMBOLS] {
+        let input = TrackingInput {
+            unusable: Some(why),
+            ..tracking_input(Vec::new(), Vec::new())
+        };
+        let gate = tracking_gate_of(&r, input);
+        assert_eq!(gate.status, GateStatus::NotEvaluated, "{}", gate.note);
+        assert_eq!(
+            gate.note,
+            format!("{why}; make a tracking run from a clean build with the candidate's inputs")
+        );
+    }
+}
+
+#[test]
+fn a_failed_earlier_stretch_fails_even_when_the_newest_is_short() {
+    let r = drift(5, 0.001, 0.010);
+    let input = with_stretches(
+        tracking_input(r.clone(), r.clone()),
+        vec![
+            stretch(1, drift(25, 0.01, -0.010), drift(25, 0.001, 0.010)),
+            stretch(30, r.clone(), r.clone()),
+        ],
+    );
+    let gate = tracking_gate_of(&r, input);
+    assert_eq!(gate.status, GateStatus::Fail, "{}", gate.note);
+    assert!(
+        gate.note.contains("an earlier stretch is out of band"),
+        "{}",
+        gate.note
+    );
+    assert!(
+        gate.note.contains("(2026-01-01 to 2026-01-25, 25 sessions"),
+        "{}",
+        gate.note
+    );
+    assert!(gate.note.contains("5 sessions"), "{}", gate.note);
+}
+
+#[test]
+fn a_failed_stretch_fails_even_when_the_run_is_stale() {
+    let r = drift(20, 0.001, 0.010);
+    let input = TrackingInput {
+        lag_sessions: 6,
+        ..with_stretches(
+            tracking_input(r.clone(), r.clone()),
+            vec![stretch(1, drift(20, 0.01, -0.010), drift(20, 0.001, 0.010))],
+        )
+    };
+    let gate = tracking_gate_of(&r, input);
+    assert_eq!(gate.status, GateStatus::Fail, "{}", gate.note);
+    assert!(!gate.note.contains("older"), "{}", gate.note);
+}
+
+#[test]
+fn a_stale_run_with_nothing_failed_is_not_evaluated() {
+    let r = drift(20, 0.001, 0.010);
+    let input = TrackingInput {
+        lag_sessions: 6,
+        ..with_stretches(
+            tracking_input(r.clone(), r.clone()),
+            vec![stretch(1, r.clone(), r.clone())],
+        )
+    };
+    let gate = tracking_gate_of(&r, input);
+    assert_eq!(gate.status, GateStatus::NotEvaluated, "{}", gate.note);
+    assert!(gate.note.contains("6 sessions older"), "{}", gate.note);
 }
 
 #[test]
@@ -2350,7 +2466,7 @@ fn the_checks_are_ordered_unreadable_before_experiment_before_lag_before_floor()
     let r = drift(3, 0.001, 0.010);
     let all_bad = TrackingInput {
         unreadable: true,
-        same_experiment: false,
+        unusable: Some(UNUSABLE_INPUTS),
         lag_sessions: 9,
         ..tracking_input(r.clone(), r.clone())
     };
@@ -2362,7 +2478,7 @@ fn the_checks_are_ordered_unreadable_before_experiment_before_lag_before_floor()
     );
 
     let not_same = TrackingInput {
-        same_experiment: false,
+        unusable: Some(UNUSABLE_INPUTS),
         lag_sessions: 9,
         ..tracking_input(r.clone(), r.clone())
     };
@@ -2473,8 +2589,7 @@ fn an_earlier_stretch_under_the_floor_is_not_judged_and_the_note_says_so() {
 fn a_build_with_uncommitted_changes_is_not_evaluated_before_the_experiment() {
     let r = drift(30, 0.001, 0.010);
     let input = TrackingInput {
-        clean_build: false,
-        same_experiment: false,
+        unusable: Some(UNUSABLE_DIRTY),
         ..tracking_input(r.clone(), r.clone())
     };
     let gate = tracking_gate_of(&r, input);
@@ -3038,7 +3153,7 @@ async fn the_tracking_gate_is_judged_from_equity_rows_and_a_tracking_run() {
     assert_eq!(input.leading_skipped, 1);
     assert!(input.gaps.is_empty());
     assert_eq!(input.lag_sessions, 0);
-    assert!(input.same_experiment && input.clean_build && !input.unreadable);
+    assert!(input.unusable.is_none() && !input.unreadable);
     assert_eq!(input.stretches.len(), 1);
     let stretch = &input.stretches[0];
     assert_eq!((stretch.first, stretch.last), (day(3), day(22)));
@@ -3075,7 +3190,7 @@ async fn a_tracking_run_with_other_costs_is_not_evaluated() {
 
     let inputs = load_inputs(&client, v, gates()).await.unwrap();
     let input = inputs.live.as_ref().expect("a tracking input");
-    assert!(!input.same_experiment);
+    assert_eq!(input.unusable, Some(UNUSABLE_INPUTS));
     let gate = find(&build_report(&inputs), "tracking").clone();
     assert_eq!(gate.status, GateStatus::NotEvaluated, "{}", gate.note);
     assert!(gate.note.contains("same inputs"), "{}", gate.note);
@@ -3192,7 +3307,7 @@ async fn a_dirty_tracking_run_is_not_evaluated() {
 
     let inputs = load_inputs(&client, v, gates()).await.unwrap();
     let input = inputs.live.as_ref().expect("a tracking input");
-    assert!(!input.clean_build);
+    assert_eq!(input.unusable, Some(UNUSABLE_DIRTY));
     let gate = find(&build_report(&inputs), "tracking").clone();
     assert_eq!(gate.status, GateStatus::NotEvaluated, "{}", gate.note);
     assert!(gate.note.contains("uncommitted changes"), "{}", gate.note);
@@ -3241,6 +3356,8 @@ async fn live_equity_is_preferred_over_paper() {
     )
     .await;
     tracking_run(&client, v, &days(&[5, 6, 7, 8]), &[0.0, 0.2, -0.25, 0.1]).await;
+    // Edited: a candidate with the tracking run's inputs, so the run is usable.
+    backtest_with_costs(&client, v, &[0.0, 0.2, -0.25, 0.1], costs_a()).await;
 
     let inputs = load_inputs(&client, v, gates()).await.unwrap();
     let input = inputs.live.as_ref().expect("a tracking input");
@@ -3268,15 +3385,20 @@ async fn a_malformed_tracking_result_leaves_the_gate_uncomputable() {
         Some(json!({"tracking": true})),
     )
     .await;
-    let mut result = stored_result(json!([0.0, 0.1, -0.1]), false);
+    // Edited: the run must be usable (clean build, the candidate's inputs) for its malformed series
+    // to be read at all.
+    let mut result = result_with_costs(json!([0.0, 0.1, -0.1]), costs_a());
+    result["dirty_build"] = json!(false);
     result["session_dates"] = json!(["2026-01-05", "not a date", "2026-01-07"]);
     trial_result::insert(&client, id, &result, UnixNanos::from(T))
         .await
         .unwrap();
+    backtest_with_costs(&client, v, &[0.0, 0.1, -0.1], costs_a()).await;
 
     let inputs = load_inputs(&client, v, gates()).await.unwrap();
     // Edited: the malformed result is now an unreadable tracking input, not two empty series.
     let input = inputs.live.as_ref().expect("a tracking input");
+    assert_eq!(input.unusable, None);
     assert!(input.unreadable);
     assert!(input.stretches.is_empty() && input.gaps.is_empty());
     let gate = find(&build_report(&inputs), "tracking").clone();
@@ -3547,8 +3669,8 @@ fn all_pass_holds_only_when_every_gate_passes() {
     // Each flip breaks exactly the gate named, and only that one must be non-passing.
     type Flip = fn(&mut ReportInputs);
     let flips: [(&str, Flip); 7] = [
-        ("trial_budget", |i| i.lifetime_trials = 101),
-        ("deflated_sharpe", |i| i.lifetime_trials = 30),
+        ("trial_budget", |i| i.selection_trials = 101),
+        ("deflated_sharpe", |i| i.selection_trials = 30),
         ("pbo", |i| {
             for trial in &mut i.trials {
                 if trial.trial_id < 10 {
@@ -3862,6 +3984,218 @@ async fn load_inputs_counts_every_trial_and_reads_backtest_results_only() {
     assert_eq!(inputs.risk_breaches, 0);
     assert_eq!(inputs.sent_orders, 0);
     assert_eq!(inputs.live, None);
+
+    drop(client);
+    db.drop_db().await.unwrap();
+}
+
+/// Midnight UTC of January day `n`, as the engine's run start.
+fn engine_start(n: u32) -> UnixNanos {
+    let seconds = day(n).and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
+    UnixNanos::from(u64::try_from(seconds).unwrap() * 1_000_000_000)
+}
+
+/// Registers a tracking run of `version` over January days 1 to `len` with the candidate's inputs,
+/// made from a build with uncommitted changes (`dirty_build` true), and returns its trial id.
+async fn dirty_tracking_run(client: &Client, version: StrategyVersionId, len: u32) -> i64 {
+    let id = register(
+        client,
+        version,
+        TrialKind::Backtest,
+        Some(json!({"tracking": true})),
+    )
+    .await;
+    let returns = wave_returns()[..usize::try_from(len).unwrap()].to_vec();
+    let mut result = result_with_costs(json!(returns), costs_a());
+    result["dirty_build"] = json!(true);
+    result["session_dates"] = json!(
+        days(&day_range(1, len))
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    );
+    trial_result::insert(client, id, &result, UnixNanos::from(T))
+        .await
+        .unwrap();
+    id
+}
+
+#[tokio::test]
+async fn a_newer_dirty_tracking_run_does_not_replace_a_usable_one() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let v = version(&client, 1).await;
+    record_wave(&client, v, "paper", &day_range(1, 22)).await;
+    backtest_with_costs(&client, v, &wave_returns()[..22], costs_a()).await;
+    tracking_run(&client, v, &days(&day_range(1, 22)), &wave_returns()[..22]).await;
+    dirty_tracking_run(&client, v, 22).await;
+
+    let inputs = load_inputs(&client, v, gates()).await.unwrap();
+    let input = inputs.live.as_ref().expect("a tracking input");
+    assert_eq!(input.unusable, None);
+    assert_eq!(input.stretches.len(), 1);
+    assert_eq!(
+        (input.stretches[0].first, input.stretches[0].last),
+        (day(3), day(22))
+    );
+    assert_eq!(
+        find(&build_report(&inputs), "tracking").status,
+        GateStatus::Pass
+    );
+
+    drop(client);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn only_a_dirty_tracking_run_is_unusable() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let v = version(&client, 1).await;
+    record_wave(&client, v, "paper", &day_range(1, 22)).await;
+    backtest_with_costs(&client, v, &wave_returns()[..22], costs_a()).await;
+    dirty_tracking_run(&client, v, 22).await;
+
+    let inputs = load_inputs(&client, v, gates()).await.unwrap();
+    let input = inputs.live.as_ref().expect("a tracking input");
+    assert_eq!(input.unusable, Some(UNUSABLE_DIRTY));
+    assert!(input.stretches.is_empty() && input.gaps.is_empty());
+    assert_eq!((input.leading_skipped, input.lag_sessions), (0, 0));
+    assert!(!input.unreadable);
+    let gate = find(&build_report(&inputs), "tracking").clone();
+    assert_eq!(gate.status, GateStatus::NotEvaluated, "{}", gate.note);
+    assert!(gate.note.contains("uncommitted changes"), "{}", gate.note);
+
+    drop(client);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_tracking_run_with_other_symbols_than_the_engine_is_unusable() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let v = version(&client, 1).await;
+    record_wave(&client, v, "paper", &day_range(1, 22)).await;
+    // The candidate and the tracking run trade SPY; the engine trades AAPL.
+    backtest_with_costs(&client, v, &wave_returns()[..22], costs_a()).await;
+    tracking_run(&client, v, &days(&day_range(1, 22)), &wave_returns()[..22]).await;
+    trial_registry::insert_live(
+        &client,
+        v,
+        "paper",
+        &["AAPL".to_owned()],
+        engine_start(1),
+        UnixNanos::from(T),
+    )
+    .await
+    .unwrap();
+
+    let inputs = load_inputs(&client, v, gates()).await.unwrap();
+    let input = inputs.live.as_ref().expect("a tracking input");
+    assert_eq!(input.unusable, Some(UNUSABLE_SYMBOLS));
+    let gate = find(&build_report(&inputs), "tracking").clone();
+    assert_eq!(gate.status, GateStatus::NotEvaluated, "{}", gate.note);
+    assert!(
+        gate.note.contains("symbols the engine trades"),
+        "{}",
+        gate.note
+    );
+
+    // The engine moves to SPY: the same tracking run is now usable.
+    trial_registry::insert_live(
+        &client,
+        v,
+        "paper",
+        &["SPY".to_owned()],
+        engine_start(1),
+        UnixNanos::from(T),
+    )
+    .await
+    .unwrap();
+    let inputs = load_inputs(&client, v, gates()).await.unwrap();
+    let input = inputs.live.as_ref().expect("a tracking input");
+    assert_eq!(input.unusable, None);
+    assert_eq!(input.stretches[0].first, day(3));
+
+    drop(client);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn equity_before_the_engines_current_run_is_left_out() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let v = version(&client, 1).await;
+    record_wave(&client, v, "paper", &day_range(1, 22)).await;
+    backtest_with_costs(&client, v, &wave_returns()[..22], costs_a()).await;
+    tracking_run(&client, v, &days(&day_range(1, 22)), &wave_returns()[..22]).await;
+    // The engine's current run started on day 6: days 1 to 5 belong to another run.
+    trial_registry::insert_live(
+        &client,
+        v,
+        "paper",
+        &["SPY".to_owned()],
+        engine_start(6),
+        UnixNanos::from(T),
+    )
+    .await
+    .unwrap();
+
+    let inputs = load_inputs(&client, v, gates()).await.unwrap();
+    let input = inputs.live.as_ref().expect("a tracking input");
+    assert_eq!(input.unusable, None);
+    // Day 6 is the first row; day 7 is the first change, so pairing starts on day 8.
+    assert_eq!(input.leading_skipped, 1);
+    assert!(input.gaps.is_empty());
+    assert_eq!(input.stretches.len(), 1);
+    assert_eq!(input.stretches[0].first, day(8));
+    assert_eq!(input.stretches[0].live.len(), 15);
+
+    drop(client);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn equity_without_a_live_trial_is_still_read() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let v = version(&client, 1).await;
+    record_wave(&client, v, "paper", &day_range(1, 22)).await;
+    backtest_with_costs(&client, v, &wave_returns()[..22], costs_a()).await;
+    tracking_run(&client, v, &days(&day_range(1, 22)), &wave_returns()[..22]).await;
+
+    let inputs = load_inputs(&client, v, gates()).await.unwrap();
+    let input = inputs.live.as_ref().expect("a tracking input");
+    assert_eq!(input.unusable, None);
+    assert_eq!(input.leading_skipped, 1);
+    assert_eq!(input.stretches[0].first, day(3));
+    assert_eq!(input.stretches[0].live.len(), 20);
+
+    drop(client);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn load_inputs_counts_selecting_and_registered_trials() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let v = version(&client, 1).await;
+    backtest_with_costs(&client, v, &[0.01, -0.02], costs_a()).await;
+    tracking_run(&client, v, &days(&[5, 6]), &[0.0, 0.1]).await;
+    trial_registry::insert_live(
+        &client,
+        v,
+        "paper",
+        &["SPY".to_owned()],
+        engine_start(1),
+        UnixNanos::from(T),
+    )
+    .await
+    .unwrap();
+
+    let inputs = load_inputs(&client, v, gates()).await.unwrap();
+    assert_eq!(inputs.selection_trials, 1);
+    assert_eq!(inputs.lifetime_trials, 3);
 
     drop(client);
     db.drop_db().await.unwrap();
