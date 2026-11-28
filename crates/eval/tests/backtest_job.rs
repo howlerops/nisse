@@ -9,10 +9,10 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use chrono::{Datelike, NaiveDate};
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use nisse_bars::{BarReader, write_bars};
 use nisse_core::{
-    bars_snapshot_id,
+    StrategyVersionId, bars_snapshot_id,
     nautilus::{
         AggregationSource, Bar, BarAggregation, BarSpecification, BarType, InstrumentId, Price,
         PriceType, Quantity, Symbol, UnixNanos, Venue,
@@ -232,7 +232,60 @@ fn options(replayable: bool, allow_dirty: bool, holdout: bool) -> RunOptions {
         replayable,
         allow_dirty,
         holdout,
+        tracking: false,
     }
+}
+
+/// Options for a tracking run on a clean build.
+fn tracking_options() -> RunOptions {
+    RunOptions {
+        tracking: true,
+        ..options(true, false, false)
+    }
+}
+
+/// Runs an ordinary backtest of `job` (which creates its strategy version) and registers a paper
+/// `live` trial for that version starting at `live_from`. Returns the version. Call it before
+/// `set_holdout` moves the boundary inside the bars, since an ordinary run cannot reach it.
+async fn traded(
+    store: &Store,
+    client: &Client,
+    job: &BacktestJob,
+    live_from: UnixNanos,
+) -> StrategyVersionId {
+    let ordinary = run_backtest_job(store, job, options(true, false, false), now())
+        .await
+        .unwrap();
+    trial_registry::insert_live(
+        client,
+        ordinary.strategy_version_id,
+        "paper",
+        live_from,
+        now(),
+    )
+    .await
+    .unwrap();
+    ordinary.strategy_version_id
+}
+
+/// The UTC date of a timestamp, as `YYYY-MM-DD`.
+fn date_of(ts: UnixNanos) -> String {
+    let nanos = i64::try_from(ts.as_u64()).unwrap();
+    DateTime::<Utc>::from_timestamp_nanos(nanos)
+        .date_naive()
+        .to_string()
+}
+
+/// The `result` column of a trial's registry row; `None` for SQL NULL (no marker).
+async fn registry_result(client: &Client, trial_id: i64) -> Option<Value> {
+    client
+        .query_one(
+            "SELECT result FROM trial_registry WHERE id = $1",
+            &[&trial_id],
+        )
+        .await
+        .unwrap()
+        .get(0)
 }
 
 fn now() -> UnixNanos {
@@ -267,10 +320,11 @@ fn error_text<T>(result: Result<T, EvalError>) -> String {
     result.err().expect("an error").to_string()
 }
 
-const RESULT_FIELDS: [&str; 28] = [
+const RESULT_FIELDS: [&str; 29] = [
     "returns",
     "returns_complete",
     "holdout",
+    "tracking",
     "holdout_start",
     "holdout_sessions",
     "final_drawdown_mode",
@@ -1284,6 +1338,266 @@ async fn a_stored_backtest_result_is_a_usable_trial_for_the_gate_report() {
             .usable(&Gates::load(&earlier).unwrap())
             .is_err()
     );
+    db.drop_db().await.unwrap();
+}
+
+// ---- tracking runs --------------------------------------------------------------------------
+
+/// A paper live start inside the synthetic bars, used by most tracking tests.
+fn live_from() -> UnixNanos {
+    utc(2021, 2, 1, 0, 0, 0, 0)
+}
+
+#[tokio::test]
+async fn a_tracking_run_is_refused_without_a_live_trial() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let store = Store::new(db.client().await.unwrap());
+    let dir = bars_dir("tracking-no-live", &market());
+    let job = job(dir.path(), strategy_params());
+    let before = trial_count(&client).await;
+
+    let err = run_backtest_job(&store, &job, tracking_options(), now())
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("no live trial"));
+    assert_eq!(trial_count(&client).await, before);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_tracking_run_is_refused_for_a_config_that_was_never_traded() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let store = Store::new(db.client().await.unwrap());
+    let dir = bars_dir("tracking-other-config", &market());
+    let traded_job = job(dir.path(), strategy_params());
+    traded(&store, &client, &traded_job, live_from()).await;
+    let mut other_params = strategy_params();
+    other_params["lookback_days"] = json!(21);
+    let other = job(dir.path(), other_params);
+    let before = trial_count(&client).await;
+
+    let err = run_backtest_job(&store, &other, tracking_options(), now())
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("no live trial"));
+    assert_eq!(trial_count(&client).await, before);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_tracking_run_is_refused_when_the_bars_end_before_the_first_live_session() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let store = Store::new(db.client().await.unwrap());
+    let dir = bars_dir("tracking-late-live", &market());
+    let job = job(dir.path(), strategy_params());
+    // The last session in the bars is 2 July 2021.
+    traded(&store, &client, &job, utc(2021, 7, 5, 0, 0, 0, 0)).await;
+    let before = trial_count(&client).await;
+
+    let err = run_backtest_job(&store, &job, tracking_options(), now())
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("the bars end before it"));
+    assert_eq!(trial_count(&client).await, before);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_tracking_run_may_start_on_the_last_session_the_engine_ran() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let store = Store::new(db.client().await.unwrap());
+    let dir = bars_dir("tracking-last-session", &market());
+    let job = job(dir.path(), strategy_params());
+    let last_close = *closes().last().unwrap();
+    traded(&store, &client, &job, last_close).await;
+
+    let outcome = run_backtest_job(&store, &job, tracking_options(), now())
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.result["tracking"], json!(true));
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_tracking_run_may_reach_past_the_holdout_boundary() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let store = Store::new(db.client().await.unwrap());
+    let dir = bars_dir("tracking-past-holdout", &market());
+    let full = job(dir.path(), strategy_params());
+    traded(&store, &client, &full, live_from()).await;
+    set_holdout(&full, "2021-05-03", 10);
+
+    let ordinary = run_backtest_job(&store, &full, options(true, false, false), now())
+        .await
+        .unwrap_err();
+    assert!(matches!(ordinary, EvalError::HoldoutTouched(_)));
+
+    let outcome = run_backtest_job(&store, &full, tracking_options(), now())
+        .await
+        .unwrap();
+    assert_eq!(outcome.result["holdout"], json!(false));
+    assert_eq!(outcome.result["tracking"], json!(true));
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_tracking_run_is_not_a_holdout_look() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let store = Store::new(db.client().await.unwrap());
+    let dir = bars_dir("tracking-not-look", &market());
+    let full = job(dir.path(), strategy_params());
+    traded(&store, &client, &full, live_from()).await;
+    set_holdout(&full, "2021-05-03", 10);
+    let looks_before = trial_registry::holdout_count(&client).await.unwrap();
+
+    run_backtest_job(&store, &full, tracking_options(), now())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        trial_registry::holdout_count(&client).await.unwrap(),
+        looks_before
+    );
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_tracking_run_registers_a_trial_marked_tracking() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let store = Store::new(db.client().await.unwrap());
+    let dir = bars_dir("tracking-marked", &market());
+    let job = job(dir.path(), strategy_params());
+    traded(&store, &client, &job, live_from()).await;
+    let before = trial_count(&client).await;
+
+    let outcome = run_backtest_job(&store, &job, tracking_options(), now())
+        .await
+        .unwrap();
+
+    assert_eq!(trial_count(&client).await, before + 1);
+    assert_eq!(
+        registry_result(&client, outcome.trial_id).await,
+        Some(json!({"tracking": true}))
+    );
+    assert_eq!(outcome.result["tracking"], json!(true));
+    assert_eq!(outcome.result["holdout"], json!(false));
+    assert_eq!(outcome.result["holdout_sessions"], json!(0));
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_tracking_run_stores_one_session_date_per_return() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let store = Store::new(db.client().await.unwrap());
+    let dir = bars_dir("tracking-dates", &market());
+    let job = job(dir.path(), strategy_params());
+    traded(&store, &client, &job, live_from()).await;
+
+    let outcome = run_backtest_job(&store, &job, tracking_options(), now())
+        .await
+        .unwrap();
+
+    let returns = outcome.result["returns"].as_array().unwrap();
+    let dates = outcome.result["session_dates"].as_array().unwrap();
+    assert_eq!(dates.len(), returns.len());
+    assert_eq!(dates.len(), SESSIONS - 1);
+    let texts: Vec<&str> = dates.iter().map(|d| d.as_str().unwrap()).collect();
+    for text in &texts {
+        NaiveDate::parse_from_str(text, "%Y-%m-%d").unwrap();
+    }
+    assert!(texts.windows(2).all(|pair| pair[0] < pair[1]));
+    let last_bar_date = date_of(*closes().last().unwrap());
+    assert_eq!(last_bar_date, "2021-07-02");
+    assert_eq!(texts.last().copied(), Some(last_bar_date.as_str()));
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_tracking_run_is_left_out_of_backtest_results() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let store = Store::new(db.client().await.unwrap());
+    let dir = bars_dir("tracking-left-out", &market());
+    let job = job(dir.path(), strategy_params());
+    let version = traded(&store, &client, &job, live_from()).await;
+    let ordinary = run_backtest_job(&store, &job, options(true, false, false), now())
+        .await
+        .unwrap();
+
+    let tracking = run_backtest_job(&store, &job, tracking_options(), now())
+        .await
+        .unwrap();
+
+    let results = scoring::backtest_results(&client).await.unwrap();
+    assert!(results.iter().all(|r| r.trial_id != tracking.trial_id));
+    assert!(results.iter().any(|r| r.trial_id == ordinary.trial_id));
+    let found = scoring::tracking_result(&client, version)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.trial_id, tracking.trial_id);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn holdout_and_tracking_together_are_refused() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let store = Store::new(db.client().await.unwrap());
+    let dir = bars_dir("holdout-and-tracking", &market());
+    let full = job(dir.path(), strategy_params());
+    traded(&store, &client, &full, live_from()).await;
+    set_holdout(&full, "2021-05-03", 10);
+    let trials_before = trial_count(&client).await;
+    let versions_before = version_count(&client).await;
+    let looks_before = trial_registry::holdout_count(&client).await.unwrap();
+    let both = RunOptions {
+        holdout: true,
+        ..tracking_options()
+    };
+
+    let err = run_backtest_job(&store, &full, both, now())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, EvalError::InvalidJob(_)));
+    assert!(err.to_string().contains("not both"));
+    assert_eq!(trial_count(&client).await, trials_before);
+    assert_eq!(version_count(&client).await, versions_before);
+    assert_eq!(
+        trial_registry::holdout_count(&client).await.unwrap(),
+        looks_before
+    );
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_ordinary_run_stores_tracking_false_and_no_session_dates() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let store = Store::new(db.client().await.unwrap());
+    let dir = bars_dir("ordinary-tracking-false", &market());
+    let job = job(dir.path(), strategy_params());
+
+    let outcome = run_backtest_job(&store, &job, options(true, false, false), now())
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.result["tracking"], json!(false));
+    assert!(outcome.result.get("session_dates").is_none());
+    assert_eq!(registry_result(&client, outcome.trial_id).await, None);
     db.drop_db().await.unwrap();
 }
 
