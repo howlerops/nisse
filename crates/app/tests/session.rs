@@ -348,6 +348,32 @@ async fn a_tick_with_no_bar_file_yet_reconciles_and_writes_a_heartbeat() {
 }
 
 #[tokio::test]
+async fn a_tick_registers_the_live_trial_before_any_session_close() {
+    let f = fixture().await;
+    let sim = broker();
+    let clock = ManualClock::new(at(date(2025, 12, 15), 15));
+
+    tick(&f.config, &f.market, &f.store, f.sink.clone(), &sim, &clock)
+        .await
+        .unwrap();
+
+    // The tick registered the trial after restore, and no session has closed: no equity row.
+    assert_eq!(paper_live_trials(&f.store).await, 1);
+    assert_eq!(count(&f.store, "account_equity").await, 0);
+
+    // A session close after that adds no second trial.
+    let day = date(2025, 12, 31);
+    let clock = ManualClock::new(plus_minutes(close_at(day), 10));
+    session_close(&f.config, &f.market, &f.store, f.sink.clone(), &sim, &clock)
+        .await
+        .unwrap();
+    assert_eq!(paper_live_trials(&f.store).await, 1);
+    assert_eq!(count(&f.store, "trial_registry").await, 1);
+
+    f.db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
 async fn a_tick_with_the_lock_held_elsewhere_is_busy() {
     let f = fixture().await;
     let other = Store::new(f.db.client().await.unwrap());
@@ -1326,7 +1352,12 @@ async fn session_close_records_the_account_equity() {
         .unwrap()
         .unwrap();
     assert_eq!(status, StepStatus::Done);
-    assert_eq!(detail["trial_registered"], json!(true));
+    assert_eq!(
+        detail["equity"]
+            .as_str()
+            .map(|text| text.parse::<Decimal>().unwrap()),
+        Some(observed_equity(&f.store, day).await)
+    );
 
     f.db.drop_db().await.unwrap();
 }
@@ -1396,7 +1427,12 @@ async fn a_second_session_adds_equity_but_no_second_trial() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(detail["trial_registered"], json!(false));
+    assert_eq!(
+        detail["equity"]
+            .as_str()
+            .map(|text| text.parse::<Decimal>().unwrap()),
+        Some(observed_equity(&f.store, second).await)
+    );
 
     f.db.drop_db().await.unwrap();
 }

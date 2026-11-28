@@ -42,6 +42,8 @@ pub struct EngineConfig {
     pub source: String,
     /// Whether the deployment must be signed, and where its manifest is.
     pub signature: SignatureRule,
+    /// The environment the engine trades in. Only `PAPER` is accepted by this build.
+    pub environment: &'static str,
 }
 
 /// The `signature` setting: where the deployment's manifest is and whether it must verify.
@@ -202,6 +204,7 @@ impl EngineConfig {
                 .as_u64()
                 .ok_or_else(|| invalid("seed must be a non-negative integer (u64)"))?,
             source: raw.source,
+            environment: PAPER,
             signature: SignatureRule {
                 manifest,
                 required: raw.signature.required,
