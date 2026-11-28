@@ -10,7 +10,7 @@ use nisse_core::nautilus::UnixNanos;
 use nisse_core::{StrategyVersionId, Trial, TrialKind};
 use nisse_eval::gate_report::{
     EVAL_VERSION, GateReport, GateResult, GateStatus, ReportInputs, TrackingInput, TrackingPairing,
-    TrialSeries, build_report, load_inputs, pair_tracking, store_report,
+    TrackingStretch, TrialSeries, build_report, load_inputs, pair_tracking, store_report,
 };
 use nisse_eval::gates::Gates;
 use nisse_eval::stats::{dsr, moments, pbo};
@@ -2145,19 +2145,41 @@ fn risk_breaches_must_be_zero_and_need_a_sent_order() {
 
 // ---- tracking -------------------------------------------------------------------------------
 
-/// A tracking input that passes every check but the sessions: paper equity, the same experiment as
-/// the candidate, no gap, no lag. Its span is only for the note, so it is not a real calendar.
-fn tracking_input(live: Vec<f64>, backtest: Vec<f64>) -> TrackingInput {
-    TrackingInput {
-        environment: "paper",
+/// A stretch of paired sessions from day `first` on, one session per return.
+fn stretch(first: u32, live: Vec<f64>, backtest: Vec<f64>) -> TrackingStretch {
+    let last = first + u32::try_from(live.len()).unwrap() - 1;
+    TrackingStretch {
+        first: day(first),
+        last: day(last),
         live,
         backtest,
-        span: Some((day(1), day(31))),
-        gap: None,
+    }
+}
+
+/// A tracking input that passes every check but the sessions: paper equity, the same experiment as
+/// the candidate, a clean build, no gap, no lag, nothing skipped at the start. The sessions are one
+/// stretch from day 1 (none when `live` is empty).
+fn tracking_input(live: Vec<f64>, backtest: Vec<f64>) -> TrackingInput {
+    let stretches = if live.is_empty() {
+        Vec::new()
+    } else {
+        vec![stretch(1, live, backtest)]
+    };
+    TrackingInput {
+        environment: "paper",
+        stretches,
+        gaps: Vec::new(),
+        leading_skipped: 0,
         lag_sessions: 0,
         same_experiment: true,
+        clean_build: true,
         unreadable: false,
     }
+}
+
+/// `input` with its stretches replaced by `stretches`.
+fn with_stretches(input: TrackingInput, stretches: Vec<TrackingStretch>) -> TrackingInput {
+    TrackingInput { stretches, ..input }
 }
 
 /// The tracking gate of a version whose candidate is `cand` and whose tracking input is `input`.
@@ -2205,10 +2227,10 @@ fn fewer_than_twenty_paired_sessions_are_not_evaluated_and_the_count_is_named() 
 #[test]
 fn exactly_twenty_identical_sessions_pass_and_the_note_names_them() {
     let r = drift(20, 0.001, 0.010);
-    let input = TrackingInput {
-        span: Some((day(5), day(24))),
-        ..tracking_input(r.clone(), r.clone())
-    };
+    let input = with_stretches(
+        tracking_input(r.clone(), r.clone()),
+        vec![stretch(5, r.clone(), r.clone())],
+    );
     let gate = tracking_gate_of(&r, input);
     assert_eq!(gate.status, GateStatus::Pass, "{}", gate.note);
     for text in ["paper", "2026-01-05", "2026-01-24", "20 sessions"] {
@@ -2279,34 +2301,37 @@ fn an_unreadable_tracking_result_is_not_evaluated() {
 
 #[test]
 fn a_gap_with_twenty_sessions_after_it_is_judged_and_the_note_names_it() {
+    // Edited: the gap is now a list of gaps, and the note names each one.
     let r = drift(25, 0.001, 0.010);
     let input = TrackingInput {
-        gap: Some(day(7)),
+        gaps: vec![day(7)],
         ..tracking_input(r.clone(), r.clone())
     };
     let gate = tracking_gate_of(&r, input);
     assert_eq!(gate.status, GateStatus::Pass, "{}", gate.note);
     assert!(
-        gate.note.contains("sessions up to 2026-01-07 are left out"),
+        gate.note
+            .ends_with("; no equity and tracking pair for 2026-01-07"),
         "{}",
         gate.note
     );
-    assert!(gate.note.contains("2026-01-07"), "{}", gate.note);
 }
 
 #[test]
 fn a_gap_leaving_fewer_than_twenty_sessions_names_the_gap() {
+    // Edited: the note names the gap after the count, as the shared suffix.
     let r = drift(19, 0.001, 0.010);
     let input = TrackingInput {
-        gap: Some(day(7)),
+        gaps: vec![day(7)],
         ..tracking_input(r.clone(), r.clone())
     };
     let gate = tracking_gate_of(&r, input);
     assert_eq!(gate.status, GateStatus::NotEvaluated, "{}", gate.note);
     assert!(gate.note.contains("19 paired sessions"), "{}", gate.note);
     assert!(
-        gate.note
-            .ends_with("sessions up to 2026-01-07 are left out: the equity and tracking series do not both have 2026-01-07"),
+        gate.note.ends_with(
+            "19 paired sessions since 2026-01-01; at least 20 are needed; no equity and tracking pair for 2026-01-07"
+        ),
         "{}",
         gate.note
     );
@@ -2352,11 +2377,151 @@ fn the_checks_are_ordered_unreadable_before_experiment_before_lag_before_floor()
     assert!(gate.note.contains("sessions older"), "{}", gate.note);
 }
 
+#[test]
+fn a_short_newest_stretch_is_not_evaluated_even_with_a_long_earlier_one() {
+    let r = drift(25, 0.001, 0.010);
+    let input = with_stretches(
+        tracking_input(r.clone(), r.clone()),
+        vec![
+            stretch(1, r.clone(), r.clone()),
+            stretch(30, r[..19].to_vec(), r[..19].to_vec()),
+        ],
+    );
+    let gate = tracking_gate_of(&r, input);
+    assert_eq!(gate.status, GateStatus::NotEvaluated, "{}", gate.note);
+    assert!(
+        gate.note.starts_with("19 paired sessions since 2026-01-30"),
+        "{}",
+        gate.note
+    );
+}
+
+#[test]
+fn an_out_of_band_earlier_stretch_fails_the_gate_even_when_the_newest_passes() {
+    let r = drift(20, 0.001, 0.010);
+    let bad = drift(25, 0.01, -0.010);
+    let input = with_stretches(
+        tracking_input(r.clone(), r.clone()),
+        vec![
+            stretch(1, bad, drift(25, 0.001, 0.010)),
+            stretch(30, r.clone(), r.clone()),
+        ],
+    );
+    let gate = tracking_gate_of(&r, input);
+    assert_eq!(gate.status, GateStatus::Fail, "{}", gate.note);
+    assert!(
+        gate.note.contains("an earlier stretch is out of band"),
+        "{}",
+        gate.note
+    );
+    assert!(
+        gate.note.contains("(2026-01-01 to 2026-01-25, 25 sessions"),
+        "{}",
+        gate.note
+    );
+    // The value is the worst tracking error, the earlier stretch's.
+    let newest_only = tracking_gate_of(&r, tracking_input(r.clone(), r.clone()));
+    assert!(gate.value > newest_only.value, "{gate:?}");
+}
+
+#[test]
+fn an_in_band_earlier_stretch_is_judged_and_named_with_the_newest() {
+    let r = drift(20, 0.001, 0.010);
+    let earlier = drift(25, 0.001, 0.010);
+    let input = with_stretches(
+        tracking_input(r.clone(), r.clone()),
+        vec![
+            stretch(1, earlier.clone(), earlier),
+            stretch(30, r.clone(), r.clone()),
+        ],
+    );
+    let gate = tracking_gate_of(&r, input);
+    assert_eq!(gate.status, GateStatus::Pass, "{}", gate.note);
+    assert!(
+        gate.note.contains("2026-01-30 to 2026-02-18, 20 sessions"),
+        "{}",
+        gate.note
+    );
+    assert!(
+        gate.note.contains("(2026-01-01 to 2026-01-25, 25 sessions"),
+        "{}",
+        gate.note
+    );
+}
+
+#[test]
+fn an_earlier_stretch_under_the_floor_is_not_judged_and_the_note_says_so() {
+    let r = drift(20, 0.001, 0.010);
+    let input = with_stretches(
+        tracking_input(r.clone(), r.clone()),
+        vec![
+            stretch(1, drift(5, 0.01, -0.010), drift(5, 0.0, 0.0)),
+            stretch(30, r.clone(), r.clone()),
+        ],
+    );
+    let gate = tracking_gate_of(&r, input);
+    assert_eq!(gate.status, GateStatus::Pass, "{}", gate.note);
+    assert!(
+        gate.note
+            .contains("1 earlier stretch of fewer than 20 sessions is not judged"),
+        "{}",
+        gate.note
+    );
+}
+
+#[test]
+fn a_build_with_uncommitted_changes_is_not_evaluated_before_the_experiment() {
+    let r = drift(30, 0.001, 0.010);
+    let input = TrackingInput {
+        clean_build: false,
+        same_experiment: false,
+        ..tracking_input(r.clone(), r.clone())
+    };
+    let gate = tracking_gate_of(&r, input);
+    assert_eq!(gate.status, GateStatus::NotEvaluated, "{}", gate.note);
+    assert!(gate.note.contains("uncommitted changes"), "{}", gate.note);
+}
+
+#[test]
+fn leading_sessions_skipped_before_the_first_trade_are_named() {
+    let r = drift(25, 0.001, 0.010);
+    let input = TrackingInput {
+        leading_skipped: 3,
+        ..tracking_input(r.clone(), r.clone())
+    };
+    let gate = tracking_gate_of(&r, input);
+    assert_eq!(gate.status, GateStatus::Pass, "{}", gate.note);
+    assert!(
+        gate.note
+            .contains("3 leading sessions before the engine first traded are left out"),
+        "{}",
+        gate.note
+    );
+}
+
+#[test]
+fn six_gaps_name_the_newest_five_and_the_count_of_the_rest() {
+    let r = drift(25, 0.001, 0.010);
+    let input = TrackingInput {
+        gaps: days(&[2, 3, 4, 5, 6, 7]),
+        ..tracking_input(r.clone(), r.clone())
+    };
+    let gate = tracking_gate_of(&r, input);
+    assert_eq!(gate.status, GateStatus::Pass, "{}", gate.note);
+    assert!(
+        gate.note.ends_with(
+            "no equity and tracking pair for 2026-01-03, 2026-01-04, 2026-01-05, 2026-01-06, 2026-01-07 and 1 earlier"
+        ),
+        "{}",
+        gate.note
+    );
+}
+
 // ---- pairing the live and tracking returns ----------------------------------------------------
 
-/// January 2026, day `n`.
+/// January 2026, day `n`. Days past the 31st run on into February, so the longer fixtures work.
 fn day(n: u32) -> NaiveDate {
-    NaiveDate::from_ymd_opt(2026, 1, n).unwrap()
+    NaiveDate::from_ymd_opt(2026, 1, 1).unwrap() + chrono::Days::new(u64::from(n.saturating_sub(1)))
 }
 
 fn days(ns: &[u32]) -> Vec<NaiveDate> {
@@ -2382,19 +2547,38 @@ fn assert_close(actual: &[f64], expected: &[f64]) {
     }
 }
 
+/// Asserts the pairing is one stretch with the given returns.
 fn assert_paired(pair: Option<TrackingPairing>, live: &[f64], backtest: &[f64]) {
     let pair = pair.expect("the series pair");
     assert!(!pair.malformed, "{pair:?}");
-    assert_close(&pair.live, live);
-    assert_close(&pair.backtest, backtest);
+    assert_eq!(pair.stretches.len(), 1, "{pair:?}");
+    assert_close(&pair.stretches[0].live, live);
+    assert_close(&pair.stretches[0].backtest, backtest);
 }
 
-/// The inputs are malformed: both series empty and flagged, which the gate reports as unreadable.
+/// The inputs are malformed: no stretches and no gaps, flagged, which the gate reports as
+/// unreadable.
 fn assert_malformed(pair: Option<TrackingPairing>) {
     let pair = pair.expect("malformed inputs still give a pairing");
     assert!(pair.malformed, "{pair:?}");
-    assert!(pair.live.is_empty() && pair.backtest.is_empty(), "{pair:?}");
-    assert_eq!((pair.span, pair.gap), (None, None));
+    assert!(
+        pair.stretches.is_empty() && pair.gaps.is_empty(),
+        "{pair:?}"
+    );
+}
+
+/// Asserts the pairing has exactly these stretches, given as `(first, last, live, backtest)`.
+fn assert_stretches(pair: &TrackingPairing, expected: &[(u32, u32, &[f64], &[f64])]) {
+    assert_eq!(pair.stretches.len(), expected.len(), "{pair:?}");
+    for (stretch, &(first, last, live, backtest)) in pair.stretches.iter().zip(expected) {
+        assert_eq!(
+            (stretch.first, stretch.last),
+            (day(first), day(last)),
+            "{pair:?}"
+        );
+        assert_close(&stretch.live, live);
+        assert_close(&stretch.backtest, backtest);
+    }
 }
 
 #[test]
@@ -2421,85 +2605,193 @@ fn pair_tracking_with_no_tracking_date_or_only_one_before_the_span_pairs_nothing
         pair_tracking(&eq, &days(&[4, 5]), &[0.0, 0.0]),
     ] {
         let pair = pair.expect("a pairing");
-        assert!(pair.live.is_empty() && pair.backtest.is_empty(), "{pair:?}");
-        assert_eq!((pair.span, pair.gap), (None, None));
+        assert!(
+            pair.stretches.is_empty() && pair.gaps.is_empty(),
+            "{pair:?}"
+        );
         assert!(!pair.malformed);
     }
 }
 
 #[test]
 fn pair_tracking_pairs_the_live_and_backtest_returns_of_the_same_sessions() {
+    // Edited: day 6 is the first change in equity, so pairing starts on day 7.
     let eq = equity_rows(&[(5, "100"), (6, "110"), (7, "99")]);
     let pair = pair_tracking(&eq, &days(&[5, 6, 7]), &[0.0, 0.05, -0.02]);
-    assert_paired(pair, &[0.10, -0.10], &[0.05, -0.02]);
+    assert_paired(pair, &[-0.10], &[-0.02]);
 }
 
 #[test]
 fn pair_tracking_uses_only_the_tail_of_a_long_tracking_run() {
+    // Edited: day 8 is the first change, so pairing starts on day 9.
     let eq = equity_rows(&[(7, "100"), (8, "101"), (9, "103")]);
     let dates = days(&[1, 2, 3, 4, 5, 6, 7, 8, 9]);
     let returns = [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.004, 0.02];
     let pair = pair_tracking(&eq, &dates, &returns);
-    assert_paired(pair, &[0.01, 2.0 / 101.0], &[0.004, 0.02]);
+    assert_paired(pair, &[2.0 / 101.0], &[0.02]);
 }
 
 #[test]
-fn pair_tracking_pairs_from_the_second_equity_row_when_the_run_starts_later() {
+fn pair_tracking_pairs_from_the_row_after_the_first_change_when_the_run_starts_later() {
+    // Edited: the run starts on day 6, the first change, so day 7 pairs with it.
     let eq = equity_rows(&[(5, "100"), (6, "110"), (7, "99")]);
     let pair = pair_tracking(&eq, &days(&[6, 7]), &[0.05, -0.02]);
-    assert_paired(pair, &[0.10, -0.10], &[0.05, -0.02]);
+    assert_paired(pair, &[-0.10], &[-0.02]);
 }
 
 #[test]
 fn pair_tracking_compares_only_up_to_the_last_tracking_date() {
+    // Edited: the equity runs to day 8, the tracking run to day 7. Day 8 is not compared.
     let eq = equity_rows(&[(5, "100"), (6, "110"), (7, "99"), (8, "105")]);
-    let pair = pair_tracking(&eq, &days(&[5, 6]), &[0.0, 0.05]);
-    assert_paired(pair, &[0.10], &[0.05]);
+    let pair = pair_tracking(&eq, &days(&[5, 6, 7]), &[0.0, 0.05, -0.02]);
+    assert_paired(pair, &[-0.10], &[-0.02]);
+}
+
+#[test]
+fn a_gap_splits_the_pairs_into_two_stretches() {
+    // Day 6 is the first change, so pairing runs from day 7. Equity lacks day 9: day 9 is the gap,
+    // days 7 and 8 form the first stretch, and days 11 and 12 (pairing again from day 11) the
+    // second. Day 10 has no pair: its previous row is day 8, and the tracking run has day 9.
+    let eq = equity_rows(&[
+        (5, "100"),
+        (6, "110"),
+        (7, "99"),
+        (8, "108.9"),
+        (10, "100"),
+        (11, "110"),
+        (12, "99"),
+    ]);
+    let dates = days(&[5, 6, 7, 8, 9, 10, 11, 12]);
+    let returns = [0.0, 0.1, -0.1, 0.1, 0.0, 0.0, 0.1, -0.1];
+    let pair = pair_tracking(&eq, &dates, &returns).unwrap();
+    assert_eq!(pair.gaps, vec![day(9)]);
+    assert_stretches(
+        &pair,
+        &[
+            (7, 8, &[-0.1, 0.1], &[-0.1, 0.1]),
+            (11, 12, &[0.1, -0.1], &[0.1, -0.1]),
+        ],
+    );
+}
+
+#[test]
+fn two_gaps_give_three_stretches() {
+    // Equity lacks day 9 and day 13. Stretches: 7 to 8, 11 to 12 and 15.
+    let eq = equity_rows(&[
+        (5, "100"),
+        (6, "110"),
+        (7, "99"),
+        (8, "108.9"),
+        (10, "100"),
+        (11, "110"),
+        (12, "99"),
+        (14, "108.9"),
+        (15, "98.01"),
+    ]);
+    let dates = days(&[5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+    let returns = [0.0, 0.1, -0.1, 0.1, 0.0, 0.0, 0.1, -0.1, 0.0, 0.0, -0.1];
+    let pair = pair_tracking(&eq, &dates, &returns).unwrap();
+    assert_eq!(pair.gaps, vec![day(9), day(13)]);
+    assert_stretches(
+        &pair,
+        &[
+            (7, 8, &[-0.1, 0.1], &[-0.1, 0.1]),
+            (11, 12, &[0.1, -0.1], &[0.1, -0.1]),
+            (15, 15, &[-0.1], &[-0.1]),
+        ],
+    );
+}
+
+#[test]
+fn leading_unchanged_equity_and_the_first_change_are_skipped_not_gaps() {
+    // Equity is unchanged on days 1 to 3 and changes on day 4, the first change. Days 1 to 4 are
+    // skipped (not gaps), so the one stretch is days 5 and 6.
+    let eq = equity_rows(&[
+        (1, "100"),
+        (2, "100"),
+        (3, "100"),
+        (4, "101"),
+        (5, "102"),
+        (6, "103"),
+    ]);
+    let dates = days(&[1, 2, 3, 4, 5, 6]);
+    let returns = [0.0, 0.0, 0.0, 0.0099, 0.0098, 0.0098];
+    let pair = pair_tracking(&eq, &dates, &returns).unwrap();
+    assert_eq!(pair.leading_skipped, 3);
+    assert!(pair.gaps.is_empty(), "{pair:?}");
+    assert_stretches(
+        &pair,
+        &[(
+            5,
+            6,
+            &[102.0 / 101.0 - 1.0, 103.0 / 102.0 - 1.0],
+            &[0.0098, 0.0098],
+        )],
+    );
+}
+
+#[test]
+fn equity_that_never_changes_pairs_nothing() {
+    let eq = equity_rows(&[(5, "100"), (6, "100"), (7, "100"), (8, "100")]);
+    let pair = pair_tracking(&eq, &days(&[5, 6, 7, 8]), &[0.0, 0.0, 0.0, 0.0]).unwrap();
+    assert_eq!(pair.leading_skipped, 3);
+    assert!(
+        pair.stretches.is_empty() && pair.gaps.is_empty(),
+        "{pair:?}"
+    );
+    assert!(!pair.malformed);
+}
+
+#[test]
+fn a_stretch_with_no_pairs_is_not_kept() {
+    // Day 7 is the only gap, and no pair comes after the first change before it: no stretch.
+    let eq = equity_rows(&[(5, "100"), (6, "110"), (8, "99")]);
+    let pair = pair_tracking(&eq, &days(&[5, 6, 7, 8]), &[0.0, 0.05, 0.01, -0.02]).unwrap();
+    assert!(pair.stretches.is_empty(), "{pair:?}");
+    assert_eq!(pair.gaps, vec![day(7)]);
 }
 
 #[test]
 fn a_tracking_session_the_equity_lacks_is_the_gap_and_nothing_after_it_is_left() {
-    // Edited: this used to expect two empty series. Day 7 is in the tracking run and the equity
-    // series has no row for it. Day 8 is paired only if the session before it is an equity row,
-    // and it is not, so nothing is paired.
+    // Day 7 is in the tracking run and the equity series has no row for it: the gap. Day 8 is not
+    // paired, since the tracking session before it is not an equity row, and there is no stretch.
     let eq = equity_rows(&[(5, "100"), (6, "110"), (8, "99")]);
     let pair = pair_tracking(&eq, &days(&[5, 6, 7, 8]), &[0.0, 0.05, 0.01, -0.02]).unwrap();
-    assert!(pair.live.is_empty() && pair.backtest.is_empty());
-    assert_eq!(pair.gap, Some(day(7)));
-    assert_eq!(pair.span, None);
+    assert!(pair.stretches.is_empty());
+    assert_eq!(pair.gaps, vec![day(7)]);
     assert!(!pair.malformed);
 }
 
 #[test]
 fn an_equity_row_the_tracking_run_lacks_is_the_gap() {
-    // Edited: this used to expect two empty series. Day 6 has an equity row but no tracking date;
-    // day 7 is paired against day 6, which the tracking run lacks, so it is a gap too. The newest
-    // gap is day 7's previous row, day 6.
+    // Edited: day 6 is the first change, so the first pair is day 7. The tracking run lacks day
+    // 6 and so its return for day 7 spans other sessions: day 7 is the gap.
     let eq = equity_rows(&[(5, "100"), (6, "110"), (7, "99")]);
     let pair = pair_tracking(&eq, &days(&[5, 7]), &[0.0, 0.01]).unwrap();
-    assert!(pair.live.is_empty() && pair.backtest.is_empty());
-    assert_eq!(pair.gap, Some(day(6)));
+    assert!(pair.stretches.is_empty());
+    assert_eq!(pair.gaps, vec![day(7)]);
     assert!(!pair.malformed);
 }
 
 #[test]
 fn a_zero_or_negative_previous_equity_is_a_gap_at_that_session() {
-    // Edited: this used to expect two empty series. Day 6 cannot be paired: its previous equity is
-    // not positive. The gap is day 6, and nothing before it was paired.
-    let zero = equity_rows(&[(5, "0"), (6, "110")]);
-    let pair = pair_tracking(&zero, &days(&[5, 6]), &[0.0, 0.05]).unwrap();
-    assert!(pair.live.is_empty() && pair.backtest.is_empty());
-    assert_eq!(pair.gap, Some(day(6)));
-    let negative = equity_rows(&[(5, "-5"), (6, "110")]);
-    let pair = pair_tracking(&negative, &days(&[5, 6]), &[0.0, 0.05]).unwrap();
-    assert!(pair.live.is_empty() && pair.backtest.is_empty());
-    assert_eq!(pair.gap, Some(day(6)));
+    // Edited: the previous equity must be positive. Day 8 follows the row of day 7, whose equity
+    // is not positive, so day 8 is the gap. Day 7 itself pairs with day 6.
+    let zero = equity_rows(&[(5, "100"), (6, "110"), (7, "0"), (8, "50")]);
+    let pair = pair_tracking(&zero, &days(&[5, 6, 7, 8]), &[0.0, 0.1, -0.1, 0.0]).unwrap();
+    assert_eq!(pair.gaps, vec![day(8)]);
+    assert_stretches(&pair, &[(7, 7, &[-1.0], &[-0.1])]);
+    let negative = equity_rows(&[(5, "100"), (6, "110"), (7, "-5"), (8, "110")]);
+    let pair = pair_tracking(&negative, &days(&[5, 6, 7, 8]), &[0.0, 0.1, -0.1, 0.0]).unwrap();
+    assert_eq!(pair.gaps, vec![day(8)]);
+    assert_stretches(&pair, &[(7, 7, &[-1.0 - 5.0 / 110.0], &[-0.1])]);
 }
 
 #[test]
 fn a_gap_drops_the_sessions_up_to_it_and_keeps_the_rest() {
-    // Tracking has days 5 to 10. The equity has no row for day 7, so the gap is day 7 and the
-    // comparison keeps days 9 and 10 only. Day 8's equity return spans day 7, so it is dropped too.
+    // Edited: the first change is day 6, so pairing starts on day 8. Tracking has days 5 to 10.
+    // The equity has no row for day 7, so the gap is day 7 and the stretch keeps days 9 and 10
+    // only. Day 8's equity return spans day 7, so it is dropped too.
     let eq = equity_rows(&[
         (5, "100"),
         (6, "110"),
@@ -2510,47 +2802,26 @@ fn a_gap_drops_the_sessions_up_to_it_and_keeps_the_rest() {
     let dates = days(&[5, 6, 7, 8, 9, 10]);
     let returns = [0.0, 0.1, 0.5, -0.3, 0.1, -0.1];
     let pair = pair_tracking(&eq, &dates, &returns).unwrap();
-    assert_paired(Some(pair.clone()), &[0.1, -0.1], &[0.1, -0.1]);
-    assert_eq!(pair.gap, Some(day(7)));
-    assert_eq!(pair.span, Some((day(9), day(10))));
+    assert_stretches(&pair, &[(9, 10, &[0.1, -0.1], &[0.1, -0.1])]);
+    assert_eq!(pair.gaps, vec![day(7)]);
 }
 
 #[test]
-fn two_gaps_keep_only_the_sessions_after_the_newest() {
-    // Gaps at day 7 (equity lacks it) and day 11 (tracking has it, equity does not: the equity
-    // row on day 12 is preceded by day 9 in the equity, while the tracking run has 10 and 11).
-    let eq = equity_rows(&[
-        (5, "100"),
-        (6, "110"),
-        (8, "99"),
-        (9, "108.9"),
-        (12, "100"),
-        (13, "110"),
-        (14, "99"),
-    ]);
-    let dates = days(&[5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
-    let returns = [0.0, 0.1, 0.5, -0.3, 0.1, 0.2, 0.3, 0.4, 0.1, -0.1];
-    let pair = pair_tracking(&eq, &dates, &returns).unwrap();
-    assert_paired(Some(pair.clone()), &[0.1, -0.1], &[0.1, -0.1]);
-    assert_eq!(pair.gap, Some(day(11)));
-    assert_eq!(pair.span, Some((day(13), day(14))));
-}
-
-#[test]
-fn no_gap_reports_none() {
+fn no_gap_leaves_no_gaps() {
     let eq = equity_rows(&[(5, "100"), (6, "110"), (7, "99")]);
     let pair = pair_tracking(&eq, &days(&[5, 6, 7]), &[0.0, 0.05, -0.02]).unwrap();
-    assert_eq!(pair.gap, None);
-    assert_eq!(pair.span, Some((day(6), day(7))));
+    assert!(pair.gaps.is_empty());
+    assert_stretches(&pair, &[(7, 7, &[-0.10], &[-0.02])]);
 }
 
 #[test]
 fn a_tracking_session_after_the_last_equity_row_inside_the_span_is_a_gap() {
-    // The span ends at day 7 (the last tracking date). The equity has nothing after day 5 in it.
-    let eq = equity_rows(&[(5, "100"), (9, "110")]);
-    let pair = pair_tracking(&eq, &days(&[5, 6, 7]), &[0.0, 0.1, 0.2]).unwrap();
-    assert!(pair.live.is_empty() && pair.backtest.is_empty());
-    assert_eq!(pair.gap, Some(day(7)));
+    // Edited: the tracking run ends on day 8, before the equity's last row (day 9). Day 8 has no
+    // equity row, so it is the trailing gap. Day 7 pairs with day 6.
+    let eq = equity_rows(&[(5, "100"), (6, "110"), (7, "99"), (9, "110")]);
+    let pair = pair_tracking(&eq, &days(&[5, 6, 7, 8]), &[0.0, 0.1, -0.1, 0.2]).unwrap();
+    assert_eq!(pair.gaps, vec![day(8)]);
+    assert_stretches(&pair, &[(7, 7, &[-0.1], &[-0.1])]);
 }
 
 #[test]
@@ -2574,12 +2845,24 @@ fn pair_tracking_with_equity_out_of_date_order_is_malformed() {
 }
 
 #[test]
-fn a_gap_with_no_session_after_it_leaves_nothing_paired() {
-    // Tracking has day 6, which the equity lacks, so day 7 cannot be paired with day 5.
-    let eq = equity_rows(&[(5, "100"), (7, "110")]);
-    let pair = pair_tracking(&eq, &days(&[6, 7]), &[0.0, 0.1]).unwrap();
-    assert!(pair.live.is_empty() && pair.backtest.is_empty());
-    assert_eq!(pair.gap, Some(day(6)));
+fn tracking_sessions_before_the_first_change_are_not_gaps() {
+    // Replaces the old gap-at-day-6 case: day 6 is before the first change (day 7), so the
+    // tracking run having it and the equity lacking it is not a gap.
+    let eq = equity_rows(&[(5, "100"), (7, "110"), (8, "99")]);
+    let pair = pair_tracking(&eq, &days(&[6, 7, 8]), &[0.0, 0.1, -0.1]).unwrap();
+    assert!(pair.gaps.is_empty(), "{pair:?}");
+    assert_stretches(&pair, &[(8, 8, &[-0.1], &[-0.1])]);
+    // With nothing after the first change, nothing is paired and nothing is a gap.
+    let pair = pair_tracking(
+        &equity_rows(&[(5, "100"), (7, "110")]),
+        &days(&[6, 7]),
+        &[0.0, 0.1],
+    )
+    .unwrap();
+    assert!(
+        pair.stretches.is_empty() && pair.gaps.is_empty(),
+        "{pair:?}"
+    );
 }
 
 // ---- the tracking gate from the store -------------------------------------------------------
@@ -2616,8 +2899,8 @@ async fn tracking_run(
     tracking_run_with_costs(client, version, dates, returns, costs_a()).await
 }
 
-/// Registers a tracking run of `version` with its returns over `dates` and costs `costs`, and
-/// returns its trial id.
+/// Registers a tracking run of `version` with its returns over `dates` and costs `costs`, made
+/// from a clean build, and returns its trial id.
 async fn tracking_run_with_costs(
     client: &Client,
     version: StrategyVersionId,
@@ -2633,6 +2916,7 @@ async fn tracking_run_with_costs(
     )
     .await;
     let mut result = result_with_costs(json!(returns), costs);
+    result["dirty_build"] = json!(false);
     result["session_dates"] = json!(dates.iter().map(ToString::to_string).collect::<Vec<_>>());
     trial_result::insert(client, id, &result, UnixNanos::from(T))
         .await
@@ -2660,11 +2944,13 @@ async fn backtest_with_costs(
     id
 }
 
-/// The equity of January days 1 to 31: 100 on day 1, then up 10% and down 10% alternately, so
-/// the return of day `d` (from day 2 on) is `wave_returns()[d - 1]`. Exact in `Decimal`.
-fn wave_equity() -> Vec<Decimal> {
+/// The equity of the first `len` January days: 100 on day 1, then up 10% and down 10% alternately,
+/// so the return of day `d` (from day 2 on) is `wave_returns_of(len)[d - 1]`. Exact in `Decimal`
+/// up to 28 steps; beyond that the product rounds at the 28th decimal place, far below any tolerance
+/// the tests use.
+fn wave_equity_of(len: usize) -> Vec<Decimal> {
     let mut equity = vec![dec("100")];
-    for index in 1..31 {
+    for index in 1..len {
         let factor = if index % 2 == 1 {
             dec("1.1")
         } else {
@@ -2676,9 +2962,9 @@ fn wave_equity() -> Vec<Decimal> {
     equity
 }
 
-/// The daily returns of January days 1 to 31 that match `wave_equity` (day 1 has none).
-fn wave_returns() -> Vec<f64> {
-    (0..31)
+/// The daily returns of the first `len` January days that match `wave_equity_of` (day 1 has none).
+fn wave_returns_of(len: usize) -> Vec<f64> {
+    (0..len)
         .map(|index| match index {
             0 => 0.0,
             i if i % 2 == 1 => 0.1,
@@ -2687,9 +2973,15 @@ fn wave_returns() -> Vec<f64> {
         .collect()
 }
 
+/// The daily returns of January days 1 to 31 that match `wave_equity` (day 1 has none).
+fn wave_returns() -> Vec<f64> {
+    wave_returns_of(31)
+}
+
 /// Records the wave equity of `version` in `environment` for the given January days.
 async fn record_wave(client: &Client, version: StrategyVersionId, environment: &str, days: &[u32]) {
-    let equity = wave_equity();
+    let longest = days.iter().copied().max().map_or(0, |n| n as usize);
+    let equity = wave_equity_of(longest);
     for &n in days {
         account_equity::insert(
             client,
@@ -2732,8 +3024,9 @@ async fn the_tracking_gate_is_judged_from_equity_rows_and_a_tracking_run() {
     let db = ScratchDb::create().await;
     let client = db.client().await.unwrap();
     let v = version(&client, 1).await;
-    // Edited: 22 equity rows (21 paired sessions, the floor is 20) and a candidate backtest with
-    // the tracking run's inputs. The equity alternates up and down 10%: day 2 is 0.1, day 3 -0.1.
+    // Edited: 22 equity rows. Day 2 is the first change in equity (the wave starts with a move), so
+    // pairing starts on day 3 and gives the floor's 20 sessions. A candidate backtest with the
+    // tracking run's inputs. Day 2 is 0.1 and day 3 is -0.1.
     record_wave(&client, v, "paper", &day_range(1, 22)).await;
     let dates = days(&day_range(1, 22));
     tracking_run(&client, v, &dates, &wave_returns()[..22]).await;
@@ -2742,17 +3035,26 @@ async fn the_tracking_gate_is_judged_from_equity_rows_and_a_tracking_run() {
     let inputs = load_inputs(&client, v, gates()).await.unwrap();
     let input = inputs.live.as_ref().expect("a tracking input");
     assert_eq!(input.environment, "paper");
-    assert_eq!(input.span, Some((day(2), day(22))));
-    assert_eq!(input.gap, None);
+    assert_eq!(input.leading_skipped, 1);
+    assert!(input.gaps.is_empty());
     assert_eq!(input.lag_sessions, 0);
-    assert!(input.same_experiment && !input.unreadable);
-    assert_close(&input.live, &wave_returns()[1..22]);
-    assert_close(&input.backtest, &wave_returns()[1..22]);
+    assert!(input.same_experiment && input.clean_build && !input.unreadable);
+    assert_eq!(input.stretches.len(), 1);
+    let stretch = &input.stretches[0];
+    assert_eq!((stretch.first, stretch.last), (day(3), day(22)));
+    assert_close(&stretch.live, &wave_returns()[2..22]);
+    assert_close(&stretch.backtest, &wave_returns()[2..22]);
     let report = build_report(&inputs);
     let gate = find(&report, "tracking");
     assert_eq!(gate.status, GateStatus::Pass, "{}", gate.note);
     assert!(gate.value.expect("a tracking error").abs() < 1e-12);
-    for text in ["paper", "2026-01-02", "2026-01-22", "21 sessions"] {
+    for text in [
+        "paper",
+        "2026-01-03",
+        "2026-01-22",
+        "20 sessions",
+        "1 leading",
+    ] {
         assert!(gate.note.contains(text), "{} lacks {text}", gate.note);
     }
 
@@ -2782,31 +3084,118 @@ async fn a_tracking_run_with_other_costs_is_not_evaluated() {
     db.drop_db().await.unwrap();
 }
 
+/// Fifty days of the wave (January, then February), the paper equity lacking day 23, and a tracking
+/// run over every day with `tracking_returns`. Day 2 is the first change, so the first stretch is
+/// days 3 to 22 (20 pairs) and the newest is days 25 to 50 (26 pairs).
+async fn missed_session_fixture(client: &Client, v: StrategyVersionId, tracking_returns: Vec<f64>) {
+    let equity_days: Vec<u32> = day_range(1, 50).into_iter().filter(|&n| n != 23).collect();
+    record_wave(client, v, "paper", &equity_days).await;
+    tracking_run(client, v, &days(&day_range(1, 50)), &tracking_returns).await;
+    backtest_with_costs(client, v, &wave_returns_of(50), costs_a()).await;
+}
+
 #[tokio::test]
 async fn a_missed_session_is_named_and_the_rest_is_judged() {
     let db = ScratchDb::create().await;
     let client = db.client().await.unwrap();
     let v = version(&client, 1).await;
-    // The equity has no row for day 3, which the tracking run has. Days 1 and 2 pair, then the
-    // gap at day 3 drops them: days 5 to 31 (27 sessions) are judged.
-    let equity_days: Vec<u32> = day_range(1, 31).into_iter().filter(|&n| n != 3).collect();
-    record_wave(&client, v, "paper", &equity_days).await;
-    tracking_run(&client, v, &days(&day_range(1, 31)), &wave_returns()).await;
-    backtest_with_costs(&client, v, &wave_returns(), costs_a()).await;
+    // Edited: the earlier stretch is now also 20 sessions, in band, so both are judged and named.
+    missed_session_fixture(&client, v, wave_returns_of(50)).await;
 
     let inputs = load_inputs(&client, v, gates()).await.unwrap();
     let input = inputs.live.as_ref().expect("a tracking input");
-    assert_eq!(input.gap, Some(day(3)));
-    assert_eq!(input.span, Some((day(5), day(31))));
-    assert_eq!(input.live.len(), 27);
+    assert_eq!(input.gaps, vec![day(23)]);
+    assert_eq!(input.leading_skipped, 1);
+    assert_eq!(input.stretches.len(), 2);
+    assert_eq!(
+        (input.stretches[0].first, input.stretches[0].last),
+        (day(3), day(22))
+    );
+    assert_eq!(
+        (input.stretches[1].first, input.stretches[1].last),
+        (day(25), day(50))
+    );
+    assert_eq!(input.stretches[1].live.len(), 26);
     let gate = find(&build_report(&inputs), "tracking").clone();
     assert_eq!(gate.status, GateStatus::Pass, "{}", gate.note);
-    assert!(gate.note.contains("27 sessions"), "{}", gate.note);
+    assert!(gate.note.contains("26 sessions"), "{}", gate.note);
     assert!(
-        gate.note.contains("sessions up to 2026-01-03 are left out"),
+        gate.note.contains("(2026-01-03 to 2026-01-22, 20 sessions"),
         "{}",
         gate.note
     );
+    assert!(
+        gate.note
+            .contains("no equity and tracking pair for 2026-01-23"),
+        "{}",
+        gate.note
+    );
+
+    drop(client);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_missed_session_cannot_hide_an_earlier_failure() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let v = version(&client, 1).await;
+    // The tracking run's returns for days 3 to 22 are the wave's negated: the earlier stretch
+    // diverges badly. The newest stretch (days 25 to 50) matches, and the gate must still fail.
+    let mut returns = wave_returns_of(50);
+    for (index, value) in returns.iter_mut().enumerate() {
+        if (2..22).contains(&index) {
+            *value = -*value;
+        }
+    }
+    missed_session_fixture(&client, v, returns).await;
+
+    let inputs = load_inputs(&client, v, gates()).await.unwrap();
+    let gate = find(&build_report(&inputs), "tracking").clone();
+    assert_eq!(gate.status, GateStatus::Fail, "{}", gate.note);
+    assert!(
+        gate.note.contains("an earlier stretch is out of band"),
+        "{}",
+        gate.note
+    );
+
+    drop(client);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_dirty_tracking_run_is_not_evaluated() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let v = version(&client, 1).await;
+    record_wave(&client, v, "paper", &day_range(1, 22)).await;
+    // Made from a build with uncommitted changes: the stored result says so.
+    let id = register(
+        &client,
+        v,
+        TrialKind::Backtest,
+        Some(json!({"tracking": true})),
+    )
+    .await;
+    let mut result = result_with_costs(json!(wave_returns()[..22]), costs_a());
+    result["dirty_build"] = json!(true);
+    result["session_dates"] = json!(
+        days(&day_range(1, 22))
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    );
+    trial_result::insert(&client, id, &result, UnixNanos::from(T))
+        .await
+        .unwrap();
+    backtest_with_costs(&client, v, &wave_returns()[..22], costs_a()).await;
+
+    let inputs = load_inputs(&client, v, gates()).await.unwrap();
+    let input = inputs.live.as_ref().expect("a tracking input");
+    assert!(!input.clean_build);
+    let gate = find(&build_report(&inputs), "tracking").clone();
+    assert_eq!(gate.status, GateStatus::NotEvaluated, "{}", gate.note);
+    assert!(gate.note.contains("uncommitted changes"), "{}", gate.note);
 
     drop(client);
     db.drop_db().await.unwrap();
@@ -2844,15 +3233,23 @@ async fn live_equity_is_preferred_over_paper() {
     let client = db.client().await.unwrap();
     let v = version(&client, 1).await;
     record_equity(&client, v, "paper", &[(5, "100"), (6, "110"), (7, "99")]).await;
-    record_equity(&client, v, "live", &[(5, "100"), (6, "120"), (7, "90")]).await;
-    tracking_run(&client, v, &days(&[5, 6, 7]), &[0.0, 0.2, -0.25]).await;
+    record_equity(
+        &client,
+        v,
+        "live",
+        &[(5, "100"), (6, "120"), (7, "90"), (8, "99")],
+    )
+    .await;
+    tracking_run(&client, v, &days(&[5, 6, 7, 8]), &[0.0, 0.2, -0.25, 0.1]).await;
 
     let inputs = load_inputs(&client, v, gates()).await.unwrap();
     let input = inputs.live.as_ref().expect("a tracking input");
     assert_eq!(input.environment, "live");
-    // The live rows give 0.2 and -0.25; paper's would give 0.1 and -0.1.
-    assert_close(&input.live, &[0.2, -0.25]);
-    assert_close(&input.backtest, &[0.2, -0.25]);
+    // Edited: day 6 is the first change in live equity, so pairing starts on day 7. The live rows
+    // give -0.25 (90 over 120) and 0.1 (99 over 90); paper's would give -0.1 and 0.1.
+    assert_eq!(input.stretches.len(), 1);
+    assert_close(&input.stretches[0].live, &[-0.25, 0.1]);
+    assert_close(&input.stretches[0].backtest, &[-0.25, 0.1]);
 
     drop(client);
     db.drop_db().await.unwrap();
@@ -2881,7 +3278,7 @@ async fn a_malformed_tracking_result_leaves_the_gate_uncomputable() {
     // Edited: the malformed result is now an unreadable tracking input, not two empty series.
     let input = inputs.live.as_ref().expect("a tracking input");
     assert!(input.unreadable);
-    assert!(input.live.is_empty() && input.backtest.is_empty());
+    assert!(input.stretches.is_empty() && input.gaps.is_empty());
     let gate = find(&build_report(&inputs), "tracking").clone();
     assert_eq!(gate.status, GateStatus::NotEvaluated, "{}", gate.note);
     assert!(
