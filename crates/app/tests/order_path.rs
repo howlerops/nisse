@@ -10,11 +10,27 @@
 //! The functions that send orders are public (the engine's own integration tests need them), so a
 //! new production caller fails this test. If it fails because you added one on purpose, that is a
 //! change to a sensitive path: say so in the pull request, then update the lists here.
+//!
+//! What is scanned, for every crate under `crates/*` and `ui/ext/*`:
+//! - every `.rs` file under `src/`, `examples/` and `benches/` (recursively), and `build.rs`;
+//! - the text before an inline test module (`#[cfg(test)]` then `mod name {`), with comment
+//!   lines removed. A `#[cfg(test)] mod name;` declaration does not end the scan.
+//!
+//! What is not scanned: `tests/` directories (integration tests need the order functions), and
+//! anything under an inline test module. Cargo manifests are read only by the network test.
+//! Benches measure order functions against the simulated broker; a bench that matches a guarded
+//! pattern must be listed in `BENCH_CALLERS`, and that list is asserted exactly.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::fs;
 use std::path::{Path, PathBuf};
+
+/// Bench files (repo-relative paths) that call a guarded order function. Benches run against the
+/// simulated broker only, never a live one, so such a call is a measurement and not an order.
+/// Empty: `crates/engine/benches/hot_path.rs` calls no guarded function. A new entry is a review
+/// decision, asserted exactly by `bench_callers_are_exactly_the_listed_files`.
+const BENCH_CALLERS: [&str; 0] = [];
 
 /// Crate dependencies that open network connections or call an LLM SDK. A crate other than
 /// `alpaca-adapter` that depends on one of these fails the network test.
@@ -80,7 +96,7 @@ fn opens_test_module(rest: &[&str]) -> bool {
             }
             continue;
         }
-        return t.starts_with("mod ");
+        return t.starts_with("mod ") && t.ends_with('{');
     }
     false
 }
@@ -88,8 +104,9 @@ fn opens_test_module(rest: &[&str]) -> bool {
 /// Production text of a file: comment lines are removed, and so is a trailing test module.
 ///
 /// A `#[cfg(test)]` line ends the text (to the end of the file) only when the next line that is not
-/// blank and not an attribute starts with `mod `, the workspace's test-module convention. Any other
-/// `#[cfg(test)]` item, such as a test helper, stays in the text.
+/// blank and not an attribute is an inline module: it starts with `mod ` and ends with `{`. A
+/// declaration such as `#[cfg(test)] mod fixtures;` and any other `#[cfg(test)]` item, such as a
+/// test helper, stays in the text, and scanning goes on after it.
 fn production_text(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let mut kept = Vec::new();
@@ -159,8 +176,9 @@ fn crate_dirs() -> Vec<(String, PathBuf)> {
     subdirs(&root().join("crates"))
 }
 
-/// Production source files of the workspace crates and of the phone app's Rust module
-/// (`ui/ext/*`, a separate workspace), as (repo-relative path with forward slashes, production text).
+/// Scanned source files of the workspace crates and of the phone app's Rust module (`ui/ext/*`, a
+/// separate workspace), as (repo-relative path with forward slashes, production text). See the
+/// module header for what is included.
 fn sources() -> Vec<(String, String)> {
     let root = root();
     let mut crate_roots: Vec<PathBuf> = crate_dirs().into_iter().map(|(_, dir)| dir).collect();
@@ -171,12 +189,17 @@ fn sources() -> Vec<(String, String)> {
     );
     let mut result = Vec::new();
     for dir in crate_roots {
-        let src = dir.join("src");
-        if !src.is_dir() {
-            continue;
-        }
         let mut files = Vec::new();
-        rust_files(&src, &mut files);
+        for sub in ["src", "examples", "benches"] {
+            let path = dir.join(sub);
+            if path.is_dir() {
+                rust_files(&path, &mut files);
+            }
+        }
+        let build = dir.join("build.rs");
+        if build.is_file() {
+            files.push(build);
+        }
         for file in files {
             let rel = file
                 .strip_prefix(&root)
@@ -198,6 +221,22 @@ fn files_where(sources: &[(String, String)], pred: impl Fn(&str) -> bool) -> Vec
         .filter(|(_, text)| pred(text))
         .map(|(path, _)| path.as_str())
         .collect()
+}
+
+/// The sorted files a guard allows to match: its production `callers` plus `BENCH_CALLERS`.
+fn expected_callers(callers: &[&'static str]) -> Vec<&'static str> {
+    let mut all: Vec<&'static str> = callers
+        .iter()
+        .chain(BENCH_CALLERS.iter())
+        .copied()
+        .collect();
+    all.sort_unstable();
+    all
+}
+
+/// Whether a source file is a bench (`benches/` under a crate).
+fn is_bench(path: &str) -> bool {
+    path.contains("/benches/")
 }
 
 /// Whether a manifest declares a dependency named `name`, or renames one to it. Matches `name = ...`
@@ -304,6 +343,38 @@ fn production_text_drops_comment_lines_only() {
 }
 
 #[test]
+fn production_text_keeps_the_code_after_a_test_module_declaration() {
+    let text = "#[cfg(test)]\nmod fixtures;\n\nfn ship(b: &B) {\n    b.submit(i);\n}\n";
+    let kept = production_text(text);
+    assert!(
+        kept.contains("mod fixtures;"),
+        "declaration dropped: {kept}"
+    );
+    assert!(
+        kept.contains("b.submit(i);"),
+        "production call after a declaration dropped: {kept}"
+    );
+}
+
+#[test]
+fn production_text_drops_only_from_an_inline_test_module() {
+    let text = "#[cfg(test)]\nmod fixtures;\nfn ship(b: &B) { b.submit(i); }\n#[cfg(test)]\nmod tests {\n    fn t() { x.replace(i); }\n}\nfn after() { y.submit(i); }\n";
+    let kept = production_text(text);
+    assert!(kept.contains("b.submit(i);"), "first call dropped: {kept}");
+    assert!(!kept.contains("replace"), "inline test module kept: {kept}");
+    assert!(
+        !kept.contains("y.submit"),
+        "text after an inline test module kept: {kept}"
+    );
+}
+
+#[test]
+fn production_text_drops_an_inline_module_whatever_follows_the_brace() {
+    let text = "fn ship() {}\n#[cfg(test)]\nmod tests{\n    fn t() { x.submit(i); }\n}\n";
+    assert!(!production_text(text).contains("submit"));
+}
+
+#[test]
 fn identifiers_match_whole_words_only() {
     assert!(calls_method("a.submit(x)", "submit"));
     assert!(calls_method("Broker::submit(&b, x)", "submit"));
@@ -344,11 +415,11 @@ fn only_the_trader_submits_orders() {
         files_where(&sources, |t| ident_positions(t, "submit_and_record")
             .next()
             .is_some()),
-        [
+        expected_callers(&[
             "crates/engine/src/lib.rs",
             "crates/engine/src/order_service.rs",
             "crates/engine/src/trader.rs",
-        ],
+        ]),
         "submit_and_record may appear only in the re-export, its definition and the trader"
     );
 }
@@ -360,10 +431,10 @@ fn nothing_replaces_orders_outside_tests() {
         files_where(&sources, |t| ident_positions(t, "replace_and_record")
             .next()
             .is_some()),
-        [
+        expected_callers(&[
             "crates/engine/src/lib.rs",
             "crates/engine/src/order_service.rs",
-        ],
+        ]),
         "replace_and_record may appear only in the re-export and its definition"
     );
 }
@@ -371,11 +442,11 @@ fn nothing_replaces_orders_outside_tests() {
 #[test]
 fn only_the_gateway_layer_calls_the_broker_to_submit_or_replace() {
     let sources = sources();
-    let expected = [
+    let expected = expected_callers(&[
         "crates/core/src/order.rs",
         "crates/engine/src/gateway.rs",
         "crates/engine/src/order_service.rs",
-    ];
+    ]);
     for name in ["submit", "replace"] {
         assert_eq!(
             files_where(&sources, |t| calls_method(t, name)),
@@ -383,6 +454,45 @@ fn only_the_gateway_layer_calls_the_broker_to_submit_or_replace() {
             "callers of `{name}` changed"
         );
     }
+}
+
+#[test]
+fn bench_callers_are_exactly_the_listed_files() {
+    let sources = sources();
+    let guarded = |t: &str| {
+        ident_positions(t, "submit_and_record").next().is_some()
+            || ident_positions(t, "replace_and_record").next().is_some()
+            || calls_method(t, "submit")
+            || calls_method(t, "replace")
+    };
+    let benches: Vec<&str> = sources
+        .iter()
+        .filter(|(path, _)| is_bench(path))
+        .filter(|(_, text)| guarded(text))
+        .map(|(path, _)| path.as_str())
+        .collect();
+    assert_eq!(
+        benches, BENCH_CALLERS,
+        "a bench calls a guarded order function: list it in BENCH_CALLERS, with a reason"
+    );
+}
+
+#[test]
+fn the_engine_bench_and_build_script_are_scanned() {
+    let sources = sources();
+    for path in [
+        "crates/engine/benches/hot_path.rs",
+        "crates/engine/build.rs",
+    ] {
+        assert!(
+            sources.iter().any(|(p, _)| p == path),
+            "{path} was not found by the source walk"
+        );
+    }
+    assert!(
+        sources.iter().all(|(p, _)| !p.contains("/tests/")),
+        "integration test directories must stay out of the walk"
+    );
 }
 
 #[test]
