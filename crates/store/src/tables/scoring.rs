@@ -8,7 +8,7 @@ use nisse_core::nautilus::{OrderSide, Symbol, UnixNanos};
 use nisse_core::{DecisionId, StrategyVersionId};
 use rust_decimal::Decimal;
 use serde_json::Value;
-use tokio_postgres::GenericClient;
+use tokio_postgres::{GenericClient, Row};
 
 use crate::StoreError;
 use crate::db::{from_ts, parse_enum};
@@ -234,8 +234,28 @@ pub async fn entry_risks<C: GenericClient>(
     Ok(out)
 }
 
+/// The columns of a trial with its stored result, as [`trial_with_result`] reads them.
+const TRIAL_RESULT_COLUMNS: &str = "t.id, t.strategy_version_id, \
+     COALESCE(t.result @> '{\"holdout\": true}', false) AS holdout, \
+     r.result, t.event_ts";
+
+/// Builds a [`TrialWithResult`] from a row selected with [`TRIAL_RESULT_COLUMNS`].
+fn trial_with_result(row: &Row) -> Result<TrialWithResult, StoreError> {
+    let event_ts: DateTime<Utc> = row.try_get("event_ts")?;
+    let version: i64 = row.try_get("strategy_version_id")?;
+    Ok(TrialWithResult {
+        trial_id: row.try_get("id")?,
+        strategy_version_id: StrategyVersionId(version),
+        holdout: row.try_get("holdout")?,
+        result: row.try_get("result")?,
+        ts: from_ts(event_ts)?,
+    })
+}
+
 /// Every trial of kind `backtest` that has a `trial_result` row, in trial id order. A trial
-/// without a result (still running, or crashed) is not returned.
+/// without a result (still running, or crashed) is not returned. Tracking runs (registered
+/// with `"tracking": true`) are left out: nothing that selects or judges a strategy may see
+/// one.
 ///
 /// One statement.
 pub async fn backtest_results<C: GenericClient>(
@@ -243,30 +263,48 @@ pub async fn backtest_results<C: GenericClient>(
 ) -> Result<Vec<TrialWithResult>, StoreError> {
     let rows = client
         .query(
-            "SELECT t.id, t.strategy_version_id, \
-                    COALESCE(t.result @> '{\"holdout\": true}', false) AS holdout, \
-                    r.result, t.event_ts \
-             FROM trial_registry t \
-             JOIN trial_result r ON r.trial_id = t.id \
-             WHERE t.kind = 'backtest' \
-             ORDER BY t.id",
+            &format!(
+                "SELECT {TRIAL_RESULT_COLUMNS} \
+                 FROM trial_registry t \
+                 JOIN trial_result r ON r.trial_id = t.id \
+                 WHERE t.kind = 'backtest' \
+                   AND NOT COALESCE(t.result @> '{{\"tracking\": true}}', false) \
+                 ORDER BY t.id"
+            ),
             &[],
         )
         .await?;
 
     let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        let event_ts: DateTime<Utc> = row.try_get("event_ts")?;
-        let version: i64 = row.try_get("strategy_version_id")?;
-        out.push(TrialWithResult {
-            trial_id: row.try_get("id")?,
-            strategy_version_id: StrategyVersionId(version),
-            holdout: row.try_get("holdout")?,
-            result: row.try_get("result")?,
-            ts: from_ts(event_ts)?,
-        });
+    for row in &rows {
+        out.push(trial_with_result(row)?);
     }
     Ok(out)
+}
+
+/// The newest tracking run with a stored result for `version`'s strategy config: the `backtest`
+/// trial with the highest id that was registered with `"tracking": true`, among every strategy
+/// version with the same `config_hash`. `None` when there is none. One statement.
+pub async fn tracking_result<C: GenericClient>(
+    client: &C,
+    version: StrategyVersionId,
+) -> Result<Option<TrialWithResult>, StoreError> {
+    let row = client
+        .query_opt(
+            &format!(
+                "SELECT {TRIAL_RESULT_COLUMNS} \
+                 FROM trial_registry t \
+                 JOIN trial_result r ON r.trial_id = t.id \
+                 JOIN strategy_version v ON v.id = t.strategy_version_id \
+                 WHERE t.kind = 'backtest' \
+                   AND t.result @> '{{\"tracking\": true}}' \
+                   AND v.config_hash = (SELECT config_hash FROM strategy_version WHERE id = $1) \
+                 ORDER BY t.id DESC LIMIT 1"
+            ),
+            &[&version.0],
+        )
+        .await?;
+    row.as_ref().map(trial_with_result).transpose()
 }
 
 /// Decisions of `version` whose NEWEST `replay_match` score (by `eval_score.id`) is 0, as
