@@ -1303,13 +1303,14 @@ async fn the_version(store: &Store) -> StrategyVersionId {
     StrategyVersionId(row.get(0))
 }
 
-/// The number of `live` trials of any config in the paper environment.
+/// The number of `live` trials of any config in the paper environment. The result also carries
+/// the symbols, so the environment is matched by its key alone.
 async fn paper_live_trials(store: &Store) -> i64 {
     store
         .client()
         .query_one(
             "SELECT count(*) FROM trial_registry \
-             WHERE kind = 'live' AND result = '{\"environment\": \"paper\"}'::jsonb",
+             WHERE kind = 'live' AND result ->> 'environment' = 'paper'",
             &[],
         )
         .await
@@ -1386,11 +1387,84 @@ async fn session_close_registers_one_live_trial() {
     );
     let version = the_version(&f.store).await;
     assert!(
-        trial_registry::live_start(f.store.client(), version, Some("paper"))
+        trial_registry::latest_live(f.store.client(), version, Some("paper"))
             .await
             .unwrap()
             .is_some()
     );
+
+    f.db.drop_db().await.unwrap();
+}
+
+/// The newest live run of the paper environment for the one strategy version of the fixture.
+async fn newest_paper_run(store: &Store) -> trial_registry::LiveRun {
+    let version = the_version(store).await;
+    trial_registry::latest_live(store.client(), version, Some("paper"))
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn the_live_trial_records_the_engines_symbols_sorted() {
+    let f = fixture().await;
+    let sim = broker();
+    let day = date(2025, 12, 31);
+    let clock = ManualClock::new(plus_minutes(close_at(day), 10));
+
+    session_close(&f.config, &f.market, &f.store, f.sink.clone(), &sim, &clock)
+        .await
+        .unwrap();
+
+    let expected: Vec<String> = SYMBOLS.iter().map(ToString::to_string).collect();
+    assert_eq!(newest_paper_run(&f.store).await.symbols, expected);
+
+    let stored: Value = f
+        .store
+        .client()
+        .query_one(
+            "SELECT result -> 'symbols' FROM trial_registry WHERE kind = 'live'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(stored, json!(SYMBOLS));
+
+    f.db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn changing_the_engines_symbols_registers_a_new_live_trial() {
+    let f = fixture().await;
+    let sim = broker();
+    let first = date(2025, 12, 30);
+    let second = date(2025, 12, 31);
+
+    let clock = ManualClock::new(plus_minutes(close_at(first), 10));
+    session_close(&f.config, &f.market, &f.store, f.sink.clone(), &sim, &clock)
+        .await
+        .unwrap();
+    let before = newest_paper_run(&f.store).await;
+
+    // The same config with VNQ removed from the universe.
+    let mut reduced = f.config.clone();
+    reduced.symbols.retain(|s| s.as_str() != "VNQ");
+    let clock = ManualClock::new(plus_minutes(close_at(second), 10));
+    let outcome = session_close(&reduced, &f.market, &f.store, f.sink.clone(), &sim, &clock)
+        .await
+        .unwrap();
+    assert!(matches!(outcome, SessionCloseOutcome::Ran { .. }));
+
+    assert_eq!(paper_live_trials(&f.store).await, 2);
+    let after = newest_paper_run(&f.store).await;
+    let expected: Vec<String> = SYMBOLS
+        .iter()
+        .filter(|text| **text != "VNQ")
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(after.symbols, expected);
+    assert!(after.start >= before.start, "{before:?} then {after:?}");
 
     f.db.drop_db().await.unwrap();
 }
