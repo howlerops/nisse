@@ -170,16 +170,23 @@ pub struct JobOutcome {
 ///    `holdout_max_looks` (`HoldoutRetired`, nothing written). Ordinary and tracking runs take
 ///    no lock and do not check looks.
 /// 6. Ensure the strategy version and register the trial, before the run. A tracking run must
-///    have a `live` trial for its config (`live_start`) and its last bar must be on or after the
-///    engine's first session; otherwise `InvalidJob`. The strategy version is ensured before
-///    these checks, so a refused tracking run may leave a `strategy_version` row, but no trial.
-///    A holdout run is marked in its registered result, so the look counts even if the run then
-///    fails. A tracking run is marked `{"tracking": true}`. The holdout lock is released after
-///    registration, and on every refusal between taking it and registering.
+///    have a `live` trial for its config (`live_start`) and its last bar's UTC date must be on or
+///    after the UTC date of the engine's first session; otherwise `InvalidJob`. The strategy
+///    version is ensured before these checks, so a refused tracking run may leave a
+///    `strategy_version` row, but no trial. A holdout run is marked in its registered result, so
+///    the look counts even if the run then fails. A tracking run is marked `{"tracking": true}`.
+///    The holdout lock is released after registration, and on every refusal between taking it
+///    and registering.
 /// 7. Run the backtest. On failure the trial stays registered with no result.
-/// 8. Store the result. It carries `"tracking"`; a tracking run also carries `"session_dates"`,
-///    one `YYYY-MM-DD` per entry of `"returns"`, so the report can line the series up by date.
-///    `"holdout_sessions"` is counted only for a holdout run, and is 0 otherwise.
+/// 8. Store the result. It carries `"tracking"` and `"holdout_sessions"` (counted only for a
+///    holdout run, 0 otherwise). A tracking run is then redacted by `redact_for_tracking`: it
+///    stores the returns of the sessions on or after the engine's first day, with their
+///    `"session_dates"` and a `"tracking_start"` date, and nulls every figure computed over the
+///    whole span (summary, final equity, fees, drawdown mode, blocked orders, risk events,
+///    decisions, fills). A tracking run must reveal nothing about the days before the engine
+///    first ran: its config may be on paper before it has passed the holdout gate, so a
+///    whole-span figure would be an uncounted look at the holdout. Ordinary and holdout runs
+///    store their result unchanged.
 pub async fn run_backtest_job(
     store: &Store,
     job: &BacktestJob,
@@ -288,7 +295,7 @@ pub async fn run_backtest_job(
         parent_id: None,
         ts: now,
     };
-    let (strategy_version_id, trial_id) = if options.holdout {
+    let (strategy_version_id, trial_id, tracking_start) = if options.holdout {
         // Held from the look-count check until the trial is registered, so two holdout runs
         // cannot both pass the check. Released on every path once taken.
         if !scoring::try_advisory_lock(store.client(), scoring::HOLDOUT_LOCK).await? {
@@ -392,10 +399,8 @@ pub async fn run_backtest_job(
         "limits_hash": limits_hash,
         "limits": limits_json,
     });
-    if options.tracking
-        && let Some(object) = result.as_object_mut()
-    {
-        object.insert("session_dates".to_owned(), session_dates(&run.equity_curve));
+    if let Some(start) = tracking_start {
+        redact_for_tracking(&mut result, &run.equity_curve, start);
     }
     trial_result::insert(store.client(), trial_id, &result, now).await?;
 
@@ -409,10 +414,11 @@ pub async fn run_backtest_job(
 /// The look-count check (a holdout run only), then the strategy version, the tracking check (a
 /// tracking run only) and the trial. A holdout run is refused here, before anything is written,
 /// once `max_looks` looks exist. A tracking run is refused when its config has no `live` trial
-/// (`live_start` is `None`) or when `last_session` is before the engine's first session; both
-/// refusals happen after the strategy version is ensured, so they may leave that row, but never
-/// a trial. Returns the strategy version id and the trial id. The caller holds `HOLDOUT_LOCK`
-/// across this call when the run is a holdout run.
+/// or when the UTC date of `last_session` is before the UTC date of the engine's first session;
+/// both refusals happen after the strategy version is ensured, so they may leave that row, but
+/// never a trial. Returns the strategy version id, the trial id, and for a tracking run the
+/// engine's first session (`live_start`), which the result is redacted to; `None` otherwise. The
+/// caller holds `HOLDOUT_LOCK` across this call when the run is a holdout run.
 async fn register_trial(
     store: &Store,
     version: &StrategyVersion,
@@ -421,7 +427,7 @@ async fn register_trial(
     max_looks: u32,
     last_session: UnixNanos,
     now: UnixNanos,
-) -> Result<(StrategyVersionId, i64), EvalError> {
+) -> Result<(StrategyVersionId, i64, Option<UnixNanos>), EvalError> {
     if options.holdout {
         let looks = trial_registry::holdout_count(store.client()).await?;
         if looks >= i64::from(max_looks) {
@@ -432,7 +438,7 @@ async fn register_trial(
         }
     }
     let strategy_version_id = store.ensure_strategy_version(version).await?;
-    if options.tracking {
+    let tracking_start = if options.tracking {
         match trial_registry::live_start(store.client(), strategy_version_id, None).await? {
             None => {
                 return Err(EvalError::InvalidJob(
@@ -440,15 +446,17 @@ async fn register_trial(
                         .to_owned(),
                 ));
             }
-            Some(start) if last_session.as_u64() < start.as_u64() => {
+            Some(start) if utc_day(last_session) < utc_day(start) => {
                 return Err(EvalError::InvalidJob(
                     "a tracking run must reach the engine's first session: the bars end before it"
                         .to_owned(),
                 ));
             }
-            Some(_) => {}
+            Some(start) => Some(start),
         }
-    }
+    } else {
+        None
+    };
     let registered_result = if options.tracking {
         Some(json!({"tracking": true}))
     } else {
@@ -463,7 +471,67 @@ async fn register_trial(
         ts: now,
     };
     let trial_id = trial_registry::insert(store.client(), &trial).await?;
-    Ok((strategy_version_id, trial_id))
+    Ok((strategy_version_id, trial_id, tracking_start))
+}
+
+/// Nanoseconds in a UTC day.
+const NANOS_PER_DAY: u64 = 86_400_000_000_000;
+
+/// The UTC day number of an instant: whole days since the epoch.
+fn utc_day(ts: UnixNanos) -> u64 {
+    ts.as_u64() / NANOS_PER_DAY
+}
+
+/// The keys a tracking run must not store: each is computed over the whole span.
+const WHOLE_SPAN_KEYS: [&str; 8] = [
+    "summary",
+    "final_equity",
+    "fees_paid",
+    "final_drawdown_mode",
+    "orders_blocked",
+    "risk_events",
+    "decisions",
+    "fills",
+];
+
+/// Reduces a tracking run's result to what it may show. A tracking run is allowed to read bars
+/// past the holdout boundary, because the engine trades that period, but its config may be on
+/// paper before it has passed the holdout gate. A summary, final equity or fee total over the
+/// whole span would therefore be an uncounted look at the holdout, and so would returns from
+/// before the engine first ran. So the stored result keeps only the returns of the sessions whose
+/// UTC date is on or after the date of `live_start` (the engine's first day), with one
+/// `session_dates` entry each and `tracking_start` giving that date. Every whole-span figure is
+/// `null`, and `sessions` counts the returns kept. Inputs (git SHA, bar file, costs, limits,
+/// holdout fields and so on) are left as they are.
+///
+/// A return needs the equity of the session before it, so the first kept return is computed from
+/// the last curve point before `live_start`, which is the only point before the engine's first
+/// day that the tail reveals (as one ratio). If no point is on or after `live_start`, nothing is
+/// kept.
+fn redact_for_tracking(result: &mut Value, curve: &[(UnixNanos, Decimal)], live_start: UnixNanos) {
+    let start_day = utc_day(live_start);
+    let first_kept = curve
+        .iter()
+        .position(|point| utc_day(point.0) >= start_day)
+        .unwrap_or(curve.len());
+    let tail = curve
+        .get(first_kept.saturating_sub(1)..)
+        .unwrap_or_default();
+    let (returns, returns_complete) = returns_json(tail);
+    let kept = tail.len().saturating_sub(1);
+    if let Some(object) = result.as_object_mut() {
+        for key in WHOLE_SPAN_KEYS {
+            object.insert(key.to_owned(), Value::Null);
+        }
+        object.insert("returns".to_owned(), returns);
+        object.insert("returns_complete".to_owned(), json!(returns_complete));
+        object.insert("session_dates".to_owned(), session_dates(tail));
+        object.insert(
+            "tracking_start".to_owned(),
+            Value::String(date_text(live_start)),
+        );
+        object.insert("sessions".to_owned(), json!(kept));
+    }
 }
 
 /// The daily returns `equity_t / equity_{t-1} - 1`, one per session after the first, as JSON

@@ -1512,7 +1512,9 @@ async fn a_tracking_run_stores_one_session_date_per_return() {
     let returns = outcome.result["returns"].as_array().unwrap();
     let dates = outcome.result["session_dates"].as_array().unwrap();
     assert_eq!(dates.len(), returns.len());
-    assert_eq!(dates.len(), SESSIONS - 1);
+    // The stored returns start at the engine's first day (1 February 2021): the 20 weekdays of
+    // January before it are not stored.
+    assert_eq!(dates.len(), 110);
     let texts: Vec<&str> = dates.iter().map(|d| d.as_str().unwrap()).collect();
     for text in &texts {
         NaiveDate::parse_from_str(text, "%Y-%m-%d").unwrap();
@@ -1597,7 +1599,161 @@ async fn an_ordinary_run_stores_tracking_false_and_no_session_dates() {
 
     assert_eq!(outcome.result["tracking"], json!(false));
     assert!(outcome.result.get("session_dates").is_none());
+    assert!(outcome.result.get("tracking_start").is_none());
     assert_eq!(registry_result(&client, outcome.trial_id).await, None);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_tracking_run_stores_returns_only_from_the_engines_first_day() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let store = Store::new(db.client().await.unwrap());
+    let dir = bars_dir("tracking-from-first-day", &market());
+    let job = job(dir.path(), strategy_params());
+    traded(&store, &client, &job, live_from()).await;
+
+    let outcome = run_backtest_job(&store, &job, tracking_options(), now())
+        .await
+        .unwrap();
+
+    let dates: Vec<&str> = outcome.result["session_dates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d.as_str().unwrap())
+        .collect();
+    let expected: Vec<String> = closes()
+        .iter()
+        .map(|ts| date_of(*ts))
+        .filter(|date| date.as_str() >= "2021-02-01")
+        .collect();
+    let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+    assert_eq!(dates, expected);
+    assert_eq!(dates.first().copied(), Some("2021-02-01"));
+    assert_eq!(
+        outcome.result["returns"].as_array().unwrap().len(),
+        dates.len()
+    );
+    assert_eq!(outcome.result["tracking_start"], json!("2021-02-01"));
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_tracking_run_stores_no_whole_span_figures() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let store = Store::new(db.client().await.unwrap());
+    let dir = bars_dir("tracking-no-whole-span", &market());
+    let job = job(dir.path(), strategy_params());
+    traded(&store, &client, &job, live_from()).await;
+
+    let outcome = run_backtest_job(&store, &job, tracking_options(), now())
+        .await
+        .unwrap();
+
+    for key in [
+        "summary",
+        "final_equity",
+        "fees_paid",
+        "final_drawdown_mode",
+        "orders_blocked",
+        "risk_events",
+        "decisions",
+        "fills",
+    ] {
+        assert_eq!(outcome.result.get(key), Some(&Value::Null), "{key}");
+    }
+    for key in [
+        "symbols",
+        "costs",
+        "limits_hash",
+        "limits",
+        "data_snapshot_id",
+        "bars_file",
+        "starting_cash",
+        "seed",
+        "git_sha",
+        "requested_start",
+        "requested_end",
+        "data_end",
+    ] {
+        assert!(
+            outcome.result.get(key).is_some_and(|v| !v.is_null()),
+            "{key} must stay"
+        );
+    }
+    assert_eq!(outcome.result["symbols"], json!(["FALL", "RISE"]));
+    let kept = outcome.result["returns"].as_array().unwrap().len();
+    assert_eq!(outcome.result["sessions"], json!(kept));
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_tracking_run_whose_bars_end_on_the_engines_first_day_is_accepted() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let store = Store::new(db.client().await.unwrap());
+    let dir = bars_dir("tracking-same-day", &market());
+    let job = job(dir.path(), strategy_params());
+    // The last bar is 21:00 UTC on 2 July 2021; the engine first ran later that same day.
+    traded(&store, &client, &job, utc(2021, 7, 2, 22, 0, 0, 0)).await;
+
+    let outcome = run_backtest_job(&store, &job, tracking_options(), now())
+        .await
+        .unwrap();
+
+    let returns = outcome.result["returns"].as_array().unwrap();
+    assert_eq!(returns.len(), 1);
+    assert_eq!(outcome.result["session_dates"], json!(["2021-07-02"]));
+    assert_eq!(outcome.result["tracking_start"], json!("2021-07-02"));
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_tracking_run_whose_engine_started_before_the_bars_keeps_every_return() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let store = Store::new(db.client().await.unwrap());
+    let dir = bars_dir("tracking-before-bars", &market());
+    let job = job(dir.path(), strategy_params());
+    traded(&store, &client, &job, utc(2020, 12, 1, 0, 0, 0, 0)).await;
+
+    let outcome = run_backtest_job(&store, &job, tracking_options(), now())
+        .await
+        .unwrap();
+
+    // Every return but the first session's: the first return is dated the second session.
+    assert_eq!(
+        outcome.result["returns"].as_array().unwrap().len(),
+        SESSIONS - 1
+    );
+    assert_eq!(outcome.result["tracking_start"], json!("2020-12-01"));
+    assert_eq!(outcome.result["session_dates"][0], json!("2021-01-05"));
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_tracking_tail_matches_the_same_sessions_of_an_ordinary_run() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let store = Store::new(db.client().await.unwrap());
+    let dir = bars_dir("tracking-tail-matches", &market());
+    let job = job(dir.path(), strategy_params());
+    traded(&store, &client, &job, live_from()).await;
+
+    let ordinary = run_backtest_job(&store, &job, options(true, false, false), now())
+        .await
+        .unwrap();
+    let tracking = run_backtest_job(&store, &job, tracking_options(), now())
+        .await
+        .unwrap();
+
+    let whole = ordinary.result["returns"].as_array().unwrap();
+    let kept = tracking.result["returns"].as_array().unwrap();
+    assert_eq!(kept.len(), 110);
+    assert_eq!(kept.as_slice(), &whole[whole.len() - kept.len()..]);
+    assert_eq!(tracking.result["returns_complete"], json!(true));
     db.drop_db().await.unwrap();
 }
 
