@@ -38,6 +38,7 @@ fn parse_args(args: &[String]) -> Option<(&str, &str)> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    nisse_core::logging::init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some((path, source)) = parse_args(&args) else {
         eprintln!("{USAGE}");

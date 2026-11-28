@@ -1,9 +1,13 @@
 //! `nisse-sign`: signs a merged research config for the paper stage.
 //!
-//! Usage: `nisse-sign <research/configs/name.json> [--root DIR] [--out FILE]`. `--root`
-//! defaults to `.`. The key is read from `NISSE_SIGNING_KEY` and is never printed, logged or
-//! put in an error. The manifest is printed as pretty JSON; with `--out` it is also written
-//! to that file, through a temporary file and a rename.
+//! Usage: `nisse-sign <research/configs/name.json> [--root DIR] [--out FILE]`, or
+//! `nisse-sign --public-key`. `--root` defaults to `.`. The secret key (64 hex digits, e.g.
+//! from `openssl rand -hex 32`) is read from `NISSE_SIGNING_KEY` and is never printed, logged
+//! or put in an error. The manifest is printed as pretty JSON; with `--out` it is also
+//! written to that file, through a temporary file and a rename.
+//!
+//! `--public-key` signs nothing: it prints the public key matching the secret key, which is
+//! what the engine host is given as `NISSE_VERIFY_KEY`.
 //!
 //! Exit codes: 0 signed, 1 refused or failed, 2 bad arguments. The logic is in
 //! `nisse_eval::signing_job`.
@@ -15,9 +19,10 @@ use std::process::ExitCode;
 
 use chrono::{DateTime, SecondsFormat};
 use nisse_core::{Clock, SystemClock};
-use nisse_eval::signing_job::{ENV_SIGNING_KEY, sign_config};
+use nisse_eval::signing_job::{ENV_SIGNING_KEY, public_key, sign_config};
 
-const USAGE: &str = "usage: nisse-sign <research/configs/name.json> [--root DIR] [--out FILE]";
+const USAGE: &str = "usage: nisse-sign <research/configs/name.json> [--root DIR] [--out FILE]\n       nisse-sign --public-key";
+const PUBLIC_KEY_FLAG: &str = "--public-key";
 const PREFIX: &str = "nisse-sign: ";
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
@@ -85,7 +90,12 @@ fn write_and_rename(tmp: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    let Some(args) = parse_args(&argv) else {
+    let public_only = argv.len() == 1 && argv[0] == PUBLIC_KEY_FLAG;
+    let args = if public_only {
+        None
+    } else if let Some(args) = parse_args(&argv) {
+        Some(args)
+    } else {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
@@ -97,6 +107,18 @@ fn main() -> ExitCode {
             eprintln!("{PREFIX}{ENV_SIGNING_KEY} is not set or is blank");
             return ExitCode::from(1);
         }
+    };
+    let Some(args) = args else {
+        return match public_key(&key) {
+            Ok(public) => {
+                println!("{public}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{PREFIX}{e}");
+                ExitCode::from(1)
+            }
+        };
     };
     let Some(signed_at) = signed_at_now() else {
         eprintln!("{PREFIX}the current time is out of range");

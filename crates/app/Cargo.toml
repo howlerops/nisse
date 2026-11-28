@@ -15,7 +15,7 @@ workspace = true
 chrono = { workspace = true }
 nisse-alpaca-adapter = { workspace = true }
 nisse-bars = { workspace = true }
-nisse-core = { workspace = true }
+nisse-core = { workspace = true, features = ["logging"] }
 nisse-engine = { workspace = true }
 nisse-risk = { workspace = true }
 nisse-store = { workspace = true }

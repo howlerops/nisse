@@ -1,112 +1,152 @@
 //! Signing a deployment: the hash of what the engine will trade (strategy parameters,
-//! universe, benchmark) and a keyed MAC over a small manifest naming it. See
+//! universe, benchmark) and an Ed25519 signature over a small manifest naming it. See
 //! `docs/phases/phase-7.md`, "Signing and verification".
 //!
-//! The MAC is HMAC-SHA256 (RFC 2104) with a shared key. Anyone holding the key can both sign
-//! and verify; the phase doc records that limitation and the owner's choice of a public-key
-//! scheme later.
+//! The signer holds a secret key ([`ENV_SIGNING_KEY`]); the engine host holds only the
+//! matching public key ([`ENV_VERIFY_KEY`]), which can check a manifest but cannot make one.
 
 use std::fmt;
 
 use chrono::DateTime;
+use ed25519_dalek::Signer as _;
 use serde_json::{Map, Value};
-use sha2::{Digest, Sha256};
 
 use crate::hash::hex_value;
 use crate::{CoreError, Hash32, canonical_json, config_hash};
 
-/// The environment variable holding the signing key as hex. Read by the binaries that sign
-/// or verify; its value is never printed.
+/// The environment variable holding the secret signing key as hex. Read only by the signer;
+/// its value is never printed.
 pub const ENV_SIGNING_KEY: &str = "NISSE_SIGNING_KEY";
 
-/// Shortest key accepted, in bytes.
-pub const MIN_KEY_BYTES: usize = 32;
+/// The environment variable holding the public verification key as hex. Read by the engine.
+/// Not a secret.
+pub const ENV_VERIFY_KEY: &str = "NISSE_VERIFY_KEY";
+
+/// Length of a secret key (an Ed25519 seed) and of a public key, in bytes.
+pub const KEY_BYTES: usize = 32;
+
+/// Length of a signature, in bytes.
+pub const SIGNATURE_BYTES: usize = 64;
 
 /// The only stage this build signs or accepts.
 pub const STAGE_PAPER: &str = "paper";
 
-/// SHA-256 block size, in bytes (the key is padded to this length for HMAC).
-const BLOCK_BYTES: usize = 64;
-
-/// The five fields a manifest signs, plus the MAC itself. Also the exact set `from_json` accepts.
+/// The five fields a manifest signs, plus the signature. Also the exact set `from_json` accepts.
 const FIELDS: [&str; 6] = [
     "name",
     "deployment_hash",
     "git_sha",
     "stage",
     "signed_at",
-    "mac",
+    "signature",
 ];
 
-/// A signing key. `Debug` prints only its length, never its bytes.
-pub struct SigningKey(Vec<u8>);
+/// Why a hex string did not decode to `N` bytes.
+enum HexError {
+    Length,
+    Char,
+}
+
+/// Decodes exactly `2 * N` hex characters (either case).
+fn decode_hex<const N: usize>(text: &str) -> Result<[u8; N], HexError> {
+    let bytes = text.as_bytes();
+    if bytes.len() != 2 * N {
+        return Err(HexError::Length);
+    }
+    let (pairs, _) = bytes.as_chunks::<2>();
+    let mut out = [0u8; N];
+    for (slot, &[hi_char, lo_char]) in out.iter_mut().zip(pairs) {
+        let hi = hex_value(hi_char).ok_or(HexError::Char)?;
+        let lo = hex_value(lo_char).ok_or(HexError::Char)?;
+        *slot = (hi << 4) | lo;
+    }
+    Ok(out)
+}
+
+/// Writes `bytes` as lower-case hex.
+fn write_hex(f: &mut fmt::Formatter<'_>, bytes: &[u8]) -> fmt::Result {
+    bytes.iter().try_for_each(|b| write!(f, "{b:02x}"))
+}
+
+/// Parses a key of `KEY_BYTES` bytes from hex (surrounding whitespace trimmed). The error
+/// names `what` and never includes any part of the text.
+fn key_from_hex(hex: &str, what: &str) -> Result<[u8; KEY_BYTES], CoreError> {
+    decode_hex(hex.trim()).map_err(|e| match e {
+        HexError::Length => invalid(format!(
+            "{what} must be exactly {KEY_BYTES} bytes ({} hex digits)",
+            2 * KEY_BYTES
+        )),
+        HexError::Char => invalid(format!("{what} contains a non-hex character")),
+    })
+}
+
+/// The secret signing key. `Debug` never prints its bytes; they are zeroed on drop.
+pub struct SigningKey(ed25519_dalek::SigningKey);
 
 impl SigningKey {
-    /// Parses hex (upper or lower case, surrounding whitespace trimmed). Fewer than
-    /// `MIN_KEY_BYTES` bytes, an odd length or a non-hex character is `InvalidSigning`
-    /// with a message that never includes any part of the key.
+    /// Parses 64 hex digits (upper or lower case, surrounding whitespace trimmed). Any other
+    /// length or a non-hex character is `InvalidSigning` with a message that never includes
+    /// any part of the key.
     pub fn from_hex(hex: &str) -> Result<Self, CoreError> {
-        let text = hex.trim().as_bytes();
-        if text.len() % 2 == 1 {
-            return Err(invalid("signing key has an odd number of hex digits"));
-        }
-        let (pairs, _) = text.as_chunks::<2>();
-        let mut bytes = Vec::with_capacity(pairs.len());
-        for &[hi_char, lo_char] in pairs {
-            let hi = hex_value(hi_char)
-                .ok_or_else(|| invalid("signing key contains a non-hex character"))?;
-            let lo = hex_value(lo_char)
-                .ok_or_else(|| invalid("signing key contains a non-hex character"))?;
-            bytes.push((hi << 4) | lo);
-        }
-        if bytes.len() < MIN_KEY_BYTES {
-            return Err(invalid(format!(
-                "signing key must be at least {MIN_KEY_BYTES} bytes"
-            )));
-        }
-        Ok(Self(bytes))
+        let seed = key_from_hex(hex, "signing key")?;
+        Ok(Self(ed25519_dalek::SigningKey::from_bytes(&seed)))
     }
 
-    /// The raw key bytes, for the MAC only.
-    fn as_bytes(&self) -> &[u8] {
-        &self.0
+    /// The public key that verifies this key's signatures.
+    #[must_use]
+    pub fn verify_key(&self) -> VerifyKey {
+        VerifyKey(self.0.verifying_key())
     }
 }
 
 impl fmt::Debug for SigningKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "SigningKey({} bytes)", self.0.len())
+        f.write_str("SigningKey(..)")
     }
 }
 
-/// HMAC-SHA256 (RFC 2104) of `message` under `key`.
-#[must_use]
-pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
-    // A key longer than the block is hashed first; either way it is zero-padded to a block.
-    let mut block = [0u8; BLOCK_BYTES];
-    if key.len() > BLOCK_BYTES {
-        let digest: [u8; 32] = Sha256::digest(key).into();
-        block[..digest.len()].copy_from_slice(&digest);
-    } else {
-        block[..key.len()].copy_from_slice(key);
+/// The public verification key. `Display` is its 64 lower-case hex digits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyKey(ed25519_dalek::VerifyingKey);
+
+impl VerifyKey {
+    /// Parses 64 hex digits (either case, surrounding whitespace trimmed). Any other length,
+    /// a non-hex character or bytes that are not a valid public key are `InvalidSigning`.
+    pub fn from_hex(hex: &str) -> Result<Self, CoreError> {
+        let bytes = key_from_hex(hex, "verification key")?;
+        ed25519_dalek::VerifyingKey::from_bytes(&bytes)
+            .map(Self)
+            .map_err(|_| invalid("verification key is not a valid Ed25519 public key"))
     }
+}
 
-    let mut inner_pad = [0u8; BLOCK_BYTES];
-    let mut outer_pad = [0u8; BLOCK_BYTES];
-    for ((ipad, opad), &k) in inner_pad.iter_mut().zip(outer_pad.iter_mut()).zip(&block) {
-        *ipad = k ^ 0x36;
-        *opad = k ^ 0x5c;
+impl fmt::Display for VerifyKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_hex(f, self.0.as_bytes())
     }
+}
 
-    let mut inner = Sha256::new();
-    inner.update(inner_pad);
-    inner.update(message);
-    let inner_digest: [u8; 32] = inner.finalize().into();
+/// An Ed25519 signature. `Display` is its 128 lower-case hex digits.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Signature([u8; SIGNATURE_BYTES]);
 
-    let mut outer = Sha256::new();
-    outer.update(outer_pad);
-    outer.update(inner_digest);
-    outer.finalize().into()
+impl Signature {
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; SIGNATURE_BYTES]) -> Self {
+        Self(bytes)
+    }
+}
+
+impl fmt::Display for Signature {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_hex(f, &self.0)
+    }
+}
+
+impl fmt::Debug for Signature {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Signature({self})")
+    }
 }
 
 /// The hash of what an engine trades: SHA-256 of the canonical JSON of
@@ -148,7 +188,7 @@ pub struct Manifest {
     pub stage: String,
     /// RFC 3339 UTC to the second, e.g. `2026-11-27T00:00:00Z`.
     pub signed_at: String,
-    pub mac: Hash32,
+    pub signature: Signature,
 }
 
 impl Manifest {
@@ -176,19 +216,19 @@ impl Manifest {
             return Err(invalid("signed_at must be RFC 3339"));
         }
 
-        let fields = signed_fields(name, &deployment_hash, git_sha, stage, signed_at);
-        let mac = compute_mac(key, fields);
+        let message = signed_message(name, &deployment_hash, git_sha, stage, signed_at);
+        let signature = Signature(key.0.sign(message.as_bytes()).to_bytes());
         Ok(Self {
             name: name.to_owned(),
             deployment_hash,
             git_sha: git_sha.to_owned(),
             stage: stage.to_owned(),
             signed_at: signed_at.to_owned(),
-            mac: Hash32::from_bytes(mac),
+            signature,
         })
     }
 
-    /// The JSON written to the manifest file: the five fields and `mac`, all strings.
+    /// The JSON written to the manifest file: the five fields and `signature`, all strings.
     #[must_use]
     pub fn to_json(&self) -> Value {
         let mut map = signed_fields(
@@ -198,7 +238,10 @@ impl Manifest {
             &self.stage,
             &self.signed_at,
         );
-        map.insert("mac".to_owned(), Value::String(self.mac.to_string()));
+        map.insert(
+            "signature".to_owned(),
+            Value::String(self.signature.to_string()),
+        );
         Value::Object(map)
     }
 
@@ -211,35 +254,42 @@ impl Manifest {
         if let Some(unknown) = map.keys().find(|key| !FIELDS.contains(&key.as_str())) {
             return Err(invalid(format!("unknown field {unknown}")));
         }
+        let signature = decode_hex(string_field(map, "signature")?)
+            .map(Signature)
+            .map_err(|_| {
+                invalid(format!(
+                    "field signature is not {} hex digits",
+                    2 * SIGNATURE_BYTES
+                ))
+            })?;
         Ok(Self {
             name: string_field(map, "name")?.to_owned(),
             deployment_hash: hash_field(map, "deployment_hash")?,
             git_sha: string_field(map, "git_sha")?.to_owned(),
             stage: string_field(map, "stage")?.to_owned(),
             signed_at: string_field(map, "signed_at")?.to_owned(),
-            mac: hash_field(map, "mac")?,
+            signature,
         })
     }
 
-    /// Checks the MAC under `key` in constant time. `BadSignature` when it does not match.
-    pub fn verify(&self, key: &SigningKey) -> Result<(), CoreError> {
-        let fields = signed_fields(
+    /// Checks the signature under `key` (strict verification: non-canonical signatures and
+    /// weak keys are refused). `BadSignature` when it does not verify.
+    pub fn verify(&self, key: &VerifyKey) -> Result<(), CoreError> {
+        let message = signed_message(
             &self.name,
             &self.deployment_hash,
             &self.git_sha,
             &self.stage,
             &self.signed_at,
         );
-        let expected = compute_mac(key, fields);
-        if constant_time_eq(&expected, self.mac.as_bytes()) {
-            Ok(())
-        } else {
-            Err(CoreError::BadSignature)
-        }
+        let signature = ed25519_dalek::Signature::from_bytes(&self.signature.0);
+        key.0
+            .verify_strict(message.as_bytes(), &signature)
+            .map_err(|_| CoreError::BadSignature)
     }
 }
 
-/// The five signed fields as a JSON object (no `mac`).
+/// The five signed fields as a JSON object (no `signature`).
 fn signed_fields(
     name: &str,
     deployment_hash: &Hash32,
@@ -259,19 +309,21 @@ fn signed_fields(
     map
 }
 
-/// HMAC of the canonical JSON of `fields`.
-fn compute_mac(key: &SigningKey, fields: Map<String, Value>) -> [u8; 32] {
-    let text = canonical_json(&Value::Object(fields));
-    hmac_sha256(key.as_bytes(), text.as_bytes())
-}
-
-/// Compares two MACs without an early return: every byte pair is folded into one value.
-fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+/// The bytes that are signed: the canonical JSON of the five signed fields.
+fn signed_message(
+    name: &str,
+    deployment_hash: &Hash32,
+    git_sha: &str,
+    stage: &str,
+    signed_at: &str,
+) -> String {
+    canonical_json(&Value::Object(signed_fields(
+        name,
+        deployment_hash,
+        git_sha,
+        stage,
+        signed_at,
+    )))
 }
 
 /// True for exactly 40 lower-case hex characters.
@@ -304,118 +356,60 @@ fn hash_field(map: &Map<String, Value>, name: &str) -> Result<Hash32, CoreError>
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
     use serde_json::json;
 
-    fn hmac_hex(key: &[u8], message: &[u8]) -> String {
-        hmac_sha256(key, message)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect()
-    }
-
-    // hmac_sha256 (RFC 4231)
+    // Keys. RFC 8032, section 7.1, test 1: this seed has this public key and signs the empty
+    // message to this signature.
+    const RFC_SEED: &str = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
+    const RFC_PUBLIC: &str = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
 
     #[test]
-    fn hmac_rfc4231_case_1() {
+    fn verify_key_matches_rfc8032_test_1() {
+        let key = SigningKey::from_hex(RFC_SEED).unwrap();
+        assert_eq!(key.verify_key().to_string(), RFC_PUBLIC);
+        assert_eq!(VerifyKey::from_hex(RFC_PUBLIC).unwrap(), key.verify_key());
+    }
+
+    #[test]
+    fn from_hex_accepts_upper_case_and_surrounding_whitespace() {
+        let text = format!("  {}\n", RFC_SEED.to_uppercase());
         assert_eq!(
-            hmac_hex(&[0x0b; 20], b"Hi There"),
-            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+            SigningKey::from_hex(&text)
+                .unwrap()
+                .verify_key()
+                .to_string(),
+            RFC_PUBLIC
         );
+        assert!(VerifyKey::from_hex(&format!(" {}\n", RFC_PUBLIC.to_uppercase())).is_ok());
     }
 
     #[test]
-    fn hmac_rfc4231_case_2() {
-        assert_eq!(
-            hmac_hex(b"Jefe", b"what do ya want for nothing?"),
-            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
-        );
-    }
-
-    #[test]
-    fn hmac_rfc4231_case_3() {
-        assert_eq!(
-            hmac_hex(&[0xaa; 20], &[0xdd; 50]),
-            "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe"
-        );
-    }
-
-    #[test]
-    fn hmac_rfc4231_case_4() {
-        let key: Vec<u8> = (0x01..=0x19).collect();
-        assert_eq!(
-            hmac_hex(&key, &[0xcd; 50]),
-            "82558a389a443c0ea4cc819899f2083a85f0faa3e578f8077a2e3ff46729665b"
-        );
-    }
-
-    #[test]
-    fn hmac_rfc4231_case_6_uses_hashed_long_key() {
-        let key = vec![0xaa; 131];
-        assert_eq!(
-            hmac_hex(
-                &key,
-                b"Test Using Larger Than Block-Size Key - Hash Key First"
-            ),
-            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
-        );
-    }
-
-    #[test]
-    fn hmac_key_of_exactly_block_size_is_not_hashed() {
-        // 64 bytes is used as-is; 65 bytes takes the hashed path. The two must differ.
-        let key64 = vec![0x11; 64];
-        let mut key65 = key64.clone();
-        key65.push(0x11);
-        assert_ne!(hmac_sha256(&key64, b"m"), hmac_sha256(&key65, b"m"));
-    }
-
-    #[test]
-    fn hmac_changes_with_the_message() {
-        assert_ne!(hmac_sha256(b"k", b"a"), hmac_sha256(b"k", b"b"));
-    }
-
-    // SigningKey
-
-    #[test]
-    fn from_hex_accepts_32_bytes_in_either_case() {
-        assert!(SigningKey::from_hex(&"ab".repeat(32)).is_ok());
-        assert!(SigningKey::from_hex(&"AB".repeat(32)).is_ok());
-        assert!(SigningKey::from_hex(&format!("  {}\n", "Ab".repeat(32))).is_ok());
-    }
-
-    #[test]
-    fn from_hex_refuses_31_bytes() {
-        assert!(matches!(
-            SigningKey::from_hex(&"ab".repeat(31)),
-            Err(CoreError::InvalidSigning(_))
-        ));
-    }
-
-    #[test]
-    fn from_hex_refuses_odd_length() {
-        assert!(matches!(
-            SigningKey::from_hex(&format!("{}a", "ab".repeat(32))),
-            Err(CoreError::InvalidSigning(_))
-        ));
-    }
-
-    #[test]
-    fn from_hex_refuses_non_hex() {
-        let key = format!("{}zz", "a7".repeat(31));
-        assert!(matches!(
-            SigningKey::from_hex(&key),
-            Err(CoreError::InvalidSigning(_))
-        ));
+    fn keys_refuse_a_wrong_length_or_a_non_hex_character() {
+        for bad in [
+            "a7".repeat(31),
+            "a7".repeat(33),
+            format!("{}a", "a7".repeat(32)),
+            format!("{}zz", "a7".repeat(31)),
+            String::new(),
+        ] {
+            assert!(matches!(
+                SigningKey::from_hex(&bad),
+                Err(CoreError::InvalidSigning(_))
+            ));
+            assert!(matches!(
+                VerifyKey::from_hex(&bad),
+                Err(CoreError::InvalidSigning(_))
+            ));
+        }
     }
 
     #[test]
     fn key_material_never_appears_in_errors_or_debug() {
-        let distinctive = "a7".repeat(64);
-        let debug = format!("{:?}", SigningKey::from_hex(&distinctive).unwrap());
-        assert_eq!(debug, "SigningKey(64 bytes)");
-        assert!(!debug.contains("a7a7"));
+        let debug = format!("{:?}", SigningKey::from_hex(&"a7".repeat(32)).unwrap());
+        assert_eq!(debug, "SigningKey(..)");
 
         for bad in [
             "a7".repeat(31),
@@ -426,8 +420,6 @@ mod tests {
             assert!(!err.contains("a7"), "error leaked key text: {err}");
         }
     }
-
-    // deployment_hash
 
     fn strategy() -> Value {
         json!({"lookback": 252, "threshold": "0.5"})
@@ -530,23 +522,18 @@ mod tests {
 
     #[test]
     fn sign_then_verify_passes() {
-        assert_eq!(signed().verify(&key()), Ok(()));
+        assert_eq!(signed().verify(&key().verify_key()), Ok(()));
     }
 
     #[test]
-    fn mac_is_hmac_of_the_canonical_signed_fields() {
-        let expected = hmac_sha256(
-            key().as_bytes(),
-            canonical_json(&json!({
-                "name": "trend-v1",
-                "deployment_hash": deployment().to_string(),
-                "git_sha": GIT_SHA,
-                "stage": "paper",
-                "signed_at": SIGNED_AT,
-            }))
-            .as_bytes(),
-        );
-        assert_eq!(signed().mac, Hash32::from_bytes(expected));
+    fn the_verification_key_parsed_from_its_hex_verifies() {
+        let public = VerifyKey::from_hex(&key().verify_key().to_string()).unwrap();
+        assert_eq!(signed().verify(&public), Ok(()));
+    }
+
+    #[test]
+    fn signing_is_deterministic() {
+        assert_eq!(signed(), signed());
     }
 
     #[test]
@@ -574,13 +561,13 @@ mod tests {
                 ..base.clone()
             },
             Manifest {
-                mac: Hash32::from_bytes([0; 32]),
+                signature: Signature::from_bytes([0; SIGNATURE_BYTES]),
                 ..base
             },
         ];
         for (i, manifest) in tampered.iter().enumerate() {
             assert_eq!(
-                manifest.verify(&key()),
+                manifest.verify(&key().verify_key()),
                 Err(CoreError::BadSignature),
                 "field {i}"
             );
@@ -589,7 +576,10 @@ mod tests {
 
     #[test]
     fn a_different_key_is_bad_signature() {
-        assert_eq!(signed().verify(&other_key()), Err(CoreError::BadSignature));
+        assert_eq!(
+            signed().verify(&other_key().verify_key()),
+            Err(CoreError::BadSignature)
+        );
     }
 
     // to_json and from_json
@@ -599,7 +589,7 @@ mod tests {
         let manifest = signed();
         let parsed = Manifest::from_json(&manifest.to_json()).unwrap();
         assert_eq!(parsed, manifest);
-        assert_eq!(parsed.verify(&key()), Ok(()));
+        assert_eq!(parsed.verify(&key().verify_key()), Ok(()));
     }
 
     #[test]
@@ -615,7 +605,10 @@ mod tests {
         let mut json = signed().to_json();
         json["name"] = json!("tampered");
         let parsed = Manifest::from_json(&json).unwrap();
-        assert_eq!(parsed.verify(&key()), Err(CoreError::BadSignature));
+        assert_eq!(
+            parsed.verify(&key().verify_key()),
+            Err(CoreError::BadSignature)
+        );
     }
 
     #[test]
@@ -649,9 +642,9 @@ mod tests {
     }
 
     #[test]
-    fn from_json_refuses_a_malformed_hash() {
+    fn from_json_refuses_a_malformed_signature() {
         let mut json = signed().to_json();
-        json["mac"] = json!("not-hex");
+        json["signature"] = json!("not-hex");
         assert!(matches!(
             Manifest::from_json(&json),
             Err(CoreError::InvalidSigning(_))

@@ -59,7 +59,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "54dae3d1d7b8956f3506c4e999a74e77f932a59153ccf38ab8cf96db74bb9dc0"
 dependencies = [
  "cfg-if",
- "getrandom 0.3.4",
  "getrandom 0.4.3",
  "once_cell",
  "serde",
@@ -2764,6 +2763,7 @@ name = "nisse-core"
 version = "0.0.0"
 dependencies = [
  "chrono",
+ "ed25519-dalek 3.0.0",
  "nautilus-core",
  "nautilus-model",
  "rust_decimal",

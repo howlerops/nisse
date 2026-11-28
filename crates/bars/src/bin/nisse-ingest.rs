@@ -22,6 +22,7 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    nisse_core::logging::init();
     let args = match IngestArgs::parse(std::env::args().skip(1)) {
         Ok(args) => args,
         Err(message) => {

@@ -13,6 +13,7 @@ workspace = true
 
 [dependencies]
 chrono = { workspace = true }
+ed25519-dalek = { workspace = true }
 nautilus-core = { workspace = true }
 nautilus-model = { workspace = true }
 rust_decimal = { workspace = true }
@@ -20,3 +21,9 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 strum = { workspace = true }
 thiserror = { workspace = true }
+tracing-subscriber = { workspace = true, optional = true }
+
+[features]
+# `logging::init` for the binaries. Off by default so that libraries (and the phone app) do not
+# build a log subscriber.
+logging = ["dep:tracing-subscriber"]

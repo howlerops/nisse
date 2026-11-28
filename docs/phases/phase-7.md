@@ -16,7 +16,7 @@ owner's, and so are three decisions listed at the end.
 | What an agent may change | Only files under `research/configs/`, `research/notes/` and `research/labels/` | One rule that CI can check from the list of changed paths. |
 | Config validation | In Rust (`nisse_eval::proposal`), with the engine's own strategy parser | The JSON Schema file in `research/schema/` documents the format for people and editors; the Rust check is the one CI runs. No schema-validation dependency. |
 | Change budget | One new or changed config per PR, and none within 30 days of the newest config of the same `family` or the same strategy kind | PLAN.md: one change per strategy per month. A new family name must not reset the budget. |
-| Signature | HMAC-SHA256 over a manifest, key in the environment (`NISSE_SIGNING_KEY`) | Uses the hash crate already in the workspace. **Limitation:** the key that signs also verifies, so the engine host could sign. A public-key signature (CI holds the private key, the host only the public one) is the better scheme and needs a new dependency: the owner's decision. The code keeps signing behind two functions so the scheme can be swapped. |
+| Signature | Ed25519 over a manifest (`ed25519-dalek`, approved by the owner 2026-11-28). The signing workflow holds the secret key (`NISSE_SIGNING_KEY`); the engine host holds only the public key (`NISSE_VERIFY_KEY`) | The host can check a manifest but cannot make one. This replaced the first version, a shared-key HMAC, whose key both signed and verified. |
 | What is signed | The *deployment*: strategy parameters, universe and benchmark (`deployment_hash`), with the config's name, the commit and the stage | The engine computes the same hash from its own config and refuses a mismatch. |
 | Stage | `paper` only; this build refuses to sign `live` | Live is Phase 9 and goes through the promotion gates. |
 | When CI signs | Only when a person starts the signing workflow on `main` and approves its run (the `signing` environment has a required reviewer) | The job runs the code on `main` with the key in its environment. There is no branch protection, so a push to `main` proves nothing by itself. |
@@ -99,11 +99,14 @@ The manifest (`research/signed/<name>.manifest.json`):
 
 ```json
 {"name": "trend-v1", "deployment_hash": "<64 hex>", "git_sha": "<40 hex>",
- "stage": "paper", "signed_at": "2026-11-27T00:00:00Z", "mac": "<64 hex>"}
+ "stage": "paper", "signed_at": "2026-11-27T00:00:00Z", "signature": "<128 hex>"}
 ```
 
-`mac` is HMAC-SHA256 with the key over the canonical JSON of the manifest without `mac`.
-The key is at least 32 bytes, given as hex in `NISSE_SIGNING_KEY`; it is never printed.
+`signature` is the Ed25519 signature over the canonical JSON of the manifest without
+`signature`. The secret key is 32 bytes, given as hex in `NISSE_SIGNING_KEY` to the signer
+only; it is never printed. `nisse-sign --public-key` prints the matching public key, which
+the engine reads from `NISSE_VERIFY_KEY`. Verification is strict (non-canonical signatures
+and weak keys are refused).
 
 The engine config gains `"signature": {"manifest": "<path>", "required": true|false}`.
 The check is made by `tick` and `session-close` themselves, not only by the binary. A
@@ -114,7 +117,7 @@ owner's call.
 Before `tick` or `session-close` does anything, the engine computes the deployment hash of
 its own config and
 
-- with `required: true`: the manifest must exist, its MAC must verify, its hash must equal
+- with `required: true`: the manifest must exist, its signature must verify, its hash must equal
   the engine's, and its stage must be `paper`; otherwise the command exits 2 and nothing
   is traded;
 - with `required: false`: it prints that the deployment is unsigned and carries on. This is
@@ -169,7 +172,7 @@ change to them is a reviewed pull request.
 | Task | What | Files | Order |
 |---|---|---|---|
 | F | Foundation (lead): this doc, `research/` skeleton, stubs | many | 0 |
-| A1 | HMAC, deployment hash, manifest | `crates/core/src/signing.rs` | 1 |
+| A1 | Signature, deployment hash, manifest | `crates/core/src/signing.rs` | 1 |
 | A2 | Research config, note and proposal checks, `nisse-proposal-check` | `crates/eval/src/proposal.rs`, bin | 1 |
 | A4 | Agent report | `crates/eval/src/agent_report.rs`, bin, tests | 1 |
 | A3 | `nisse-sign`; engine verification and the `signature` config field | `crates/eval/src/bin/nisse-sign.rs`, `crates/app/src/config.rs`, `crates/app/src/deployment.rs`, binary | 2 (A1) |

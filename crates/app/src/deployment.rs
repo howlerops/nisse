@@ -2,19 +2,20 @@
 //! `docs/phases/phase-7.md`, "Signing and verification".
 //!
 //! With `signature.required` false the check reads nothing and reports the deployment as
-//! unsigned. With it true, the manifest must exist, verify under the key in
-//! [`ENV_SIGNING_KEY`], be for the paper stage and name exactly the engine's deployment hash.
-//! Every refusal is an [`AppError::Unsigned`] whose message never contains the key.
+//! unsigned. With it true, the manifest must exist, verify under the public key in
+//! [`ENV_VERIFY_KEY`], be for the paper stage and name exactly the engine's deployment hash.
+//! Every refusal is an [`AppError::Unsigned`] whose message never contains the key. The engine
+//! never holds the secret signing key: it can check a manifest but cannot make one.
 
 use std::path::Path;
 
 use nisse_core::Hash32;
-use nisse_core::signing::{Manifest, STAGE_PAPER, SigningKey};
+use nisse_core::signing::{Manifest, STAGE_PAPER, VerifyKey};
 
 use crate::AppError;
 use crate::config::EngineConfig;
 
-pub use nisse_core::signing::ENV_SIGNING_KEY;
+pub use nisse_core::signing::ENV_VERIFY_KEY;
 
 /// What the check found.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,7 +31,7 @@ pub enum Deployment {
 }
 
 /// Checks the engine's deployment against its manifest. `key_hex` is the value of
-/// `ENV_SIGNING_KEY` if set.
+/// `ENV_VERIFY_KEY` if set.
 pub fn verify_deployment(
     config: &EngineConfig,
     key_hex: Option<&str>,
@@ -42,10 +43,10 @@ pub fn verify_deployment(
 
     let key_text = key_hex.map(str::trim).filter(|text| !text.is_empty());
     let Some(key_text) = key_text else {
-        return Err(unsigned(format!("{ENV_SIGNING_KEY} is not set")));
+        return Err(unsigned(format!("{ENV_VERIFY_KEY} is not set")));
     };
-    // The parse error never includes key material (see `SigningKey::from_hex`).
-    let key = SigningKey::from_hex(key_text).map_err(|e| unsigned(e.to_string()))?;
+    // The parse error never includes the key's text (see `VerifyKey::from_hex`).
+    let key = VerifyKey::from_hex(key_text).map_err(|e| unsigned(e.to_string()))?;
 
     let manifest = read_manifest(&config.signature.manifest)?;
     manifest
@@ -73,10 +74,10 @@ pub fn verify_deployment(
     })
 }
 
-/// [`verify_deployment`] with the key read from [`ENV_SIGNING_KEY`]. Every command that can
+/// [`verify_deployment`] with the key read from [`ENV_VERIFY_KEY`]. Every command that can
 /// trade calls this first, inside the command itself, so that no caller can forget it.
 pub fn verify_from_env(config: &EngineConfig) -> Result<Deployment, AppError> {
-    let key = std::env::var(ENV_SIGNING_KEY).ok();
+    let key = std::env::var(ENV_VERIFY_KEY).ok();
     verify_deployment(config, key.as_deref())
 }
 
@@ -108,6 +109,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use serde_json::json;
+
+    use nisse_core::signing::SigningKey;
 
     use super::*;
     use crate::config::SignatureRule;
@@ -145,6 +148,11 @@ mod tests {
 
     fn key() -> SigningKey {
         SigningKey::from_hex(KEY_TEXT).unwrap()
+    }
+
+    /// The public key matching `key()`, as the engine host would hold it.
+    fn verify_text() -> String {
+        key().verify_key().to_string()
     }
 
     /// The repository's paper config, with the signature rule pointing into `dir`.
@@ -218,7 +226,7 @@ mod tests {
         let dir = TempDir::new();
         let config = config_in(&dir, true);
         write_signed(&dir, &config, &key());
-        let outcome = verify_deployment(&config, Some(KEY_TEXT)).unwrap();
+        let outcome = verify_deployment(&config, Some(&verify_text())).unwrap();
         assert_eq!(
             outcome,
             Deployment::Signed {
@@ -234,7 +242,7 @@ mod tests {
         let dir = TempDir::new();
         let config = config_in(&dir, true);
         write_signed(&dir, &config, &key());
-        let padded = format!("  {KEY_TEXT}\n");
+        let padded = format!("  {}\n", verify_text());
         assert!(matches!(
             verify_deployment(&config, Some(&padded)),
             Ok(Deployment::Signed { .. })
@@ -247,10 +255,7 @@ mod tests {
         let config = config_in(&dir, true);
         write_signed(&dir, &config, &key());
         let message = refused(&config, None);
-        assert!(
-            message.contains("NISSE_SIGNING_KEY is not set"),
-            "{message}"
-        );
+        assert!(message.contains("NISSE_VERIFY_KEY is not set"), "{message}");
     }
 
     #[test]
@@ -260,10 +265,7 @@ mod tests {
         write_signed(&dir, &config, &key());
         for blank in ["", "   "] {
             let message = refused(&config, Some(blank));
-            assert!(
-                message.contains("NISSE_SIGNING_KEY is not set"),
-                "{message}"
-            );
+            assert!(message.contains("NISSE_VERIFY_KEY is not set"), "{message}");
         }
     }
 
@@ -282,7 +284,7 @@ mod tests {
     fn required_with_a_missing_manifest_is_refused() {
         let dir = TempDir::new();
         let config = config_in(&dir, true);
-        let message = refused(&config, Some(KEY_TEXT));
+        let message = refused(&config, Some(&verify_text()));
         assert!(message.contains("cannot read manifest"), "{message}");
         assert!(message.contains(MANIFEST_NAME), "{message}");
     }
@@ -292,7 +294,7 @@ mod tests {
         let dir = TempDir::new();
         let config = config_in(&dir, true);
         std::fs::write(dir.manifest_path(), "{ not json").unwrap();
-        let message = refused(&config, Some(KEY_TEXT));
+        let message = refused(&config, Some(&verify_text()));
         assert!(message.contains("is not JSON"), "{message}");
         assert!(message.contains(MANIFEST_NAME), "{message}");
     }
@@ -302,7 +304,7 @@ mod tests {
         let dir = TempDir::new();
         let config = config_in(&dir, true);
         write_json(&dir, &json!({"name": "trend-v1"}));
-        let message = refused(&config, Some(KEY_TEXT));
+        let message = refused(&config, Some(&verify_text()));
         assert!(message.contains("is not a manifest"), "{message}");
     }
 
@@ -315,7 +317,7 @@ mod tests {
             &config,
             &SigningKey::from_hex(OTHER_KEY_TEXT).unwrap(),
         );
-        let message = refused(&config, Some(KEY_TEXT));
+        let message = refused(&config, Some(&verify_text()));
         assert_eq!(message, "the manifest's signature does not verify");
     }
 
@@ -330,7 +332,7 @@ mod tests {
             config.deployment_hash().unwrap()
         );
         write_signed(&dir, &changed, &key());
-        let message = refused(&config, Some(KEY_TEXT));
+        let message = refused(&config, Some(&verify_text()));
         assert!(
             message.contains("not the deployment that was signed"),
             "{message}"
@@ -352,7 +354,7 @@ mod tests {
         write_signed(&dir, &signed_config, &key());
         let mut edited = signed_config;
         edited.strategy["lookback_days"] = json!(253);
-        let message = refused(&edited, Some(KEY_TEXT));
+        let message = refused(&edited, Some(&verify_text()));
         assert!(
             message.contains("not the deployment that was signed"),
             "{message}"
@@ -367,13 +369,13 @@ mod tests {
         let mut json = manifest.to_json();
         json["name"] = json!("trend-v2");
         write_json(&dir, &json);
-        let message = refused(&config, Some(KEY_TEXT));
+        let message = refused(&config, Some(&verify_text()));
         assert_eq!(message, "the manifest's signature does not verify");
     }
 
     #[test]
     fn a_stage_edit_is_caught_by_the_signature_check_first() {
-        // `Manifest::sign` refuses any stage but paper, so no manifest with a verifying MAC and
+        // `Manifest::sign` refuses any stage but paper, so no manifest with a verifying signature and
         // another stage can be built here; the stage check after `verify` is reached only that
         // way. This checks that an edited stage fails the signature, which runs first.
         let dir = TempDir::new();
@@ -382,17 +384,26 @@ mod tests {
         let mut json = manifest.to_json();
         json["stage"] = json!("live");
         write_json(&dir, &json);
-        let message = refused(&config, Some(KEY_TEXT));
+        let message = refused(&config, Some(&verify_text()));
         assert_eq!(message, "the manifest's signature does not verify");
     }
 
     #[test]
-    fn a_key_below_the_minimum_length_is_refused() {
+    fn a_key_of_the_wrong_length_is_refused() {
         let dir = TempDir::new();
         let config = config_in(&dir, true);
         write_signed(&dir, &config, &key());
         let short = "3c".repeat(16);
         let message = refused(&config, Some(&short));
-        assert!(message.contains("at least 32 bytes"), "{message}");
+        assert!(message.contains("exactly 32 bytes"), "{message}");
+    }
+
+    #[test]
+    fn the_secret_key_in_place_of_the_public_key_is_refused() {
+        // The two are the same length; putting the wrong one on the host must not verify.
+        let dir = TempDir::new();
+        let config = config_in(&dir, true);
+        write_signed(&dir, &config, &key());
+        refused(&config, Some(KEY_TEXT));
     }
 }

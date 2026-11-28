@@ -43,6 +43,9 @@ nautilus-model = "=0.68.0"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 chrono-tz = "0.10"
 # DuckDB is compiled from the source vendored in the crate (no download at build time).
+# Deployment signatures (Ed25519): the engine host holds only the public key. Owner-approved
+# 2026-11-28.
+ed25519-dalek = { version = "3", default-features = false, features = ["fast", "zeroize"] }
 duckdb = { version = "1.20001", default-features = false, features = ["bundled", "parquet", "rust_decimal"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
@@ -59,6 +62,8 @@ tracing = "0.1"
 
 # Binaries only
 anyhow = "1"
+# Log output for the cron-run binaries. Owner-approved 2026-11-28.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 
 # Test-only
 criterion = { version = "0.8", default-features = false }

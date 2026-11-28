@@ -9,8 +9,8 @@ runs the engine against Alpaca.
 
 ## Before the first day
 
-1. **Decide the feed** (`"feed"` in `config/engine/paper.json`): `iex` is free, `sip` needs the
-   paid data subscription.
+1. **The feed** (`"feed"` in `config/engine/paper.json`) is `iex` (decided 2026-11-28):
+   `iex` is free, `sip` needs the paid data subscription.
 2. **Provision one small Linux VM** with its time zone set to UTC
    (`timedatectl set-timezone UTC`; the schedule is written in UTC), with Postgres 16 on it or reachable from it. Create a
    database, a login role that is a member of `nisse_writer`, and run `scripts/migrate.sh`
