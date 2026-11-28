@@ -5,17 +5,19 @@
 
 use std::path::Path;
 
+use chrono::NaiveDate;
 use nisse_core::nautilus::UnixNanos;
 use nisse_core::{StrategyVersionId, Trial, TrialKind};
 use nisse_eval::gate_report::{
     EVAL_VERSION, GateReport, GateResult, GateStatus, ReportInputs, TrialSeries, build_report,
-    load_inputs, store_report,
+    load_inputs, pair_tracking, store_report,
 };
 use nisse_eval::gates::Gates;
 use nisse_eval::stats::{dsr, moments, pbo};
 use nisse_store::tables::scoring::TrialWithResult;
-use nisse_store::tables::{trial_registry, trial_result};
+use nisse_store::tables::{account_equity, trial_registry, trial_result};
 use nisse_store::testing::ScratchDb;
+use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use tokio_postgres::Client;
 
@@ -2167,6 +2169,325 @@ fn tracking_is_not_evaluated_without_live_returns_and_judged_with_them() {
         status(&build_report(&i), "tracking"),
         GateStatus::NotEvaluated
     );
+}
+
+// ---- pairing the live and tracking returns ----------------------------------------------------
+
+/// January 2026, day `n`.
+fn day(n: u32) -> NaiveDate {
+    NaiveDate::from_ymd_opt(2026, 1, n).unwrap()
+}
+
+fn days(ns: &[u32]) -> Vec<NaiveDate> {
+    ns.iter().map(|&n| day(n)).collect()
+}
+
+fn dec(text: &str) -> Decimal {
+    text.parse().unwrap()
+}
+
+/// Equity rows as `(day, equity)`.
+fn equity_rows(rows: &[(u32, &str)]) -> Vec<(NaiveDate, Decimal)> {
+    rows.iter()
+        .map(|&(n, equity)| (day(n), dec(equity)))
+        .collect()
+}
+
+/// Asserts two series have the same length and values to within 1e-12.
+fn assert_close(actual: &[f64], expected: &[f64]) {
+    assert_eq!(actual.len(), expected.len(), "{actual:?} vs {expected:?}");
+    for (a, e) in actual.iter().zip(expected) {
+        assert!((a - e).abs() < 1e-12, "{actual:?} vs {expected:?}");
+    }
+}
+
+fn assert_paired(pair: Option<(Vec<f64>, Vec<f64>)>, live: &[f64], backtest: &[f64]) {
+    let (got_live, got_backtest) = pair.expect("the series pair");
+    assert_close(&got_live, live);
+    assert_close(&got_backtest, backtest);
+}
+
+/// The two series cannot be compared: both empty, which the gate reports as not computable.
+fn assert_uncomparable(pair: Option<(Vec<f64>, Vec<f64>)>) {
+    assert_eq!(pair, Some((Vec::new(), Vec::new())));
+}
+
+#[test]
+fn pair_tracking_needs_two_equity_rows() {
+    let returns = [0.0, 0.1];
+    assert_eq!(
+        pair_tracking(&equity_rows(&[]), &days(&[5, 6]), &returns),
+        None
+    );
+    assert_eq!(
+        pair_tracking(&equity_rows(&[(5, "100")]), &days(&[5, 6]), &returns),
+        None
+    );
+}
+
+#[test]
+fn pair_tracking_is_none_without_a_tracking_date_on_or_after_the_second_equity_row() {
+    let eq = equity_rows(&[(5, "100"), (6, "110")]);
+    assert_eq!(pair_tracking(&eq, &[], &[]), None);
+    // A tracking date only before the second equity row: nothing to compare yet.
+    assert_eq!(pair_tracking(&eq, &days(&[4, 5]), &[0.0, 0.0]), None);
+}
+
+#[test]
+fn pair_tracking_pairs_the_live_and_backtest_returns_of_the_same_sessions() {
+    let eq = equity_rows(&[(5, "100"), (6, "110"), (7, "99")]);
+    let pair = pair_tracking(&eq, &days(&[5, 6, 7]), &[0.0, 0.05, -0.02]);
+    assert_paired(pair, &[0.10, -0.10], &[0.05, -0.02]);
+}
+
+#[test]
+fn pair_tracking_uses_only_the_tail_of_a_long_tracking_run() {
+    let eq = equity_rows(&[(7, "100"), (8, "101"), (9, "103")]);
+    let dates = days(&[1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    let returns = [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.004, 0.02];
+    let pair = pair_tracking(&eq, &dates, &returns);
+    assert_paired(pair, &[0.01, 2.0 / 101.0], &[0.004, 0.02]);
+}
+
+#[test]
+fn pair_tracking_pairs_from_the_second_equity_row_when_the_run_starts_later() {
+    let eq = equity_rows(&[(5, "100"), (6, "110"), (7, "99")]);
+    let pair = pair_tracking(&eq, &days(&[6, 7]), &[0.05, -0.02]);
+    assert_paired(pair, &[0.10, -0.10], &[0.05, -0.02]);
+}
+
+#[test]
+fn pair_tracking_compares_only_up_to_the_last_tracking_date() {
+    let eq = equity_rows(&[(5, "100"), (6, "110"), (7, "99"), (8, "105")]);
+    let pair = pair_tracking(&eq, &days(&[5, 6]), &[0.0, 0.05]);
+    assert_paired(pair, &[0.10], &[0.05]);
+}
+
+#[test]
+fn pair_tracking_with_an_equity_row_missing_inside_the_span_is_uncomparable() {
+    // Day 7 is in the tracking run, but the equity series has no row for it.
+    let eq = equity_rows(&[(5, "100"), (6, "110"), (8, "99")]);
+    let pair = pair_tracking(&eq, &days(&[5, 6, 7, 8]), &[0.0, 0.05, 0.01, -0.02]);
+    assert_uncomparable(pair);
+}
+
+#[test]
+fn pair_tracking_with_an_equity_row_the_tracking_run_lacks_is_uncomparable() {
+    let eq = equity_rows(&[(5, "100"), (6, "110"), (7, "99")]);
+    assert_uncomparable(pair_tracking(&eq, &days(&[5, 7]), &[0.0, 0.01]));
+}
+
+#[test]
+fn pair_tracking_with_a_zero_or_negative_previous_equity_is_uncomparable() {
+    let zero = equity_rows(&[(5, "0"), (6, "110")]);
+    assert_uncomparable(pair_tracking(&zero, &days(&[5, 6]), &[0.0, 0.05]));
+    let negative = equity_rows(&[(5, "-5"), (6, "110")]);
+    assert_uncomparable(pair_tracking(&negative, &days(&[5, 6]), &[0.0, 0.05]));
+}
+
+#[test]
+fn pair_tracking_with_different_lengths_is_uncomparable() {
+    let eq = equity_rows(&[(5, "100"), (6, "110"), (7, "99")]);
+    assert_uncomparable(pair_tracking(&eq, &days(&[5, 6, 7]), &[0.0, 0.05]));
+    assert_uncomparable(pair_tracking(&eq, &days(&[5, 6]), &[0.0, 0.05, -0.02]));
+}
+
+#[test]
+fn pair_tracking_with_unsorted_or_repeated_tracking_dates_is_uncomparable() {
+    let eq = equity_rows(&[(5, "100"), (6, "110"), (7, "99")]);
+    assert_uncomparable(pair_tracking(&eq, &days(&[5, 7, 6]), &[0.0, -0.02, 0.05]));
+    assert_uncomparable(pair_tracking(&eq, &days(&[5, 6, 6]), &[0.0, 0.05, 0.05]));
+}
+
+#[test]
+fn pair_tracking_with_equity_out_of_date_order_is_uncomparable() {
+    let eq = equity_rows(&[(6, "110"), (5, "100")]);
+    assert_uncomparable(pair_tracking(&eq, &days(&[5, 6]), &[0.0, 0.05]));
+}
+
+// ---- the tracking gate from the store -------------------------------------------------------
+
+/// Records the equity of `version` in `environment` for each `(day, equity)` row of January 2026.
+async fn record_equity(
+    client: &Client,
+    version: StrategyVersionId,
+    environment: &str,
+    rows: &[(u32, &str)],
+) {
+    for &(n, equity) in rows {
+        account_equity::insert(
+            client,
+            version,
+            environment,
+            day(n),
+            dec(equity),
+            UnixNanos::from(T),
+        )
+        .await
+        .unwrap();
+    }
+}
+
+/// Registers a tracking run of `version` with its returns over `dates` and returns its trial id.
+async fn tracking_run(
+    client: &Client,
+    version: StrategyVersionId,
+    dates: &[NaiveDate],
+    returns: &[f64],
+) -> i64 {
+    let id = register(
+        client,
+        version,
+        TrialKind::Backtest,
+        Some(json!({"tracking": true})),
+    )
+    .await;
+    let mut result = stored_result(json!(returns), false);
+    result["session_dates"] = json!(dates.iter().map(ToString::to_string).collect::<Vec<_>>());
+    trial_result::insert(client, id, &result, UnixNanos::from(T))
+        .await
+        .unwrap();
+    id
+}
+
+#[tokio::test]
+async fn the_tracking_gate_is_not_evaluated_without_equity_rows() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let v = version(&client, 1).await;
+    tracking_run(&client, v, &days(&[5, 6, 7]), &[0.0, 0.1, -0.1]).await;
+
+    let inputs = load_inputs(&client, v, gates()).await.unwrap();
+    assert_eq!(inputs.live, None);
+    let report = build_report(&inputs);
+    let gate = find(&report, "tracking");
+    assert_eq!(gate.status, GateStatus::NotEvaluated);
+    assert!(gate.note.contains("no live returns yet"), "{}", gate.note);
+
+    drop(client);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_tracking_gate_is_judged_from_equity_rows_and_a_tracking_run() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let v = version(&client, 1).await;
+    // Equity 100, 110, 99, 108.9: daily returns 0.10, -0.10 and 0.10.
+    record_equity(
+        &client,
+        v,
+        "paper",
+        &[(5, "100"), (6, "110"), (7, "99"), (8, "108.9")],
+    )
+    .await;
+    tracking_run(&client, v, &days(&[5, 6, 7, 8]), &[0.0, 0.1, -0.1, 0.1]).await;
+
+    let inputs = load_inputs(&client, v, gates()).await.unwrap();
+    let (live, backtest) = inputs.live.as_ref().expect("a paired series");
+    assert_close(live, &[0.1, -0.1, 0.1]);
+    assert_close(backtest, &[0.1, -0.1, 0.1]);
+    let report = build_report(&inputs);
+    let gate = find(&report, "tracking");
+    assert_eq!(gate.status, GateStatus::Pass);
+    assert!(gate.value.expect("a tracking error").abs() < 1e-12);
+
+    drop(client);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn live_equity_is_preferred_over_paper() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let v = version(&client, 1).await;
+    record_equity(&client, v, "paper", &[(5, "100"), (6, "110"), (7, "99")]).await;
+    record_equity(&client, v, "live", &[(5, "100"), (6, "120"), (7, "90")]).await;
+    tracking_run(&client, v, &days(&[5, 6, 7]), &[0.0, 0.2, -0.25]).await;
+
+    let inputs = load_inputs(&client, v, gates()).await.unwrap();
+    let (live, backtest) = inputs.live.as_ref().expect("a paired series");
+    // The live rows give 0.2 and -0.25; paper's would give 0.1 and -0.1.
+    assert_close(live, &[0.2, -0.25]);
+    assert_close(backtest, &[0.2, -0.25]);
+
+    drop(client);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_missed_session_makes_the_tracking_gate_not_evaluated() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let v = version(&client, 1).await;
+    // The equity has no row for day 7, which the tracking run has.
+    record_equity(&client, v, "paper", &[(5, "100"), (6, "110"), (8, "108.9")]).await;
+    tracking_run(&client, v, &days(&[5, 6, 7, 8]), &[0.0, 0.1, -0.1, 0.1]).await;
+
+    let inputs = load_inputs(&client, v, gates()).await.unwrap();
+    assert_eq!(inputs.live, Some((Vec::new(), Vec::new())));
+    let report = build_report(&inputs);
+    let gate = find(&report, "tracking");
+    assert_eq!(gate.status, GateStatus::NotEvaluated);
+    assert!(gate.note.contains("could not be computed"), "{}", gate.note);
+
+    drop(client);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_malformed_tracking_result_leaves_the_gate_uncomputable() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let v = version(&client, 1).await;
+    record_equity(&client, v, "paper", &[(5, "100"), (6, "110"), (7, "99")]).await;
+    let id = register(
+        &client,
+        v,
+        TrialKind::Backtest,
+        Some(json!({"tracking": true})),
+    )
+    .await;
+    let mut result = stored_result(json!([0.0, 0.1, -0.1]), false);
+    result["session_dates"] = json!(["2026-01-05", "not a date", "2026-01-07"]);
+    trial_result::insert(&client, id, &result, UnixNanos::from(T))
+        .await
+        .unwrap();
+
+    let inputs = load_inputs(&client, v, gates()).await.unwrap();
+    assert_eq!(inputs.live, Some((Vec::new(), Vec::new())));
+    assert_eq!(
+        status(&build_report(&inputs), "tracking"),
+        GateStatus::NotEvaluated
+    );
+
+    drop(client);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_tracking_run_never_becomes_the_candidate() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let v = version(&client, 1).await;
+    let ordinary = register(&client, v, TrialKind::Backtest, None).await;
+    trial_result::insert(
+        &client,
+        ordinary,
+        &stored_result(json!([0.01, -0.02]), false),
+        UnixNanos::from(T),
+    )
+    .await
+    .unwrap();
+    // The tracking run is newer, so it would be the candidate if it were a trial.
+    tracking_run(&client, v, &days(&[5, 6]), &[0.0, 0.1]).await;
+
+    let inputs = load_inputs(&client, v, gates()).await.unwrap();
+    let report = build_report(&inputs);
+    assert_eq!(report.candidate_trial_id, Some(ordinary));
+
+    drop(client);
+    db.drop_db().await.unwrap();
 }
 
 // ---- info -----------------------------------------------------------------------------------

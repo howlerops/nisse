@@ -8,12 +8,14 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 
+use chrono::NaiveDate;
 use nisse_core::nautilus::UnixNanos;
 use nisse_core::{EvalScore, StrategyVersionId, SubjectType};
 use nisse_store::StoreError;
 use nisse_store::tables::scoring::{self, TrialWithResult};
-use nisse_store::tables::{eval_score, trial_registry};
+use nisse_store::tables::{account_equity, eval_score, trial_registry};
 use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use serde_json::{Value, json};
 use tokio_postgres::GenericClient;
 
@@ -42,6 +44,13 @@ pub const MIN_HOLDOUT_SESSIONS: u64 = 60;
 /// a noisy Sharpe ratio, so a threshold drawn from it would be arbitrary. The flat warm-up is not
 /// counted.
 pub const MIN_BASELINE_SESSIONS: usize = 252;
+
+/// The environment whose account equity the tracking gate reads first. Paper is read only when
+/// it has no live rows.
+const LIVE_ENVIRONMENT: &str = "live";
+
+/// The environment the tracking gate falls back to when the live environment has no equity rows.
+const PAPER_ENVIRONMENT: &str = "paper";
 
 /// The verdict on one gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,7 +244,9 @@ pub struct ReportInputs {
     /// Orders of this version sent beyond the intent. Zero means the risk gate has nothing to
     /// judge.
     pub sent_orders: u64,
-    /// Live and backtest daily returns over the same sessions, when live trading exists.
+    /// Live and backtest daily returns over the same sessions (see [`pair_tracking`]). `None`
+    /// when there is no tracking run or nothing to compare yet. Two empty vectors when the
+    /// series cannot be compared: the tracking gate then says it could not be computed.
     pub live: Option<(Vec<f64>, Vec<f64>)>,
 }
 
@@ -321,7 +332,10 @@ pub fn build_report(inputs: &ReportInputs) -> GateReport {
     }
 }
 
-/// Loads the inputs for `version` from the store (no live returns yet: `live` is `None`).
+/// Loads the inputs for `version` from the store. The live returns come from the daily equity
+/// (the `live` environment's rows if it has any, else `paper`'s) and the newest tracking run
+/// (see [`pair_tracking`]). A tracking run whose result is incomplete or malformed gives two
+/// empty series, so the tracking gate says it could not be computed.
 pub async fn load_inputs<C: GenericClient>(
     client: &C,
     version: StrategyVersionId,
@@ -337,6 +351,21 @@ pub async fn load_inputs<C: GenericClient>(
     let (failed, scored) = scoring::replay_failures(client, version).await?;
     let breaches = scoring::risk_breaches(client, version, GATE_RULES).await?;
     let sent = scoring::sent_orders(client, version).await?;
+    let equity = {
+        let live = account_equity::daily(client, version, LIVE_ENVIRONMENT).await?;
+        if live.is_empty() {
+            account_equity::daily(client, version, PAPER_ENVIRONMENT).await?
+        } else {
+            live
+        }
+    };
+    let live = match scoring::tracking_result(client, version).await? {
+        None => None,
+        Some(run) => match tracking_series(&run.result) {
+            Some((dates, returns)) => pair_tracking(&equity, &dates, &returns),
+            None => uncomparable(),
+        },
+    };
     Ok(ReportInputs {
         version,
         gates,
@@ -346,8 +375,114 @@ pub async fn load_inputs<C: GenericClient>(
         replay: (count(failed)?, count(scored)?),
         risk_breaches: count(breaches)?,
         sent_orders: count(sent)?,
-        live: None,
+        live,
     })
+}
+
+/// The tracking run's session dates and returns, when its result is complete, every return is a
+/// number and every date is `%Y-%m-%d`. Otherwise `None`.
+fn tracking_series(result: &Value) -> Option<(Vec<NaiveDate>, Vec<f64>)> {
+    let returns = parse_returns(result)?;
+    let dates = result
+        .get("session_dates")?
+        .as_array()?
+        .iter()
+        .map(|day| {
+            day.as_str()
+                .and_then(|text| NaiveDate::parse_from_str(text, "%Y-%m-%d").ok())
+        })
+        .collect::<Option<Vec<NaiveDate>>>()?;
+    Some((dates, returns))
+}
+
+/// Lines the engine's daily returns up with a tracking run's, session by session.
+///
+/// `equity` is the account's equity per session, ascending by date. The live return of a session
+/// is `equity / previous equity row's equity - 1`. `dates` and `returns` are the tracking run's
+/// (one date per return, ascending). The span compared runs from the second session with an
+/// equity row to the earlier of the last equity row and the last tracking date.
+///
+/// Returns `(live, backtest)`, equal lengths, one pair per session of the span. Returns two empty
+/// vectors, which the gate reports as "could not be computed", when the two series do not cover
+/// the same sessions inside the span: a tracking date in the span with no equity row (a missed
+/// session close), or an equity row in the span with no tracking date. Also empty when `dates`
+/// and `returns` differ in length, `dates` is not strictly ascending, a previous equity is not
+/// positive, or a live return is not finite.
+/// Returns `None` when there is nothing to compare yet: fewer than two equity rows, or no
+/// tracking date on or after the second equity row's date.
+#[must_use]
+pub fn pair_tracking(
+    equity: &[(NaiveDate, Decimal)],
+    dates: &[NaiveDate],
+    returns: &[f64],
+) -> Option<(Vec<f64>, Vec<f64>)> {
+    let second = equity.get(1)?.0;
+    if dates.len() != returns.len() || dates.windows(2).any(|w| matches!(w, [a, b] if a >= b)) {
+        return uncomparable();
+    }
+    // The first tracking date on or after the span's start; dates before it are not compared.
+    let start = dates.partition_point(|day| *day < second);
+    if start == dates.len() {
+        return None;
+    }
+    let end = equity.last()?.0.min(*dates.last()?);
+    let tracked_in_span = dates
+        .partition_point(|day| *day <= end)
+        .saturating_sub(start);
+
+    let capacity = equity.len().saturating_sub(1).min(tracked_in_span);
+    let mut live = Vec::with_capacity(capacity);
+    let mut backtest = Vec::with_capacity(capacity);
+    let mut previous = *equity.first()?;
+    for &(day, today) in equity.iter().skip(1) {
+        if day > end {
+            break;
+        }
+        let (previous_day, previous_equity) = previous;
+        previous = (day, today);
+        if day <= previous_day {
+            return uncomparable();
+        }
+        // The tracking date just before `day` must be the previous equity session: otherwise
+        // the backtest's return on `day` spans another session than the live one does.
+        let before = dates.partition_point(|tracked| *tracked < day);
+        let tracked_before = before.checked_sub(1).and_then(|i| dates.get(i));
+        if tracked_before.is_some_and(|tracked| *tracked != previous_day) {
+            return uncomparable();
+        }
+        let (Some(&tracked_day), Some(&backtest_return)) = (dates.get(before), returns.get(before))
+        else {
+            return uncomparable();
+        };
+        let Some(live_return) = live_return(today, previous_equity) else {
+            return uncomparable();
+        };
+        if tracked_day != day {
+            return uncomparable();
+        }
+        live.push(live_return);
+        backtest.push(backtest_return);
+    }
+    // Every tracking date in the span was paired, so none lacks an equity row.
+    if live.len() != tracked_in_span {
+        return uncomparable();
+    }
+    Some((live, backtest))
+}
+
+/// The return of `equity` over `previous`, in `Decimal` and converted to `f64` last. `None` when
+/// `previous` is not positive, or the result is not finite.
+fn live_return(equity: Decimal, previous: Decimal) -> Option<f64> {
+    if previous <= Decimal::ZERO {
+        return None;
+    }
+    let ratio = equity.checked_div(previous)?.checked_sub(Decimal::ONE)?;
+    ratio.to_f64().filter(|r| r.is_finite())
+}
+
+/// Two empty series: the two sides cannot be compared, and the gate says so.
+fn uncomparable() -> Option<(Vec<f64>, Vec<f64>)> {
+    Some((Vec::new(), Vec::new()))
 }
 
 /// A database count, which can never be negative: a negative one is a data error.
