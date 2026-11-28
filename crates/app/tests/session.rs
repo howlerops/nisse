@@ -32,7 +32,7 @@ use nisse_engine::{EngineError, SimBroker, SimError};
 use nisse_risk::DrawdownMode;
 use nisse_store::{
     Store,
-    tables::{account_equity, engine_step::StepStatus, risk_event, trial_registry},
+    tables::{account_equity, engine_step::StepStatus, heartbeat, risk_event, trial_registry},
     testing::ScratchDb,
 };
 use rust_decimal::Decimal;
@@ -1466,6 +1466,98 @@ async fn rerunning_the_same_session_writes_no_second_equity_row() {
         .unwrap()
         .get(0);
     assert_eq!(steps, 2);
+
+    f.db.drop_db().await.unwrap();
+}
+
+/// Makes the `account_equity` table unreachable under its name, as if the binary had been
+/// deployed before migration 0015: the equity insert then fails with "relation does not exist".
+/// The scratch database is the test's own, so nothing else sees the rename.
+async fn hide_account_equity(store: &Store) {
+    store
+        .client()
+        .batch_execute("ALTER TABLE account_equity RENAME TO account_equity_hidden")
+        .await
+        .unwrap();
+}
+
+/// Undoes [`hide_account_equity`].
+async fn restore_account_equity(store: &Store) {
+    store
+        .client()
+        .batch_execute("ALTER TABLE account_equity_hidden RENAME TO account_equity")
+        .await
+        .unwrap();
+}
+
+/// The newest status of the `equity` step of the run for `day`, if it has one.
+async fn equity_status(store: &Store, day: NaiveDate) -> Option<StepStatus> {
+    store
+        .step_status(&run_key(day), "equity")
+        .await
+        .unwrap()
+        .map(|(status, _)| status)
+}
+
+#[tokio::test]
+async fn a_failed_equity_write_does_not_stop_the_session_close() {
+    let f = fixture().await;
+    let sim = broker();
+    let day = date(2025, 12, 31);
+    let clock = ManualClock::new(plus_minutes(close_at(day), 10));
+    hide_account_equity(&f.store).await;
+
+    let outcome = session_close(&f.config, &f.market, &f.store, f.sink.clone(), &sim, &clock)
+        .await
+        .unwrap();
+
+    assert!(matches!(outcome, SessionCloseOutcome::Ran { .. }));
+    assert_eq!(equity_status(&f.store, day).await, Some(StepStatus::Failed));
+    assert!(
+        heartbeat::latest(f.store.client(), &f.config.source)
+            .await
+            .unwrap()
+            .is_some(),
+        "the heartbeat is written after a failed equity write"
+    );
+    assert!(
+        f.store
+            .step_status(&run_key(day), "rebalance")
+            .await
+            .unwrap()
+            .is_some(),
+        "the rebalance step runs after a failed equity write"
+    );
+
+    f.db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn rerun_after_a_failed_equity_write_records_it() {
+    let f = fixture().await;
+    let sim = broker();
+    let day = date(2025, 12, 31);
+    let clock = ManualClock::new(plus_minutes(close_at(day), 10));
+    hide_account_equity(&f.store).await;
+    session_close(&f.config, &f.market, &f.store, f.sink.clone(), &sim, &clock)
+        .await
+        .unwrap();
+
+    restore_account_equity(&f.store).await;
+    let outcome = session_close(&f.config, &f.market, &f.store, f.sink.clone(), &sim, &clock)
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        outcome,
+        SessionCloseOutcome::Ran {
+            rebalance: RebalanceStep::AlreadyDone,
+            ..
+        }
+    ));
+    assert_eq!(count(&f.store, "account_equity").await, 1);
+    assert_eq!(equity_status(&f.store, day).await, Some(StepStatus::Done));
+    assert_eq!(paper_live_trials(&f.store).await, 1);
 
     f.db.drop_db().await.unwrap();
 }

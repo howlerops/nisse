@@ -45,9 +45,11 @@ pub const TICK_ATTEMPT_STEP: &str = "rebalance";
 const INGEST_STEP: &str = "ingest";
 const RECONCILE_STEP: &str = "reconcile";
 const OBSERVE_STEP: &str = "observe";
-/// The step recording the session's account equity. Once `done` for a run it is skipped. The
-/// engine's `live` trial is registered by [`ensure_live_trial`], before the run acts. See
-/// `docs/phases/phase-9a.md`.
+/// The step recording the session's account equity. Once `done` for a run it is skipped; a
+/// `failed` one is tried again by the next run of the same session. The write is bookkeeping for
+/// the tracking gate, so a failure is logged and does not stop the run: the rebalance and the
+/// heartbeat still happen. The engine's `live` trial is registered by [`ensure_live_trial`],
+/// before the run acts, and that one is fatal. See `docs/phases/phase-9a.md`.
 const EQUITY_STEP: &str = "equity";
 const REBALANCE_STEP: &str = "rebalance";
 
@@ -198,6 +200,9 @@ pub async fn tick<M: Market, B: Broker, C: Clock>(
 /// Order: enforce the kill switch → verify the signature → lock → ingest → restore →
 /// register the engine's trial (if it has none) → reconcile → observe → record equity →
 /// (re-read the switch) → rebalance on a month end or when one is owed → finish. The kill switch is enforced first, as in [`tick`].
+/// The equity write is not fatal: a failure is recorded as a `failed` step and logged, and the run
+/// goes on to the rebalance and the heartbeat. The trial registration ([`ensure_live_trial`]) is
+/// fatal: it runs before the engine acts.
 pub async fn session_close<M: Market, B: Broker, C: Clock>(
     config: &EngineConfig,
     market: &M,
@@ -297,7 +302,9 @@ pub async fn session_close<M: Market, B: Broker, C: Clock>(
         store.step_status(&run_key, EQUITY_STEP).await?,
         Some((StepStatus::Done, _))
     ) {
-        step(
+        // Not fatal: the step is recorded `failed` by `step`, and the next run of this session
+        // retries it (only a `done` equity step is skipped).
+        let recorded = step(
             store,
             &run_key,
             EQUITY_STEP,
@@ -312,7 +319,14 @@ pub async fn session_close<M: Market, B: Broker, C: Clock>(
             ),
             |()| json!({"equity": observed.equity.to_string()}),
         )
-        .await?;
+        .await;
+        if let Err(err) = recorded {
+            tracing::error!(
+                run_key,
+                error = %err,
+                "could not record the session's account equity; the tracking gate will report a gap unless a later run succeeds"
+            );
+        }
     }
 
     let rebalance = rebalance_step(
