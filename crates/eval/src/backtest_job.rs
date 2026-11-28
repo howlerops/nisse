@@ -170,7 +170,7 @@ pub struct JobOutcome {
 ///    `holdout_max_looks` (`HoldoutRetired`, nothing written). Ordinary and tracking runs take
 ///    no lock and do not check looks.
 /// 6. Ensure the strategy version and register the trial, before the run. A tracking run must
-///    have a `live` trial for its config (`live_start`) and its last bar's UTC date must be on or
+///    have a `live` trial for its config (`latest_live`) and its last bar's UTC date must be on or
 ///    after the UTC date of the engine's first session; otherwise `InvalidJob`. The strategy
 ///    version is ensured before these checks, so a refused tracking run may leave a
 ///    `strategy_version` row, but no trial. A holdout run is marked in its registered result, so
@@ -431,7 +431,7 @@ struct RunSpan<'a> {
 /// or when the UTC date of `last_session` is before the UTC date of the engine's first session;
 /// both refusals happen after the strategy version is ensured, so they may leave that row, but
 /// never a trial. Returns the strategy version id, the trial id, and for a tracking run the
-/// engine's first session (`live_start`), which the result is redacted to; `None` otherwise. The
+/// engine's first session (`latest_live`), which the result is redacted to; `None` otherwise. The
 /// caller holds `HOLDOUT_LOCK` across this call when the run is a holdout run.
 async fn register_trial(
     store: &Store,
@@ -540,14 +540,14 @@ pub const TRACKING_KEPT_KEYS: [&str; 18] = [
 /// paper before it has passed the holdout gate. A summary, final equity or fee total over the
 /// whole span would therefore be an uncounted look at the holdout, and so would returns from
 /// before the engine first ran. So the stored result keeps only the returns of the sessions whose
-/// UTC date is on or after the date of `live_start` (the engine's first day), with one
+/// UTC date is on or after the date of `latest_live` (the engine's first day), with one
 /// `session_dates` entry each and `tracking_start` giving that date. Every key of the result that
 /// is not in [`TRACKING_KEPT_KEYS`] is `null`, and `sessions` counts the returns kept. The kept
 /// keys (git SHA, bar file, costs, limits, holdout fields and so on) are left as they are.
 ///
 /// A return needs the equity of the session before it, so the first kept return is computed from
-/// the last curve point before `live_start`, which is the only point before the engine's first
-/// day that the tail reveals (as one ratio). If no point is on or after `live_start`, nothing is
+/// the last curve point before `latest_live`, which is the only point before the engine's first
+/// day that the tail reveals (as one ratio). If no point is on or after `latest_live`, nothing is
 /// kept.
 fn redact_for_tracking(result: &mut Value, curve: &[(UnixNanos, Decimal)], live_start: UnixNanos) {
     let start_day = utc_day(live_start);
