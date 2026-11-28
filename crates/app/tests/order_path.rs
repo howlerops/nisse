@@ -1,14 +1,32 @@
 //! Guards the rule that an order reaches a broker only from the trader, after the risk gate's check.
 //!
-//! The functions that send orders are public (the engine's own integration tests need them), so
-//! this test reads the source and fails when a new non-test caller appears. If it fails because you
-//! added one on purpose, that is a change to a sensitive path: say so in the pull request, then
-//! update the list here.
+//! This is a tripwire for honest mistakes, not a proof. It reads source text and rejects a new
+//! production call that sends or replaces an order, or a new network client dependency. A determined
+//! change could route around a text search (an alias, a macro, a re-export under another name), so a
+//! pass here does not prove the rule holds. Review of the sensitive paths (`crates/risk/`,
+//! `crates/alpaca-adapter/`, `config/limits/`, `.github/`) remains the control.
+//!
+//! The functions that send orders are public (the engine's own integration tests need them), so a
+//! new production caller fails this test. If it fails because you added one on purpose, that is a
+//! change to a sensitive path: say so in the pull request, then update the lists here.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::fs;
 use std::path::{Path, PathBuf};
+
+/// Crate dependencies that open network connections. A crate other than `alpaca-adapter` that
+/// depends on one of these fails the network test.
+const NETWORK_CLIENTS: [&str; 8] = [
+    "reqwest",
+    "tungstenite",
+    "tokio-tungstenite",
+    "hyper",
+    "ureq",
+    "isahc",
+    "surf",
+    "curl",
+];
 
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -26,32 +44,100 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Production text of a file: lines before the first `#[cfg(test)]`, without comment lines.
+/// Whether the attributes and blank lines that follow a `#[cfg(test)]` line open a `mod` item.
+/// Attributes may span lines (`#[allow(` ... `)]`), so their brackets are counted.
+fn opens_test_module(rest: &[&str]) -> bool {
+    let mut in_attr = false;
+    let mut depth: i64 = 0;
+    for line in rest {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if in_attr || t.starts_with("#[") {
+            if !in_attr {
+                in_attr = true;
+                depth = 0;
+            }
+            for c in t.chars() {
+                match c {
+                    '[' => depth += 1,
+                    ']' => depth -= 1,
+                    _ => {}
+                }
+            }
+            if depth <= 0 {
+                in_attr = false;
+            }
+            continue;
+        }
+        return t.starts_with("mod ");
+    }
+    false
+}
+
+/// Production text of a file: comment lines are removed, and so is a trailing test module.
+///
+/// A `#[cfg(test)]` line ends the text (to the end of the file) only when the next line that is not
+/// blank and not an attribute starts with `mod `, the workspace's test-module convention. Any other
+/// `#[cfg(test)]` item, such as a test helper, stays in the text.
 fn production_text(text: &str) -> String {
-    let mut lines = Vec::new();
-    for line in text.lines() {
-        if line.trim() == "#[cfg(test)]" {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut kept = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if line.trim() == "#[cfg(test)]"
+            && opens_test_module(lines.get(i + 1..).unwrap_or_default())
+        {
             break;
         }
         if line.trim_start().starts_with("//") {
             continue;
         }
-        lines.push(line);
+        kept.push(*line);
     }
-    lines.join("\n")
+    kept.join("\n")
 }
 
-fn crate_dirs() -> Vec<(String, PathBuf)> {
-    let crates = root().join("crates");
-    let mut dirs: Vec<(String, PathBuf)> = fs::read_dir(&crates)
-        .expect("read crates directory")
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Byte offsets where `name` occurs as a whole identifier (not inside a longer one).
+fn ident_positions<'a>(text: &'a str, name: &'a str) -> impl Iterator<Item = usize> + 'a {
+    text.match_indices(name).filter_map(move |(at, _)| {
+        let before_ok = text[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_ident_char(c));
+        let after_ok = text[at + name.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !is_ident_char(c));
+        (before_ok && after_ok).then_some(at)
+    })
+}
+
+/// Whether `name` is called as a method or path item: `.name(`, `::name(`, or with a turbofish.
+fn calls_method(text: &str, name: &str) -> bool {
+    ident_positions(text, name).any(|at| {
+        let before = &text[..at];
+        let after = &text[at + name.len()..];
+        (before.ends_with('.') || before.ends_with("::"))
+            && (after.starts_with('(') || after.starts_with("::<"))
+    })
+}
+
+/// Immediate subdirectories of `parent`, sorted by name.
+fn subdirs(parent: &Path) -> Vec<(String, PathBuf)> {
+    let mut dirs: Vec<(String, PathBuf)> = fs::read_dir(parent)
+        .expect("read parent directory")
         .map(|entry| entry.expect("read directory entry").path())
         .filter(|p| p.is_dir())
         .map(|p| {
             let name = p
                 .file_name()
                 .and_then(|n| n.to_str())
-                .expect("crate directory name is UTF-8")
+                .expect("directory name is UTF-8")
                 .to_owned();
             (name, p)
         })
@@ -60,10 +146,22 @@ fn crate_dirs() -> Vec<(String, PathBuf)> {
     dirs
 }
 
+fn crate_dirs() -> Vec<(String, PathBuf)> {
+    subdirs(&root().join("crates"))
+}
+
+/// Production source files of the workspace crates and of the phone app's Rust module
+/// (`ui/ext/*`, a separate workspace), as (repo-relative path with forward slashes, production text).
 fn sources() -> Vec<(String, String)> {
     let root = root();
+    let mut crate_roots: Vec<PathBuf> = crate_dirs().into_iter().map(|(_, dir)| dir).collect();
+    crate_roots.extend(
+        subdirs(&root.join("ui/ext"))
+            .into_iter()
+            .map(|(_, dir)| dir),
+    );
     let mut result = Vec::new();
-    for (_name, dir) in crate_dirs() {
+    for dir in crate_roots {
         let src = dir.join("src");
         if !src.is_dir() {
             continue;
@@ -84,12 +182,77 @@ fn sources() -> Vec<(String, String)> {
     result
 }
 
-fn files_containing<'a>(sources: &'a [(String, String)], needle: &str) -> Vec<&'a str> {
+/// Paths of the sources whose production text satisfies `pred`, in sorted order.
+fn files_where(sources: &[(String, String)], pred: impl Fn(&str) -> bool) -> Vec<&str> {
     sources
         .iter()
-        .filter(|(_, text)| text.contains(needle))
+        .filter(|(_, text)| pred(text))
         .map(|(path, _)| path.as_str())
         .collect()
+}
+
+/// The dependency name at the start of a manifest line, or "" when the line has none.
+fn dependency_name(line: &str) -> &str {
+    let end = line
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        .unwrap_or(line.len());
+    &line[..end]
+}
+
+#[test]
+fn production_text_keeps_a_cfg_test_helper_and_the_code_after_it() {
+    let text = "#[cfg(test)]\nfn helper() {}\n\nfn ship(b: &B) {\n    b.submit(i);\n}\n";
+    let kept = production_text(text);
+    assert!(
+        kept.contains("b.submit(i);"),
+        "production call dropped: {kept}"
+    );
+    assert!(kept.contains("fn helper()"), "helper dropped: {kept}");
+}
+
+#[test]
+fn production_text_drops_a_trailing_test_module() {
+    let text = "fn ship() {}\n#[cfg(test)]\nmod tests {\n    fn t() { x.submit(i); }\n}\n";
+    let kept = production_text(text);
+    assert!(
+        kept.contains("fn ship()"),
+        "production code dropped: {kept}"
+    );
+    assert!(!kept.contains("submit"), "test module kept: {kept}");
+}
+
+#[test]
+fn production_text_drops_a_test_module_behind_an_attribute() {
+    let one_line = "fn ship() {}\n#[cfg(test)]\n#[allow(clippy::unwrap_used)]\nmod tests {\n    fn t() { x.submit(i); }\n}\n";
+    assert!(!production_text(one_line).contains("submit"));
+
+    let multi_line = "fn ship() {}\n#[cfg(test)]\n#[allow(\n    clippy::unwrap_used,\n    clippy::panic,\n)]\n\nmod tests {\n    fn t() { x.replace(i); }\n}\n";
+    let kept = production_text(multi_line);
+    assert!(
+        kept.contains("fn ship()"),
+        "production code dropped: {kept}"
+    );
+    assert!(!kept.contains("replace"), "test module kept: {kept}");
+}
+
+#[test]
+fn production_text_drops_comment_lines_only() {
+    let text = "// x.submit(i);\nfn ship() {\n    // y.submit(i);\n    z.submit(i);\n}\n";
+    let kept = production_text(text);
+    assert!(!kept.contains("// "), "comment kept: {kept}");
+    assert!(kept.contains("z.submit(i);"), "call dropped: {kept}");
+}
+
+#[test]
+fn identifiers_match_whole_words_only() {
+    assert!(calls_method("a.submit(x)", "submit"));
+    assert!(calls_method("Broker::submit(&b, x)", "submit"));
+    assert!(calls_method("g.submit::<T>(x)", "submit"));
+    assert!(!calls_method("fn submit(x)", "submit"));
+    assert!(!calls_method("a.submit_and_record(x)", "submit"));
+    assert!(!calls_method("a.resubmit(x)", "submit"));
+    assert!(ident_positions("submit_and_record::<T>(x)", "submit_and_record").count() == 1);
+    assert!(ident_positions("resubmit_and_record", "submit_and_record").count() == 0);
 }
 
 #[test]
@@ -106,25 +269,42 @@ fn sources_are_found() {
             .any(|(p, _)| p == "crates/engine/src/trader.rs"),
         "crates/engine/src/trader.rs was not found by the source walk"
     );
+    assert!(
+        sources
+            .iter()
+            .any(|(p, _)| p.starts_with("ui/ext/nisse-native/src/")),
+        "ui/ext/nisse-native/src/ was not found by the source walk"
+    );
 }
 
 #[test]
 fn only_the_trader_submits_orders() {
     let sources = sources();
     assert_eq!(
-        files_containing(&sources, "submit_and_record("),
-        ["crates/engine/src/trader.rs"],
-        "submit_and_record( must be called only from the trader"
+        files_where(&sources, |t| ident_positions(t, "submit_and_record")
+            .next()
+            .is_some()),
+        [
+            "crates/engine/src/lib.rs",
+            "crates/engine/src/order_service.rs",
+            "crates/engine/src/trader.rs",
+        ],
+        "submit_and_record may appear only in the re-export, its definition and the trader"
     );
 }
 
 #[test]
 fn nothing_replaces_orders_outside_tests() {
     let sources = sources();
-    let found = files_containing(&sources, "replace_and_record(");
-    assert!(
-        found.is_empty(),
-        "replace_and_record( must not be called outside tests, found in {found:?}"
+    assert_eq!(
+        files_where(&sources, |t| ident_positions(t, "replace_and_record")
+            .next()
+            .is_some()),
+        [
+            "crates/engine/src/lib.rs",
+            "crates/engine/src/order_service.rs",
+        ],
+        "replace_and_record may appear only in the re-export and its definition"
     );
 }
 
@@ -136,11 +316,11 @@ fn only_the_gateway_layer_calls_the_broker_to_submit_or_replace() {
         "crates/engine/src/gateway.rs",
         "crates/engine/src/order_service.rs",
     ];
-    for needle in [".submit(", ".replace("] {
+    for name in ["submit", "replace"] {
         assert_eq!(
-            files_containing(&sources, needle),
+            files_where(&sources, |t| calls_method(t, name)),
             expected,
-            "callers of `{needle}` changed"
+            "callers of `{name}` changed"
         );
     }
 }
@@ -154,22 +334,25 @@ fn the_trader_checks_the_risk_gate_before_it_submits() {
         .expect("trader.rs is present");
 
     let check = "self.gate.check(";
-    let submit = "submit_and_record(";
+    let submit = "submit_and_record";
     assert_eq!(
         trader.matches(check).count(),
         1,
         "expected exactly one `{check}` in trader.rs"
     );
+    // The `use` of the function and its one call.
     assert_eq!(
-        trader.matches(submit).count(),
-        1,
-        "expected exactly one `{submit}` in trader.rs"
+        ident_positions(trader, submit).count(),
+        2,
+        "expected exactly two `{submit}` in trader.rs (the use and the call)"
     );
     let check_at = trader.find(check).expect("gate check present");
-    let submit_at = trader.find(submit).expect("submit present");
+    let submit_at = ident_positions(trader, submit)
+        .last()
+        .expect("submit present");
     assert!(
         check_at < submit_at,
-        "the risk gate check must come before submit_and_record("
+        "the risk gate check must come before the last `{submit}`"
     );
 }
 
@@ -183,7 +366,10 @@ fn only_the_broker_adapter_can_reach_the_network() {
     manifests.sort_by(|a, b| a.0.cmp(&b.0));
     let networked: Vec<&str> = manifests
         .iter()
-        .filter(|(_, text)| text.contains("reqwest") || text.contains("tungstenite"))
+        .filter(|(_, text)| {
+            text.lines()
+                .any(|line| NETWORK_CLIENTS.contains(&dependency_name(line.trim_start())))
+        })
         .map(|(name, _)| name.as_str())
         .collect();
     assert_eq!(
