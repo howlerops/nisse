@@ -491,6 +491,7 @@ fn the_tracking_gate_is_in_the_gate_report_so_the_report_can_leave_it_out() {
     let inputs = ReportInputs {
         version: StrategyVersionId(1),
         gates: gates(),
+        selection_trials: 0,
         lifetime_trials: 0,
         holdout_looks: 0,
         trials: Vec::new(),
@@ -503,8 +504,7 @@ fn the_tracking_gate_is_in_the_gate_report_so_the_report_can_leave_it_out() {
             gaps: Vec::new(),
             leading_skipped: 0,
             lag_sessions: 0,
-            same_experiment: true,
-            clean_build: true,
+            unusable: None,
             unreadable: false,
         }),
     };
@@ -522,6 +522,7 @@ fn the_holdout_gate_is_in_the_gate_report_so_the_report_can_leave_it_out() {
     let inputs = ReportInputs {
         version: StrategyVersionId(1),
         gates: gates(),
+        selection_trials: 0,
         lifetime_trials: 0,
         holdout_looks: 0,
         trials: Vec::new(),
