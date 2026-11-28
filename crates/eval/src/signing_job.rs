@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use nisse_core::signing::{Manifest, STAGE_PAPER, SigningKey, deployment_hash};
+use nisse_core::signing::{Manifest, STAGE_PAPER, SigningKey, VerifyKey, deployment_hash};
 
 use crate::EvalError;
 use crate::proposal::{
@@ -52,8 +52,8 @@ fn config_stem(config_path: &str) -> Result<&str, EvalError> {
 /// a config or note that is not a regular file (a symbolic link, say), a config that does not
 /// parse or whose name differs from its file stem, a change budget shared with another config
 /// (re-checked here, see [`budget_conflicts`]), a missing or malformed note, a build with
-/// uncommitted changes, an unknown (all-zero) commit, or a key that is not a valid hex key of at
-/// least `MIN_KEY_BYTES`.
+/// uncommitted changes, an unknown (all-zero) commit, or a key that is not exactly `KEY_BYTES`
+/// bytes of hex.
 pub fn sign_config(
     root: &Path,
     config_path: &str,
@@ -112,6 +112,12 @@ pub fn sign_config(
         STAGE_PAPER,
         signed_at,
     )?)
+}
+
+/// The public key matching the secret key `key_hex`: what the engine host is given
+/// (`NISSE_VERIFY_KEY`). It is not a secret.
+pub fn public_key(key_hex: &str) -> Result<VerifyKey, EvalError> {
+    Ok(SigningKey::from_hex(key_hex)?.verify_key())
 }
 
 /// `research/signed/<name>.manifest.json`.

@@ -20,7 +20,7 @@ pub enum CoreError {
     /// error: [`Self::BadSignature`]).
     #[error("invalid signing input: {0}")]
     InvalidSigning(String),
-    /// A manifest's MAC does not match its contents under the key given.
+    /// A manifest's signature does not verify its contents under the key given.
     #[error("the manifest's signature does not verify")]
     BadSignature,
 }

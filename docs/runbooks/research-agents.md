@@ -13,16 +13,15 @@ nothing in this repository starts an agent on its own.
   start and approve); an engine whose config says `"required": true` trades nothing without
   a valid signature.
 
-## Decide first
+## Decided, and still open
 
-1. **Where research lives.** It is in this (public) repository for now. To move it, create
-   the private repository, copy `research/` and the proposal-check job, and point the
-   agents' token at it.
-2. **Signature scheme.** The built one is a shared-key MAC: whoever can verify can also
-   sign. A public-key scheme needs one new dependency; say if you want it.
-3. **Where a proposal is evaluated.** The backtest and gates need the bar files and the
-   store, so hosted CI cannot run them. `scripts/evaluate-proposal.sh` runs them on the host.
-4. **Terms.** PLAN.md records that subscription-run research sits close to a clause in
+Decided on 2026-11-28 (PLAN.md, "Decisions"): research stays in this public repository; the
+signature is Ed25519; a proposal's backtest and gates run on the engine host
+(`scripts/evaluate-proposal.sh`), where the bar files and the store are, not in hosted CI.
+
+Still open:
+
+1. **Terms.** PLAN.md records that subscription-run research sits close to a clause in
    Anthropic's Consumer Terms. Re-read them, and the Commercial Terms, before moving to an
    API key.
 
@@ -32,28 +31,36 @@ nothing in this repository starts an agent on its own.
    protection (CLAUDE.md), so any token that can write to it can push to `main`. Create a
    fork under a separate account for the agents. Their token (step 5) can write to the
    fork only. A pull request from a fork is treated as an agent pull request by CI, with the
-   strictest rules. If research moves to its own repository, the same holds there.
-2. **Signing key.** Generate 32 random bytes as hex (`openssl rand -hex 32`). Put it in this
-   repository's Actions secrets as `NISSE_SIGNING_KEY` **in an environment named `signing`**,
-   and configure that environment with (a) deployment branches: `main` only, and (b) a
-   required reviewer: you. Both matter: the signing job runs the code on `main` with the key
-   in its environment, so every run must wait for you. Put the same key in
-   `/etc/nisse/nisse.env` on the engine host. It goes nowhere else, and never into a file in
-   this repository.
+   strictest rules.
+2. **Signing key.** Generate the secret key, 32 random bytes as hex
+   (`openssl rand -hex 32`), and print its public key with
+   `target/release/nisse-sign --public-key`, giving it the secret in the environment variable
+   `NISSE_SIGNING_KEY` without typing the value on a command line (for example
+   `read -rs NISSE_SIGNING_KEY && export NISSE_SIGNING_KEY`, and close that shell after).
+   Use a fresh value: never reuse a key from the earlier shared-key scheme, and if a host
+   was set up under it, delete `NISSE_SIGNING_KEY` from its `/etc/nisse/nisse.env`. Put the secret in
+   this repository's Actions secrets as `NISSE_SIGNING_KEY` **in an environment named
+   `signing`**, and configure that environment with (a) deployment branches: `main` only,
+   and (b) a required reviewer: you. Both matter: the signing job runs the code on `main`
+   with the key in its environment, so every run must wait for you. The secret goes nowhere
+   else: not on the engine host, and never into a file in this repository. Put the
+   **public** key in `/etc/nisse/nisse.env` on the engine host as `NISSE_VERIFY_KEY`. It is
+   not a secret; a host that holds only it can check a manifest but cannot make one.
 3. **Sign.** After you have merged a config, start the "Sign research configs" workflow by
    hand on `main` and approve its run. It never starts by itself. It refuses a config that
    is within 30 days of another of the same family or strategy kind. Copy the manifest it
    prints to `research/signed/<name>.manifest.json` on the host.
-4. **Require it.** Set `"required": true` in the engine config's `signature` block on the
-   host. From then on `tick` and `session-close` exit 2 without a valid manifest.
+4. **Require it.** As soon as the first manifest is on the host, set `"required": true` in
+   the engine config's `signature` block (decided 2026-11-28: the paper engine runs unsigned
+   only until the key exists). From then on `tick` and `session-close` exit 2 without a valid manifest.
 5. **Token.** A fine-grained GitHub token for the agents' account with: contents read and
    write on **the fork only**; pull requests read and write on this repository (to open the
    pull request); nothing else. It must not have contents write on this repository.
 6. **Agent report.** Add to the host's crontab, after the scoring job:
    `deploy/run.sh report target/release/nisse-agent-report config/eval/gates.json research/configs/trend-v1.json data/bars data/agent-report.json`.
-   How the file reaches the agents (a private gist, a bucket, a commit to a private
-   repository) depends on decision 1 under "Decide first"; it must not be committed to a
-   public repository.
+   Research is public, the report is not: give it to the agents through something private
+   (a private repository or an access-controlled bucket; a "secret" gist is only unlisted, not
+   private) and never commit it to this repository or the fork.
 7. **Scheduled tasks.** Create three Claude Code scheduled tasks, each starting a fresh
    session, each given the matching file from `research/agents/` as its instructions and
    the token from step 5: pre-market (before 13:30 UTC on weekdays), post-close (after the
@@ -108,4 +115,5 @@ the kill switch (`deploy/engine.sh kill --by <name>`), make the change, check wi
 A manifest does not expire, and the engine checks only that it signs the deployment the
 engine's config describes. To retire a signed config, remove its manifest from the host (and
 point the engine config's `signature.manifest` at the one you want); to retire every
-manifest at once, change the key.
+manifest at once, change the key pair (a new secret in the `signing` environment, its public
+key on the host).

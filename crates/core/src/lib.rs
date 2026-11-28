@@ -11,6 +11,8 @@ mod clock;
 mod error;
 mod hash;
 mod ids;
+#[cfg(feature = "logging")]
+pub mod logging;
 mod order;
 mod record;
 pub mod signing;

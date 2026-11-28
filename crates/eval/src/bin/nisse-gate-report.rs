@@ -19,6 +19,7 @@ const USAGE: &str = "usage: nisse-gate-report <strategy_version_id> <gates.json>
 
 #[tokio::main]
 async fn main() {
+    nisse_core::logging::init();
     match run().await {
         Ok(code) => std::process::exit(code),
         Err(err) => {

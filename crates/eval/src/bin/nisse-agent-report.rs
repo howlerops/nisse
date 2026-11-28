@@ -21,6 +21,7 @@ const USAGE: &str = "usage: nisse-agent-report <gates.json> <research-config.jso
 
 #[tokio::main]
 async fn main() {
+    nisse_core::logging::init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let [gates_path, config_path, bars_dir, out_path] = args.as_slice() else {
         eprintln!("{USAGE}");

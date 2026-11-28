@@ -52,8 +52,12 @@ not worked around:
 
 1. **Finish the right-hand column above.** The paper run's write-up is the evidence that
    the plumbing is clean; the gate report on real trials is the evidence about the strategy.
-2. **Decide the account**: taxable or IRA (check with a tax professional; PLAN.md notes
-   short-term gains and wash-sale windows on one side, and that an IRA avoids both).
+2. **Choose the account to fund first.** Both a taxable account and an IRA are to be
+   supported (decided 2026-11-28); nothing in the code is specific to either today. Which
+   one is funded first is still a choice to make with a tax professional: PLAN.md notes
+   short-term gains and wash-sale windows on one side, and that an IRA avoids both. If the
+   two are ever run at once, each needs its own engine config, limits file and store rows
+   keyed by account, which is unbuilt.
 3. **The promotion decision.** `nisse-gate-report` must show every gate except `tracking`
    passing for the champion's strategy version, including the one deliberate look at the
    holdout. If it does not, there is no live phase yet. The tracking gate cannot pass
@@ -77,18 +81,18 @@ not worked around:
    - the same kill switch, watcher and dead-man check as paper, rehearsed on paper first.
    - a `live` row in `trial_registry` for the live run: only the backtest job registers
      trials today, and the paper engine registers none.
-   Proposed rule, stricter than CLAUDE.md's rule for build-phase pull requests and not yet
-   written there: the owner merges this one, not Claude, and it is not a change an agent
-   proposes. With no branch protection, that rule is a convention until the owner adds it.
+   It is merged under the same rule as the other build phases (decided 2026-11-28): the
+   Claude lead may merge it after the independent review and green CI, with every change
+   under a sensitive path called out. It is never a change a research agent proposes.
 6. **Fund with a small amount**; swing holding periods only; live credentials on the engine
    host and nowhere else.
 7. **Monthly review** against the band; zero risk breaches; size doubles no faster than
    about every six months and only while in band.
 
-## Open design question: challengers in shadow
+## Challengers in shadow
 
-The issue asks for "challengers in shadow (decisions logged, no orders)". Two ways to do it,
-with a real trade-off, so it is the owner's call before anything is built:
+The issue asks for "challengers in shadow (decisions logged, no orders)". Two ways to do it
+were weighed; the owner chose B on 2026-11-28. Nothing of it is built yet.
 
 - **A. A nightly backtest.** Each evening, run the challenger through the backtest job
   over the bar file up to today and store the last session's decisions. It needs no second
@@ -109,13 +113,13 @@ with a real trade-off, so it is the owner's call before anything is built:
   the lifetime budget, so the choice is one `shadow` trial per challenger version when its
   shadow run starts, or one per session. None is not allowed by CLAUDE.md.
 
-Recommendation: B, registering one `shadow` trial per challenger version when its shadow
-run starts. A's obstacles are the holdout and the budget themselves; B's are bookkeeping.
+Decided: B, registering one `shadow` trial per challenger version when its shadow run
+starts. A's obstacles are the holdout and the budget themselves; B's are bookkeeping.
 
 ## The owner's
 
-Everything in "Order of work", the shadow decision, and whether to adopt the merge rule
-proposed in step 5. Nothing in this repository can trade real money today; changing that
-takes the pull request described in step 5.
+Everything in "Order of work" that needs an account, money, credentials or time. Nothing in
+this repository can trade real money today; changing that takes the pull request described
+in step 5.
 
 Nothing here is investment advice.

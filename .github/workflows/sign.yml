@@ -1,6 +1,6 @@
 # Signs the research configs on main. Started by hand only (never by a push and never by a
-# pull request), and only on main. The key is the secret NISSE_SIGNING_KEY of the environment
-# "signing". In the repository settings that environment must (1) be restricted to the main
+# pull request), and only on main. The secret key (Ed25519) is the secret NISSE_SIGNING_KEY
+# of the environment "signing"; the engine host holds only the matching public key. In the repository settings that environment must (1) be restricted to the main
 # branch and (2) have a required reviewer, so that every run waits for a person: this job
 # builds and runs the code on main with the key in its environment, and whoever approves the
 # run is vouching for what is on main at that moment.

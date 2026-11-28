@@ -158,7 +158,7 @@ Promote on statistical evidence across the whole trial history, never on paper o
 - Risk limits live outside the agent-writable repo in production; `config/limits/limits.json` is the reviewed default, and the code refuses a file looser than its fixed ceilings.
 - A human merges every PR.
 
-Built in Phase 7 ([`docs/phases/phase-7.md`](docs/phases/phase-7.md)): research lives under `research/` in this repository until the public-or-private question is decided; the signature is a shared-key MAC (HMAC-SHA256) until a public-key scheme, which needs a new dependency, is approved; hosted CI checks a proposal's shape and budget, while the backtest and gates run where the bar files and the store are (`scripts/evaluate-proposal.sh`).
+Built in Phase 7 ([`docs/phases/phase-7.md`](docs/phases/phase-7.md)): research lives under `research/` in this public repository (decided 2026-11-28); the signature is Ed25519 (decided 2026-11-28): the signing workflow holds the secret key and the engine host only the public one; hosted CI checks a proposal's shape and budget, while the backtest and gates run where the bar files and the store are (`scripts/evaluate-proposal.sh`).
 
 ## Risk controls and capital ramp
 
@@ -206,14 +206,31 @@ Intraday is out of scope unless a gated strategy needs it. The day-trade limit s
 
 ## Open questions
 
-- [ ] Market data: free IEX feed or the $99/month SIP plan; decide before backtesting.
+- [x] Market data: the free IEX feed (decided 2026-11-28). `feed` stays a config value, so moving to SIP later is a config change plus a re-download of the bars.
 - [ ] Whether Alpaca fractional orders can be limit orders (Alpaca docs disagree); test in paper.
 - [x] NautilusTrader pinned at `0.68.0` (Phase 0). Licence decided 2026-11-26: this repo's own code is MIT. NautilusTrader stays a separate `LGPL-3.0-only` dependency that this repo does not relicense; its terms apply to that library if a built binary is ever given to someone else.
 - [ ] Confirm Native Shell can read Postgres through a Rust module before building screens. Phase 8: confirmed on the build machine (the app's Rust module reads and writes a real Postgres in headless tests); **not** yet confirmed on a phone, where the device build has never been made.
 - [ ] Whether Anthropic's Commercial Terms or Usage Policy carry a securities clause like the Consumer Terms; read before moving agents to an API key.
-- [ ] Taxable account or IRA.
+- [x] Taxable account or IRA: support both (decided 2026-11-28). Nothing in the code is specific to an account type today; which account is funded first is still the owner's choice, with a tax professional, before Phase 9.
 - [ ] Alpaca reliability (repeated incidents in 2026): keep our own ledger and reconcile from fills.
-- [ ] This repo is public: decide whether strategy configs and research notes should live in a separate private repo.
+- [x] Research stays public, in this repository (decided 2026-11-28). The agents' report file is the exception: it must not be committed anywhere public (`docs/runbooks/research-agents.md`).
+
+## Decisions (2026-11-28)
+
+Made by the owner; the documents named carry the detail.
+
+| Question | Decision |
+|---|---|
+| Market data feed | IEX |
+| Research repository | Public (this repository; agents work from a public fork) |
+| Where a proposal is evaluated | On the engine host (`scripts/evaluate-proposal.sh`), not in hosted CI |
+| Unsigned paper engine | Runs unsigned until the signing key exists; then `"required": true` is set and it refuses |
+| Phone to Postgres | Private network (VPN or SSH tunnel); no TLS dependency |
+| Signature scheme | Ed25519 (`ed25519-dalek`), replacing the shared-key MAC |
+| Engine logs | `tracing-subscriber`, plain lines on standard error |
+| Shadow challengers | A second engine with a simulated broker; one `shadow` trial per challenger version |
+| Who merges the change that adds live | Same rule as build phases (CLAUDE.md): the Claude lead may, after the independent review and green CI |
+| Account type | Both taxable and IRA are to be supported |
 
 ## Sources
 

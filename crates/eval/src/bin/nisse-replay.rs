@@ -19,6 +19,7 @@ fn registry(params: &Value) -> Result<Box<dyn Strategy>, EvalError> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    nisse_core::logging::init();
     let url =
         std::env::var("DATABASE_URL").map_err(|_| anyhow::anyhow!("DATABASE_URL is not set"))?;
     // Deliberately not printed: the URL may contain a password.

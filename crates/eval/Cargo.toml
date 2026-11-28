@@ -17,7 +17,7 @@ rust_decimal = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 nisse-bars = { workspace = true }
-nisse-core = { workspace = true }
+nisse-core = { workspace = true, features = ["logging"] }
 nisse-engine = { workspace = true }
 nisse-risk = { workspace = true }
 nisse-store = { workspace = true }

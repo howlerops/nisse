@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use nisse_core::CoreError;
-use nisse_core::signing::{SigningKey, deployment_hash};
+use nisse_core::signing::{SigningKey, VerifyKey, deployment_hash};
 use nisse_eval::EvalError;
 use nisse_eval::signing_job::{manifest_path, sign_config};
 use serde_json::Value;
@@ -76,8 +76,9 @@ impl Drop for Tree {
     }
 }
 
-fn key(text: &str) -> SigningKey {
-    SigningKey::from_hex(text).unwrap()
+/// The public key matching the secret key `text`.
+fn key(text: &str) -> VerifyKey {
+    SigningKey::from_hex(text).unwrap().verify_key()
 }
 
 /// Signs the valid tree's config with the fixture key and a clean build.
@@ -137,7 +138,7 @@ fn signs_the_repository_config() {
 }
 
 #[test]
-fn the_manifest_verifies_only_under_the_same_key() {
+fn the_manifest_verifies_only_under_the_matching_public_key() {
     let tree = Tree::valid();
     let manifest = sign_valid(tree.path()).unwrap();
 
@@ -263,7 +264,7 @@ fn refuses_a_short_key() {
     let result = sign_config(tree.path(), CONFIG_PATH, &short, SHA, true, SIGNED_AT);
     match refusal(result) {
         EvalError::Core(CoreError::InvalidSigning(message)) => {
-            assert!(message.contains("at least"), "{message}");
+            assert!(message.contains("exactly 32 bytes"), "{message}");
             assert!(!message.contains(&short));
         }
         other => panic!("expected a core signing error, got {other:?}"),
@@ -393,4 +394,15 @@ fn refuses_a_symlinked_note() {
     tree.write("research/elsewhere/note.md", NOTE);
     tree.link("research/notes/trend-v1.md", "../elsewhere/note.md");
     assert_invalid_proposal(sign_valid(tree.path()), "is not a regular file");
+}
+
+#[test]
+fn public_key_is_the_key_that_verifies_the_manifest() {
+    let tree = Tree::valid();
+    let manifest = sign_valid(tree.path()).unwrap();
+    let public = nisse_eval::signing_job::public_key(KEY).unwrap();
+    assert_eq!(public, key(KEY));
+    // What the host is given is the printed form.
+    let parsed = VerifyKey::from_hex(&public.to_string()).unwrap();
+    manifest.verify(&parsed).unwrap();
 }

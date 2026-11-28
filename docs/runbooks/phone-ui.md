@@ -20,8 +20,9 @@ must be running: it is a line in `deploy/crontab`. For an immediate and complete
 
 **How the phone reaches Postgres.** The app does not encrypt its connection. Use a private
 network: a VPN between the phone and the host (WireGuard, Tailscale), or an SSH tunnel. Do
-not open the database to the internet for this. If you would rather have TLS, say so: it
-needs one new dependency in the app's Rust module.
+not open the database to the internet for this. Decided 2026-11-28: private network, no TLS
+in the app. TLS would be a later change: it needs one new dependency in the app's Rust
+module.
 
 ## Set up
 

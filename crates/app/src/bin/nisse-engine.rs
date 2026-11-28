@@ -15,7 +15,8 @@
 //! - `APCA_API_KEY_ID` and `APCA_API_SECRET_KEY`: the Alpaca paper keys. Read by `session-close`,
 //!   `tick`, `kill` and `kill-watch` only;
 //!   `status` and `release-kill` need neither.
-//! - `NISSE_SIGNING_KEY`: the signing key as hex. Read by `session-close` and `tick` only, and
+//! - `NISSE_VERIFY_KEY`: the public verification key as hex (not a secret; the secret signing
+//!   key is never on this host). Read by `session-close` and `tick` only, and
 //!   only when the config requires a signature (`signature.required`).
 //!
 //! `kill-watch` runs every minute: with the switch off it reads one row and asks the broker for
@@ -35,7 +36,7 @@ use nisse_app::{
     AppError,
     commands::{self, Command, USAGE},
     config::EngineConfig,
-    deployment::{Deployment, ENV_SIGNING_KEY, verify_deployment},
+    deployment::{Deployment, ENV_VERIFY_KEY, verify_deployment},
     kill_watch::{flatten_on_kill, watch_once},
     market::AlpacaMarket,
     restore::wait_for_engine_lock,
@@ -53,6 +54,7 @@ const ENGINE_LOCK_WAIT: Duration = Duration::from_secs(45);
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    nisse_core::logging::init();
     let command = match Command::parse(std::env::args().skip(1)) {
         Ok(command) => command,
         Err(message) => {
@@ -79,7 +81,7 @@ async fn main() -> ExitCode {
     // Trading commands refuse a deployment that its config requires to be signed, before any
     // client or store connection is made.
     if matches!(command, Command::Tick { .. } | Command::SessionClose { .. }) {
-        let key = std::env::var(ENV_SIGNING_KEY).ok();
+        let key = std::env::var(ENV_VERIFY_KEY).ok();
         match verify_deployment(&config, key.as_deref()) {
             Ok(deployment) => println!("{}", describe_deployment(&deployment)),
             Err(err) => {

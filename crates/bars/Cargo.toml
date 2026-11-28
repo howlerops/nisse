@@ -15,7 +15,7 @@ workspace = true
 anyhow = { workspace = true }
 chrono = { workspace = true }
 duckdb = { workspace = true }
-nisse-core = { workspace = true }
+nisse-core = { workspace = true, features = ["logging"] }
 rust_decimal = { workspace = true }
 thiserror = { workspace = true }
 nisse-alpaca-adapter = { workspace = true }
