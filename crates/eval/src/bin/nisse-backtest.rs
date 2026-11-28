@@ -1,45 +1,56 @@
 //! `nisse-backtest`: runs the backtest described by a JSON config file and stores the result.
 //!
-//! Usage: `nisse-backtest <config.json> [--allow-dirty] [--holdout]`. Reads `DATABASE_URL`, which
-//! is never printed (it may hold a password). Exits 2 on bad arguments. The logic is in
-//! `nisse_eval::backtest_job`.
+//! Usage: `nisse-backtest <config.json> [--allow-dirty] [--holdout | --tracking]`. Reads
+//! `DATABASE_URL`, which is never printed (it may hold a password). Exits 2 on bad arguments.
+//! The logic is in `nisse_eval::backtest_job`.
 //!
 //! `--holdout` marks the run as a deliberate, counted look at the holdout period. The holdout
 //! has a limited number of looks (`holdout_max_looks` in the gates file); an ordinary run may
 //! not reach into it.
+//!
+//! `--tracking` runs the backtest of a strategy config the engine has traded, over the same days
+//! as the engine's results, so the tracking gate can compare the two. It is not a holdout look,
+//! and nothing that selects or judges a strategy sees it. `--holdout` and `--tracking` together
+//! are refused.
 
 use anyhow::Context;
 use nisse_core::{Clock, SystemClock};
 use nisse_eval::backtest_job::{BacktestJob, RunOptions, run_backtest_job};
 use nisse_store::Store;
 
-const USAGE: &str = "usage: nisse-backtest <config.json> [--allow-dirty] [--holdout]";
+const USAGE: &str = "usage: nisse-backtest <config.json> [--allow-dirty] [--holdout | --tracking]";
 
-/// The config path, the `--allow-dirty` flag and the `--holdout` flag, or `None` for any other
-/// arguments.
-fn parse_args(args: &[String]) -> Option<(&str, bool, bool)> {
+/// The config path, the `--allow-dirty` flag, the `--holdout` flag and the `--tracking` flag, or
+/// `None` for any other arguments, or for `--holdout` and `--tracking` together.
+fn parse_args(args: &[String]) -> Option<(&str, bool, bool, bool)> {
     let mut path = None;
     let mut allow_dirty = false;
     let mut holdout = false;
+    let mut tracking = false;
     for arg in args {
         if arg == "--allow-dirty" {
             allow_dirty = true;
         } else if arg == "--holdout" {
             holdout = true;
+        } else if arg == "--tracking" {
+            tracking = true;
         } else if path.is_none() && !arg.starts_with('-') {
             path = Some(arg.as_str());
         } else {
             return None;
         }
     }
-    path.map(|path| (path, allow_dirty, holdout))
+    if holdout && tracking {
+        return None;
+    }
+    path.map(|path| (path, allow_dirty, holdout, tracking))
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     nisse_core::logging::init();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let Some((path, allow_dirty, holdout)) = parse_args(&args) else {
+    let Some((path, allow_dirty, holdout, tracking)) = parse_args(&args) else {
         eprintln!("{USAGE}");
         std::process::exit(2);
     };
@@ -58,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
         replayable: nisse_engine::build_is_replayable(),
         allow_dirty,
         holdout,
+        tracking,
     };
     let outcome = run_backtest_job(&store, &job, options, SystemClock.now()).await?;
 

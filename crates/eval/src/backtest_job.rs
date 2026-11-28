@@ -141,6 +141,10 @@ pub struct RunOptions {
     pub allow_dirty: bool,
     /// A deliberate, counted look at the holdout period. Ordinary runs must stay before it.
     pub holdout: bool,
+    /// A tracking run: the backtest the tracking gate compares the engine's results with. Allowed
+    /// only for a strategy config the engine has traded; may read the holdout period without
+    /// being a look; never shown to anything that selects or judges a strategy.
+    pub tracking: bool,
 }
 
 /// What a finished job reports.
@@ -159,21 +163,34 @@ pub struct JobOutcome {
 ///    error; nothing has been written yet.
 /// 4. The holdout rule. An ordinary run whose last bar is on or after the holdout boundary is
 ///    `HoldoutTouched`. A holdout run must start before the boundary (its warm-up is ordinary
-///    history) and must reach it, else `InvalidJob`. Nothing is written in these.
+///    history) and must reach it, else `InvalidJob`. Nothing is written in these. A tracking run
+///    skips the `HoldoutTouched` refusal: the engine trades the holdout period, so the tracking
+///    run may reach past the boundary.
 /// 5. A holdout run takes `HOLDOUT_LOCK` (or is refused as busy), then checks its looks against
-///    `holdout_max_looks` (`HoldoutRetired`, nothing written). Ordinary runs take no lock.
-/// 6. Ensure the strategy version and register the trial, before the run. A holdout run is
-///    marked in its registered result, so the look counts even if the run then fails. The
-///    holdout lock is released after registration, and on every refusal between taking it and
-///    registering.
+///    `holdout_max_looks` (`HoldoutRetired`, nothing written). Ordinary and tracking runs take
+///    no lock and do not check looks.
+/// 6. Ensure the strategy version and register the trial, before the run. A tracking run must
+///    have a `live` trial for its config (`live_start`) and its last bar must be on or after the
+///    engine's first session; otherwise `InvalidJob`. The strategy version is ensured before
+///    these checks, so a refused tracking run may leave a `strategy_version` row, but no trial.
+///    A holdout run is marked in its registered result, so the look counts even if the run then
+///    fails. A tracking run is marked `{"tracking": true}`. The holdout lock is released after
+///    registration, and on every refusal between taking it and registering.
 /// 7. Run the backtest. On failure the trial stays registered with no result.
-/// 8. Store the result.
+/// 8. Store the result. It carries `"tracking"`; a tracking run also carries `"session_dates"`,
+///    one `YYYY-MM-DD` per entry of `"returns"`, so the report can line the series up by date.
+///    `"holdout_sessions"` is counted only for a holdout run, and is 0 otherwise.
 pub async fn run_backtest_job(
     store: &Store,
     job: &BacktestJob,
     options: RunOptions,
     now: UnixNanos,
 ) -> Result<JobOutcome, EvalError> {
+    if options.holdout && options.tracking {
+        return Err(EvalError::InvalidJob(
+            "a run is either a holdout run or a tracking run, not both".to_owned(),
+        ));
+    }
     if !options.replayable && !options.allow_dirty {
         return Err(EvalError::DirtyBuild);
     }
@@ -239,7 +256,7 @@ pub async fn run_backtest_job(
                 "a holdout run must reach into the holdout period".to_owned(),
             ));
         }
-    } else if last_session.as_u64() >= boundary.as_u64() {
+    } else if !options.tracking && last_session.as_u64() >= boundary.as_u64() {
         return Err(EvalError::HoldoutTouched(format!(
             "the holdout starts {}, but the bars run to {}",
             gates.holdout_start_text(),
@@ -286,6 +303,7 @@ pub async fn run_backtest_job(
             (data_start, data_end),
             options,
             gates.holdout_max_looks,
+            last_session,
             now,
         )
         .await;
@@ -300,6 +318,7 @@ pub async fn run_backtest_job(
             (data_start, data_end),
             options,
             gates.holdout_max_looks,
+            last_session,
             now,
         )
         .await?
@@ -323,18 +342,24 @@ pub async fn run_backtest_job(
     let summary = metrics::summarize(&run.equity_curve, built.sessions_per_year)
         .map_or(Value::Null, |summary| summary.to_json());
     let (returns, returns_complete) = returns_json(&run.equity_curve);
-    // Zero for an ordinary run, which is refused when its last bar reaches the boundary. For a
-    // holdout run the first session is before the boundary, so this is at most `returns.len()`.
-    let holdout_sessions = run
-        .equity_curve
-        .iter()
-        .filter(|point| point.0.as_u64() >= boundary.as_u64())
-        .count();
-    let result = json!({
+    // Counted for a holdout run only. Zero for every other run: an ordinary run is refused when
+    // its last bar reaches the boundary, so none of its sessions is in the holdout, and a tracking
+    // run is not a holdout run. A holdout run's first session is before the boundary, so this is
+    // at most `returns.len()`.
+    let holdout_sessions = if options.holdout {
+        run.equity_curve
+            .iter()
+            .filter(|point| point.0.as_u64() >= boundary.as_u64())
+            .count()
+    } else {
+        0
+    };
+    let mut result = json!({
         "summary": summary,
         "returns": returns,
         "returns_complete": returns_complete,
         "holdout": options.holdout,
+        "tracking": options.tracking,
         "holdout_start": gates.holdout_start_text(),
         "holdout_sessions": holdout_sessions,
         "git_sha": GIT_SHA,
@@ -367,6 +392,11 @@ pub async fn run_backtest_job(
         "limits_hash": limits_hash,
         "limits": limits_json,
     });
+    if options.tracking
+        && let Some(object) = result.as_object_mut()
+    {
+        object.insert("session_dates".to_owned(), session_dates(&run.equity_curve));
+    }
     trial_result::insert(store.client(), trial_id, &result, now).await?;
 
     Ok(JobOutcome {
@@ -376,15 +406,20 @@ pub async fn run_backtest_job(
     })
 }
 
-/// The look-count check (a holdout run only), then the strategy version and the trial. A holdout
-/// run is refused here, before anything is written, once `max_looks` looks exist. Returns the
-/// strategy version id and the trial id. The caller holds `HOLDOUT_LOCK` across this call.
+/// The look-count check (a holdout run only), then the strategy version, the tracking check (a
+/// tracking run only) and the trial. A holdout run is refused here, before anything is written,
+/// once `max_looks` looks exist. A tracking run is refused when its config has no `live` trial
+/// (`live_start` is `None`) or when `last_session` is before the engine's first session; both
+/// refusals happen after the strategy version is ensured, so they may leave that row, but never
+/// a trial. Returns the strategy version id and the trial id. The caller holds `HOLDOUT_LOCK`
+/// across this call when the run is a holdout run.
 async fn register_trial(
     store: &Store,
     version: &StrategyVersion,
     span: (UnixNanos, UnixNanos),
     options: RunOptions,
     max_looks: u32,
+    last_session: UnixNanos,
     now: UnixNanos,
 ) -> Result<(StrategyVersionId, i64), EvalError> {
     if options.holdout {
@@ -397,12 +432,34 @@ async fn register_trial(
         }
     }
     let strategy_version_id = store.ensure_strategy_version(version).await?;
+    if options.tracking {
+        match trial_registry::live_start(store.client(), strategy_version_id, None).await? {
+            None => {
+                return Err(EvalError::InvalidJob(
+                    "a tracking run needs a strategy config the engine has traded: no live trial is registered for it"
+                        .to_owned(),
+                ));
+            }
+            Some(start) if last_session.as_u64() < start.as_u64() => {
+                return Err(EvalError::InvalidJob(
+                    "a tracking run must reach the engine's first session: the bars end before it"
+                        .to_owned(),
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    let registered_result = if options.tracking {
+        Some(json!({"tracking": true}))
+    } else {
+        options.holdout.then(|| json!({"holdout": true}))
+    };
     let trial = Trial {
         strategy_version_id,
         kind: TrialKind::Backtest,
         data_start: span.0,
         data_end: span.1,
-        result: options.holdout.then(|| json!({"holdout": true})),
+        result: registered_result,
         ts: now,
     };
     let trial_id = trial_registry::insert(store.client(), &trial).await?;
@@ -434,6 +491,18 @@ fn returns_json(curve: &[(UnixNanos, Decimal)]) -> (Value, bool) {
         returns.push(number.map_or(Value::Null, Value::Number));
     }
     (Value::Array(returns), complete)
+}
+
+/// The UTC date of each return's session, as `YYYY-MM-DD`: one per session after the first, in
+/// the order of `returns_json`.
+fn session_dates(curve: &[(UnixNanos, Decimal)]) -> Value {
+    Value::Array(
+        curve
+            .iter()
+            .skip(1)
+            .map(|point| Value::String(date_text(point.0)))
+            .collect(),
+    )
 }
 
 /// The UTC date of a bar's timestamp, as `YYYY-MM-DD`.
