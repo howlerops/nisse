@@ -52,6 +52,13 @@ const LIVE_ENVIRONMENT: &str = "live";
 /// The environment the tracking gate falls back to when the live environment has no equity rows.
 const PAPER_ENVIRONMENT: &str = "paper";
 
+/// Fewest paired sessions the tracking gate judges. Two flat series a few days long would
+/// otherwise pass.
+pub const MIN_TRACKING_SESSIONS: usize = 20;
+
+/// Most equity rows after a tracking run's last session before the run is too old to judge by.
+pub const MAX_TRACKING_LAG_SESSIONS: usize = 5;
+
 /// The verdict on one gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateStatus {
@@ -244,10 +251,31 @@ pub struct ReportInputs {
     /// Orders of this version sent beyond the intent. Zero means the risk gate has nothing to
     /// judge.
     pub sent_orders: u64,
-    /// Live and backtest daily returns over the same sessions (see [`pair_tracking`]). `None`
-    /// when there is no tracking run or nothing to compare yet. Two empty vectors when the
-    /// series cannot be compared: the tracking gate then says it could not be computed.
-    pub live: Option<(Vec<f64>, Vec<f64>)>,
+    /// What the tracking gate judges. `None` when there is no tracking run or fewer than two
+    /// equity rows (see [`load_inputs`]).
+    pub live: Option<TrackingInput>,
+}
+
+/// What the tracking gate judges: the engine's daily returns and a tracking run's over the same
+/// sessions, and what is needed to say whether the comparison is sound.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrackingInput {
+    /// `paper` or `live`: whose equity was read.
+    pub environment: &'static str,
+    /// The paired returns (equal lengths, session by session). Empty when nothing could be paired.
+    pub live: Vec<f64>,
+    pub backtest: Vec<f64>,
+    /// First and last paired session. `None` when nothing was paired.
+    pub span: Option<(NaiveDate, NaiveDate)>,
+    /// The newest session that the tracking run has and the equity series lacks (or the reverse),
+    /// if any: sessions up to it are left out of the comparison.
+    pub gap: Option<NaiveDate>,
+    /// Equity rows dated after the tracking run's last session.
+    pub lag_sessions: usize,
+    /// Whether the tracking run has the same inputs as the version's candidate backtest.
+    pub same_experiment: bool,
+    /// Why the series could not be read at all (a malformed or incomplete tracking result).
+    pub unreadable: bool,
 }
 
 /// The report for one strategy version.
@@ -332,10 +360,12 @@ pub fn build_report(inputs: &ReportInputs) -> GateReport {
     }
 }
 
-/// Loads the inputs for `version` from the store. The live returns come from the daily equity
-/// (the `live` environment's rows if it has any, else `paper`'s) and the newest tracking run
-/// (see [`pair_tracking`]). A tracking run whose result is incomplete or malformed gives two
-/// empty series, so the tracking gate says it could not be computed.
+/// Loads the inputs for `version` from the store. The tracking input (see [`TrackingInput`])
+/// compares the daily equity (the `live` environment's rows if it has any, else `paper`'s) with
+/// the newest tracking run, paired by [`pair_tracking`]. It is `None` when there is no tracking
+/// run or fewer than two equity rows. A tracking run whose result is incomplete or malformed
+/// gives `unreadable: true`, so the tracking gate says it could not be computed. The candidate
+/// is found from the trials already loaded, not queried again.
 pub async fn load_inputs<C: GenericClient>(
     client: &C,
     version: StrategyVersionId,
@@ -343,7 +373,7 @@ pub async fn load_inputs<C: GenericClient>(
 ) -> Result<ReportInputs, EvalError> {
     let lifetime = trial_registry::lifetime_count(client).await?;
     let holdouts = trial_registry::holdout_count(client).await?;
-    let trials = scoring::backtest_results(client)
+    let trials: Vec<TrialSeries> = scoring::backtest_results(client)
         .await?
         .iter()
         .map(TrialSeries::from_stored)
@@ -351,20 +381,23 @@ pub async fn load_inputs<C: GenericClient>(
     let (failed, scored) = scoring::replay_failures(client, version).await?;
     let breaches = scoring::risk_breaches(client, version, GATE_RULES).await?;
     let sent = scoring::sent_orders(client, version).await?;
-    let equity = {
+    let (environment, equity) = {
         let live = account_equity::daily(client, version, LIVE_ENVIRONMENT).await?;
         if live.is_empty() {
-            account_equity::daily(client, version, PAPER_ENVIRONMENT).await?
+            let paper = account_equity::daily(client, version, PAPER_ENVIRONMENT).await?;
+            (PAPER_ENVIRONMENT, paper)
         } else {
-            live
+            (LIVE_ENVIRONMENT, live)
         }
     };
     let live = match scoring::tracking_result(client, version).await? {
         None => None,
-        Some(run) => match tracking_series(&run.result) {
-            Some((dates, returns)) => pair_tracking(&equity, &dates, &returns),
-            None => uncomparable(),
-        },
+        Some(run) => tracking_input(
+            &run,
+            environment,
+            &equity,
+            newest_candidate(&trials, version),
+        ),
     };
     Ok(ReportInputs {
         version,
@@ -376,6 +409,49 @@ pub async fn load_inputs<C: GenericClient>(
         risk_breaches: count(breaches)?,
         sent_orders: count(sent)?,
         live,
+    })
+}
+
+/// The tracking input of one tracking run against the equity of `environment`. `None` when there
+/// are fewer than two equity rows. `candidate` is the version's candidate trial, if any.
+fn tracking_input(
+    run: &TrialWithResult,
+    environment: &'static str,
+    equity: &[(NaiveDate, Decimal)],
+    candidate: Option<&TrialSeries>,
+) -> Option<TrackingInput> {
+    if equity.len() < 2 {
+        return None;
+    }
+    let same_experiment = candidate.is_some_and(|c| same_inputs(c, &TrialSeries::from_stored(run)));
+    let parsed = tracking_series(&run.result);
+    // Every equity row is newer than a run with no session at all.
+    let lag_sessions = match parsed.as_ref().and_then(|(dates, _)| dates.last()) {
+        Some(last) => equity.iter().filter(|(day, _)| day > last).count(),
+        None => equity.len(),
+    };
+    let (live, backtest, span, gap, unreadable) = match parsed {
+        None => (Vec::new(), Vec::new(), None, None, true),
+        Some((dates, returns)) => {
+            let pairing = pair_tracking(equity, &dates, &returns)?;
+            (
+                pairing.live,
+                pairing.backtest,
+                pairing.span,
+                pairing.gap,
+                pairing.malformed,
+            )
+        }
+    };
+    Some(TrackingInput {
+        environment,
+        live,
+        backtest,
+        span,
+        gap,
+        lag_sessions,
+        same_experiment,
+        unreadable,
     })
 }
 
@@ -395,79 +471,139 @@ fn tracking_series(result: &Value) -> Option<(Vec<NaiveDate>, Vec<f64>)> {
     Some((dates, returns))
 }
 
+/// The paired returns of a tracking run and the equity series, as [`pair_tracking`] gives them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrackingPairing {
+    /// The engine's returns, one per paired session, ascending.
+    pub live: Vec<f64>,
+    /// The tracking run's returns for the same sessions.
+    pub backtest: Vec<f64>,
+    /// First and last paired session. `None` when nothing was paired.
+    pub span: Option<(NaiveDate, NaiveDate)>,
+    /// The newest session the two series do not both have, if any.
+    pub gap: Option<NaiveDate>,
+    /// The inputs are malformed (see [`pair_tracking`]); the series are then empty.
+    pub malformed: bool,
+}
+
+impl TrackingPairing {
+    /// Drops every pair so far: the sessions up to `gap` are left out.
+    fn leave_out(&mut self, gap: NaiveDate) {
+        self.live.clear();
+        self.backtest.clear();
+        self.span = None;
+        self.gap = Some(gap);
+    }
+
+    fn push(&mut self, day: NaiveDate, live: f64, backtest: f64) {
+        self.live.push(live);
+        self.backtest.push(backtest);
+        self.span = Some(match self.span {
+            Some((first, _)) => (first, day),
+            None => (day, day),
+        });
+    }
+}
+
 /// Lines the engine's daily returns up with a tracking run's, session by session.
 ///
 /// `equity` is the account's equity per session, ascending by date. The live return of a session
 /// is `equity / previous equity row's equity - 1`. `dates` and `returns` are the tracking run's
-/// (one date per return, ascending). The span compared runs from the second session with an
-/// equity row to the earlier of the last equity row and the last tracking date.
+/// (one date per return, ascending). The comparison covers the sessions up to the earlier of the
+/// last equity row and the last tracking date.
 ///
-/// Returns `(live, backtest)`, equal lengths, one pair per session of the span. Returns two empty
-/// vectors, which the gate reports as "could not be computed", when the two series do not cover
-/// the same sessions inside the span: a tracking date in the span with no equity row (a missed
-/// session close), or an equity row in the span with no tracking date. Also empty when `dates`
-/// and `returns` differ in length, `dates` is not strictly ascending, a previous equity is not
-/// positive, or a live return is not finite.
-/// Returns `None` when there is nothing to compare yet: fewer than two equity rows, or no
-/// tracking date on or after the second equity row's date.
+/// A session pairs when its equity row and its tracking date are the same session, the tracking
+/// run's session before it is the previous equity row, and the previous equity is positive with a
+/// finite return. A session that cannot be paired is a gap: its date is recorded as `gap`, every
+/// pair so far is dropped, and pairing resumes from the next equity row. The result is therefore
+/// the longest gap-free run ending at the end of the span, and `gap` is the newest gap. Gaps are:
+/// a tracking session the equity lacks (recorded as that session), an equity row the tracking run
+/// lacks, a previous equity row the tracking run lacks, and a previous equity that is not positive
+/// or a return that is not finite (recorded as the row's session).
+///
+/// Returns `None` only when there are fewer than two equity rows. Malformed input (`dates` and
+/// `returns` differ in length, `dates` not strictly ascending, equity not strictly ascending by
+/// date) gives empty series with `malformed` set. No tracking date at all gives empty series and
+/// no gap. Runs in O(n log n) with the vectors sized up front.
 #[must_use]
 pub fn pair_tracking(
     equity: &[(NaiveDate, Decimal)],
     dates: &[NaiveDate],
     returns: &[f64],
-) -> Option<(Vec<f64>, Vec<f64>)> {
-    let second = equity.get(1)?.0;
-    if dates.len() != returns.len() || dates.windows(2).any(|w| matches!(w, [a, b] if a >= b)) {
-        return uncomparable();
-    }
-    // The first tracking date on or after the span's start; dates before it are not compared.
-    let start = dates.partition_point(|day| *day < second);
-    if start == dates.len() {
+) -> Option<TrackingPairing> {
+    if equity.len() < 2 {
         return None;
     }
-    let end = equity.last()?.0.min(*dates.last()?);
-    let tracked_in_span = dates
-        .partition_point(|day| *day <= end)
-        .saturating_sub(start);
-
-    let capacity = equity.len().saturating_sub(1).min(tracked_in_span);
-    let mut live = Vec::with_capacity(capacity);
-    let mut backtest = Vec::with_capacity(capacity);
-    let mut previous = *equity.first()?;
-    for &(day, today) in equity.iter().skip(1) {
+    if dates.len() != returns.len()
+        || dates.windows(2).any(|w| w[0] >= w[1])
+        || equity.windows(2).any(|w| w[0].0 >= w[1].0)
+    {
+        return Some(TrackingPairing {
+            live: Vec::new(),
+            backtest: Vec::new(),
+            span: None,
+            gap: None,
+            malformed: true,
+        });
+    }
+    let Some(&last_tracked) = dates.last() else {
+        return Some(TrackingPairing {
+            live: Vec::new(),
+            backtest: Vec::new(),
+            span: None,
+            gap: None,
+            malformed: false,
+        });
+    };
+    let end = equity[equity.len() - 1].0.min(last_tracked);
+    let capacity = (equity.len() - 1).min(dates.len());
+    let mut out = TrackingPairing {
+        live: Vec::with_capacity(capacity),
+        backtest: Vec::with_capacity(capacity),
+        span: None,
+        gap: None,
+        malformed: false,
+    };
+    let mut last_day = equity[0].0;
+    for (index, &(day, today)) in equity.iter().enumerate().skip(1) {
         if day > end {
             break;
         }
-        let (previous_day, previous_equity) = previous;
-        previous = (day, today);
-        if day <= previous_day {
-            return uncomparable();
-        }
-        // The tracking date just before `day` must be the previous equity session: otherwise
-        // the backtest's return on `day` spans another session than the live one does.
+        let (previous_day, previous_equity) = equity[index - 1];
+        // The tracking sessions on or before the previous equity row, and those before `day`.
+        let known = dates.partition_point(|tracked| *tracked <= previous_day);
         let before = dates.partition_point(|tracked| *tracked < day);
-        let tracked_before = before.checked_sub(1).and_then(|i| dates.get(i));
-        if tracked_before.is_some_and(|tracked| *tracked != previous_day) {
-            return uncomparable();
+        if known < before {
+            // Tracking sessions between the two equity rows: the equity series lacks them.
+            out.leave_out(dates[before - 1]);
+        } else if dates.get(before) != Some(&day) {
+            // An equity row the tracking run lacks.
+            out.leave_out(day);
+        } else {
+            // The tracking session before `day` must be the previous equity row, or the two
+            // returns span different sessions. Before the first equity row of the span there
+            // may be none (a run that starts later).
+            let predecessor_ok = match before.checked_sub(1).map(|i| dates[i]) {
+                Some(tracked) => tracked == previous_day,
+                None => index == 1,
+            };
+            if !predecessor_ok {
+                out.leave_out(previous_day);
+            } else if let Some(live) = live_return(today, previous_equity) {
+                out.push(day, live, returns[before]);
+            } else {
+                out.leave_out(day);
+            }
         }
-        let (Some(&tracked_day), Some(&backtest_return)) = (dates.get(before), returns.get(before))
-        else {
-            return uncomparable();
-        };
-        let Some(live_return) = live_return(today, previous_equity) else {
-            return uncomparable();
-        };
-        if tracked_day != day {
-            return uncomparable();
-        }
-        live.push(live_return);
-        backtest.push(backtest_return);
+        last_day = day;
     }
-    // Every tracking date in the span was paired, so none lacks an equity row.
-    if live.len() != tracked_in_span {
-        return uncomparable();
+    // Tracking sessions after the last equity row walked, up to `end`, have no equity row.
+    let upto = dates.partition_point(|tracked| *tracked <= end);
+    let from = dates.partition_point(|tracked| *tracked <= last_day);
+    if upto > from {
+        out.leave_out(dates[upto - 1]);
     }
-    Some((live, backtest))
+    Some(out)
 }
 
 /// The return of `equity` over `previous`, in `Decimal` and converted to `f64` last. `None` when
@@ -478,11 +614,6 @@ fn live_return(equity: Decimal, previous: Decimal) -> Option<f64> {
     }
     let ratio = equity.checked_div(previous)?.checked_sub(Decimal::ONE)?;
     ratio.to_f64().filter(|r| r.is_finite())
-}
-
-/// Two empty series: the two sides cannot be compared, and the gate says so.
-fn uncomparable() -> Option<(Vec<f64>, Vec<f64>)> {
-    Some((Vec::new(), Vec::new()))
 }
 
 /// A database count, which can never be negative: a negative one is a data error.
@@ -523,10 +654,14 @@ pub async fn store_report<C: GenericClient>(
 
 /// The newest non-holdout trial of the version, whether or not it has returns or is usable.
 fn candidate(inputs: &ReportInputs) -> Option<&TrialSeries> {
-    inputs
-        .trials
+    newest_candidate(&inputs.trials, inputs.version)
+}
+
+/// The newest non-holdout trial of `version` in `trials` (see [`candidate`]).
+fn newest_candidate(trials: &[TrialSeries], version: StrategyVersionId) -> Option<&TrialSeries> {
+    trials
         .iter()
-        .filter(|t| t.strategy_version_id == inputs.version && !t.holdout)
+        .filter(|t| t.strategy_version_id == version && !t.holdout)
         .max_by_key(|t| t.trial_id)
 }
 
@@ -1112,14 +1247,72 @@ fn risk_gate(breaches: u64, sent: u64) -> GateResult {
     )
 }
 
+/// The tracking gate's note sentence for a gap, or nothing when there was none.
+fn gap_sentence(gap: Option<NaiveDate>) -> String {
+    gap.map_or_else(String::new, |day| {
+        format!(
+            "; sessions up to {day} are left out: the equity and tracking series do not both have {day}"
+        )
+    })
+}
+
+/// The first and last paired session as `first to last`, or `no sessions`.
+fn span_text(span: Option<(NaiveDate, NaiveDate)>) -> String {
+    span.map_or_else(
+        || "no sessions".to_owned(),
+        |(first, last)| format!("{first} to {last}"),
+    )
+}
+
+/// Judges the tracking gate in this order: no live returns, unreadable, not the same experiment,
+/// stale, too few sessions, then the tracking error and largest gap.
 fn tracking_gate(inputs: &ReportInputs) -> GateResult {
     const NAME: &str = "tracking";
     let max_error = inputs.gates.tracking_error_max;
     let max_gap = inputs.gates.tracking_gap_max;
-    let Some((live, backtest)) = inputs.live.as_ref() else {
+    let Some(input) = inputs.live.as_ref() else {
         return undecided(NAME, None, Some(max_error), "no live returns yet");
     };
-    match tracking::tracking(live, backtest, inputs.gates.periods_per_year) {
+    if input.unreadable {
+        return undecided(
+            NAME,
+            None,
+            Some(max_error),
+            "could not be computed: the tracking run's result is incomplete or malformed",
+        );
+    }
+    if !input.same_experiment {
+        return undecided(
+            NAME,
+            None,
+            Some(max_error),
+            "the tracking run does not have the same inputs as the candidate backtest (costs, symbols, limits, starting cash, seed)",
+        );
+    }
+    if input.lag_sessions > MAX_TRACKING_LAG_SESSIONS {
+        return undecided(
+            NAME,
+            None,
+            Some(max_error),
+            &format!(
+                "the tracking run is {} sessions older than the newest equity row; make a new tracking run",
+                input.lag_sessions
+            ),
+        );
+    }
+    let sessions = input.live.len();
+    if sessions < MIN_TRACKING_SESSIONS {
+        return undecided(
+            NAME,
+            None,
+            Some(max_error),
+            &format!(
+                "{sessions} paired sessions; at least {MIN_TRACKING_SESSIONS} are needed{}",
+                gap_sentence(input.gap)
+            ),
+        );
+    }
+    match tracking::tracking(&input.live, &input.backtest, inputs.gates.periods_per_year) {
         None => undecided(
             NAME,
             None,
@@ -1132,8 +1325,12 @@ fn tracking_gate(inputs: &ReportInputs) -> GateResult {
             Some(t.tracking_error),
             Some(max_error),
             format!(
-                "tracking error {:.4} against {max_error} and largest gap {:.4} against {max_gap}",
-                t.tracking_error, t.max_gap
+                "{} equity, {}, {sessions} sessions: tracking error {:.4} against {max_error} and largest gap {:.4} against {max_gap}{}",
+                input.environment,
+                span_text(input.span),
+                t.tracking_error,
+                t.max_gap,
+                gap_sentence(input.gap)
             ),
         ),
     }
