@@ -25,15 +25,17 @@ use nisse_app::{
 use nisse_core::nautilus::{Bar, ClientOrderId, UnixNanos, VenueOrderId};
 use nisse_core::{
     AccountSnapshot, Broker, BrokerOrder, BrokerPosition, Clock, ManualClock, MarketCalendar,
-    OpenOrders, OrderIntent, ReplaceRequest, RiskEvent, RiskEventKind, Session, SubmitError,
+    OpenOrders, OrderIntent, ReplaceRequest, RiskEvent, RiskEventKind, Session, StrategyVersionId,
+    SubmitError,
 };
 use nisse_engine::{EngineError, SimBroker, SimError};
 use nisse_risk::DrawdownMode;
 use nisse_store::{
     Store,
-    tables::{engine_step::StepStatus, risk_event},
+    tables::{account_equity, engine_step::StepStatus, risk_event, trial_registry},
     testing::ScratchDb,
 };
+use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use support::{
     CancelFails, FakeMarket, Scratch, broker, close_at, count, flattening_limits, plus_minutes,
@@ -1258,6 +1260,176 @@ async fn a_flattening_kill_cancels_the_resting_buys_with_the_market_closed() {
     assert!(outcome.kill_cancelled, "{outcome:?}");
     assert_eq!(outcome.rebalance, None);
     assert!(sim.open_orders().await.unwrap().orders.is_empty());
+
+    f.db.drop_db().await.unwrap();
+}
+
+/// The id of the strategy version the session-close runs registered (there is one config).
+async fn the_version(store: &Store) -> StrategyVersionId {
+    let row = store
+        .client()
+        .query_one(
+            "SELECT id FROM strategy_version ORDER BY id DESC LIMIT 1",
+            &[],
+        )
+        .await
+        .unwrap();
+    StrategyVersionId(row.get(0))
+}
+
+/// The number of `live` trials of any config in the paper environment.
+async fn paper_live_trials(store: &Store) -> i64 {
+    store
+        .client()
+        .query_one(
+            "SELECT count(*) FROM trial_registry \
+             WHERE kind = 'live' AND result = '{\"environment\": \"paper\"}'::jsonb",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0)
+}
+
+/// The equity the `observe` step of the run for `day` recorded.
+async fn observed_equity(store: &Store, day: NaiveDate) -> Decimal {
+    let (status, detail) = store
+        .step_status(&run_key(day), "observe")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status, StepStatus::Done);
+    detail["equity"].as_str().unwrap().parse().unwrap()
+}
+
+#[tokio::test]
+async fn session_close_records_the_account_equity() {
+    let f = fixture().await;
+    let sim = broker();
+    let day = date(2025, 12, 31);
+    let clock = ManualClock::new(plus_minutes(close_at(day), 10));
+
+    session_close(&f.config, &f.market, &f.store, f.sink.clone(), &sim, &clock)
+        .await
+        .unwrap();
+
+    let version = the_version(&f.store).await;
+    let series = account_equity::daily(f.store.client(), version, "paper")
+        .await
+        .unwrap();
+    assert_eq!(series, vec![(day, observed_equity(&f.store, day).await)]);
+
+    let (status, detail) = f
+        .store
+        .step_status(&run_key(day), "equity")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status, StepStatus::Done);
+    assert_eq!(detail["trial_registered"], json!(true));
+
+    f.db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn session_close_registers_one_live_trial() {
+    let f = fixture().await;
+    let sim = broker();
+    let day = date(2025, 12, 31);
+    let clock = ManualClock::new(plus_minutes(close_at(day), 10));
+    let lifetime_before = trial_registry::lifetime_count(f.store.client())
+        .await
+        .unwrap();
+
+    session_close(&f.config, &f.market, &f.store, f.sink.clone(), &sim, &clock)
+        .await
+        .unwrap();
+
+    assert_eq!(paper_live_trials(&f.store).await, 1);
+    assert_eq!(count(&f.store, "trial_registry").await, 1);
+    assert_eq!(
+        trial_registry::lifetime_count(f.store.client())
+            .await
+            .unwrap(),
+        lifetime_before + 1
+    );
+    let version = the_version(&f.store).await;
+    assert!(
+        trial_registry::live_start(f.store.client(), version, Some("paper"))
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    f.db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_second_session_adds_equity_but_no_second_trial() {
+    let f = fixture().await;
+    let sim = broker();
+    let first = date(2025, 12, 30);
+    let second = date(2025, 12, 31);
+
+    let clock = ManualClock::new(plus_minutes(close_at(first), 10));
+    session_close(&f.config, &f.market, &f.store, f.sink.clone(), &sim, &clock)
+        .await
+        .unwrap();
+    let clock = ManualClock::new(plus_minutes(close_at(second), 10));
+    let outcome = session_close(&f.config, &f.market, &f.store, f.sink.clone(), &sim, &clock)
+        .await
+        .unwrap();
+    assert!(matches!(outcome, SessionCloseOutcome::Ran { .. }));
+
+    let version = the_version(&f.store).await;
+    let series = account_equity::daily(f.store.client(), version, "paper")
+        .await
+        .unwrap();
+    assert_eq!(series.len(), 2);
+    assert_eq!(series[0].0, first);
+    assert_eq!(series[1].0, second);
+    assert_eq!(paper_live_trials(&f.store).await, 1);
+
+    let (_, detail) = f
+        .store
+        .step_status(&run_key(second), "equity")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(detail["trial_registered"], json!(false));
+
+    f.db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn rerunning_the_same_session_writes_no_second_equity_row() {
+    let f = fixture().await;
+    let sim = broker();
+    let day = date(2025, 12, 31);
+    let clock = ManualClock::new(plus_minutes(close_at(day), 10));
+
+    session_close(&f.config, &f.market, &f.store, f.sink.clone(), &sim, &clock)
+        .await
+        .unwrap();
+    session_close(&f.config, &f.market, &f.store, f.sink.clone(), &sim, &clock)
+        .await
+        .unwrap();
+
+    assert_eq!(count(&f.store, "account_equity").await, 1);
+    assert_eq!(paper_live_trials(&f.store).await, 1);
+    assert_eq!(count(&f.store, "trial_registry").await, 1);
+    // The equity step ran once: one started and one done row.
+    let steps: i64 = f
+        .store
+        .client()
+        .query_one(
+            "SELECT count(*) FROM engine_step WHERE run_key = $1 AND step = 'equity'",
+            &[&run_key(day)],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(steps, 2);
 
     f.db.drop_db().await.unwrap();
 }

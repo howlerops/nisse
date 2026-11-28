@@ -10,10 +10,13 @@ use std::future::Future;
 
 use chrono::{DateTime, Days, NaiveDate};
 use nisse_core::nautilus::UnixNanos;
-use nisse_core::{Broker, Clock, MarketCalendar, Session};
+use nisse_core::{Broker, Clock, MarketCalendar, Session, StrategyVersionId};
 use nisse_engine::{EngineError, RebalanceReport, SyncReport};
 use nisse_risk::DrawdownMode;
-use nisse_store::{Store, StoreWriter, tables::engine_step::StepStatus};
+use nisse_store::{
+    Store, StoreWriter,
+    tables::{account_equity, engine_step::StepStatus, trial_registry},
+};
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
 
@@ -22,7 +25,10 @@ use crate::ingest::{IngestOutcome, ingest_session};
 use crate::kill_watch::{enforce_kill, flatten_on_kill};
 use crate::market::Market;
 use crate::restore::{EngineTrader, Restored, restore, take_engine_lock};
-use crate::{AppError, config::EngineConfig};
+use crate::{
+    AppError,
+    config::{EngineConfig, PAPER},
+};
 
 /// How long after a session's close `session-close` still decides for it.
 pub const MAX_CLOSE_AGE_NANOS: u64 = 6 * 3_600 * 1_000_000_000;
@@ -42,6 +48,10 @@ pub const TICK_ATTEMPT_STEP: &str = "rebalance";
 const INGEST_STEP: &str = "ingest";
 const RECONCILE_STEP: &str = "reconcile";
 const OBSERVE_STEP: &str = "observe";
+/// The step recording the session's account equity, and registering the engine's `live` trial
+/// for the strategy config the first time. Once `done` for a run it is skipped. See
+/// `docs/phases/phase-9a.md`.
+const EQUITY_STEP: &str = "equity";
 const REBALANCE_STEP: &str = "rebalance";
 
 /// Nanoseconds in a second.
@@ -184,8 +194,8 @@ pub async fn tick<M: Market, B: Broker, C: Clock>(
 /// `MAX_CLOSE_AGE_NANOS` before now. See `docs/phases/phase-6.md`, "session-close".
 ///
 /// Order: enforce the kill switch → verify the signature → lock → ingest → restore →
-/// reconcile → observe → (re-read the switch) → rebalance on a month end or when one is owed
-/// → finish. The kill switch is enforced first, as in [`tick`].
+/// reconcile → observe → record equity → (re-read the switch) → rebalance on a month end or
+/// when one is owed → finish. The kill switch is enforced first, as in [`tick`].
 pub async fn session_close<M: Market, B: Broker, C: Clock>(
     config: &EngineConfig,
     market: &M,
@@ -244,7 +254,11 @@ pub async fn session_close<M: Market, B: Broker, C: Clock>(
     )
     .await?;
 
-    let Restored { mut trader, .. } = restore(config, store, sink.clone(), broker, clock).await?;
+    let Restored {
+        mut trader,
+        strategy_version_id,
+        ..
+    } = restore(config, store, sink.clone(), broker, clock).await?;
 
     let reconciled = step(
         store,
@@ -276,6 +290,29 @@ pub async fn session_close<M: Market, B: Broker, C: Clock>(
     )
     .await?;
 
+    if !matches!(
+        store.step_status(&run_key, EQUITY_STEP).await?,
+        Some((StepStatus::Done, _))
+    ) {
+        step(
+            store,
+            &run_key,
+            EQUITY_STEP,
+            now,
+            equity_pass(
+                store,
+                strategy_version_id,
+                session.date,
+                observed.equity,
+                now,
+            ),
+            |registered| {
+                json!({"equity": observed.equity.to_string(), "trial_registered": registered})
+            },
+        )
+        .await?;
+    }
+
     let rebalance = rebalance_step(
         &mut trader,
         store,
@@ -295,6 +332,28 @@ pub async fn session_close<M: Market, B: Broker, C: Clock>(
         mode_change: observed.mode_change,
         rebalance,
     })
+}
+
+/// Registers the engine's trial for this strategy config if it has none, then records the
+/// session's account equity. See `docs/phases/phase-9a.md`.
+async fn equity_pass(
+    store: &Store,
+    version: StrategyVersionId,
+    session_date: NaiveDate,
+    equity: Decimal,
+    now: UnixNanos,
+) -> Result<bool, AppError> {
+    let client = store.client();
+    let mut registered = false;
+    if trial_registry::live_start(client, version, Some(PAPER))
+        .await?
+        .is_none()
+    {
+        trial_registry::insert_live(client, version, PAPER, now, now).await?;
+        registered = true;
+    }
+    account_equity::insert(client, version, PAPER, session_date, equity, now).await?;
+    Ok(registered)
 }
 
 /// The rebalance step of a session-close run: skipped when already `done`, recorded `done`
