@@ -19,8 +19,8 @@ use nisse_core::nautilus::{
 use nisse_core::{DecisionId, OrderEvent, OrderIntent, OrderState};
 use nisse_eval::agent_report::{
     AgentReport, DataChecks, Execution, HOLDOUT_GATE, LABEL_QUEUE_MAX, LabelEntry, MIN_GROUP,
-    MetricSummary, ReportArgs, VersionReport, aggregate, build_agent_report, data_checks,
-    round_sig,
+    MetricSummary, ReportArgs, TRACKING_GATE, VersionReport, aggregate, build_agent_report,
+    data_checks, round_sig,
 };
 use nisse_eval::execution_job::METRIC_SHORTFALL_BPS;
 use nisse_eval::gate_report::{ReportInputs, build_report};
@@ -482,6 +482,28 @@ fn data_checks_window_starts_at_the_oldest_session_when_there_are_few() {
     assert_eq!(checks.zero_volume.len(), 1);
     assert_eq!(checks.zero_volume[0].date, "2026-01-01");
     assert!(checks.missing_on_last_session.is_empty());
+}
+
+#[test]
+fn the_tracking_gate_is_in_the_gate_report_so_the_report_can_leave_it_out() {
+    // If the gate report renames its tracking gate, the name this module filters on is stale and
+    // the tracking result would reach agents: this fails instead.
+    let inputs = ReportInputs {
+        version: StrategyVersionId(1),
+        gates: gates(),
+        lifetime_trials: 0,
+        holdout_looks: 0,
+        trials: Vec::new(),
+        replay: (0, 0),
+        risk_breaches: 0,
+        sent_orders: 0,
+        live: Some((vec![0.01, 0.02], vec![0.01, 0.02])),
+    };
+    let names: Vec<&str> = build_report(&inputs).gates.iter().map(|g| g.name).collect();
+    assert!(
+        names.contains(&TRACKING_GATE),
+        "gate report names {names:?} do not contain {TRACKING_GATE:?}"
+    );
 }
 
 #[test]
@@ -1014,6 +1036,41 @@ async fn the_gates_map_leaves_out_the_holdout_gate_and_the_notes_say_so() {
         report.to_json()["notes"]
             .to_string()
             .contains("holdout gate is not shown")
+    );
+
+    drop(client);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_tracking_gate_is_not_shown_to_agents() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let v = version(&client, 1).await;
+    let dir = TempDir::new("tracking");
+
+    let report = run_report(&client, dir.path(), &[]).await.unwrap();
+    let gates = &version_of(&report, v).gates;
+    assert!(
+        gates.contains_key("trial_budget"),
+        "the other gates are still shown"
+    );
+    assert!(
+        !gates.contains_key(TRACKING_GATE),
+        "the tracking gate is not shown: {gates:?}"
+    );
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|note| note.contains("tracking gate is not shown to agents")),
+        "notes: {:?}",
+        report.notes
+    );
+    assert!(
+        report.to_json()["notes"]
+            .to_string()
+            .contains("tracking gate is not shown")
     );
 
     drop(client);

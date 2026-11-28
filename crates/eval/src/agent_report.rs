@@ -17,6 +17,8 @@
 //!   is left to subtract;
 //! - the holdout gate is not shown (see [`HOLDOUT_GATE`]), because its pass or fail would give
 //!   feedback on the holdout, which is only looked at a few times on purpose;
+//! - the tracking gate is not shown either (see [`TRACKING_GATE`]), for the same reason: it
+//!   compares with a backtest of days no strategy may be chosen on;
 //! - a label queue entry says what was decided and how it was executed, and never carries a
 //!   forward return, a benchmark return, P&L or a `decision_quality_*` score;
 //! - decisions are dated by month; only the data checks use days.
@@ -58,11 +60,19 @@ pub const SIG_DIGITS: u32 = 4;
 /// private constant; a test fails if the gate report stops using this name.
 pub const HOLDOUT_GATE: &str = "holdout";
 
+/// The gate that compares the engine's live returns with a backtest, as its name in the gate
+/// report. It is left out of the per-version `gates` map, like [`HOLDOUT_GATE`]. Matched by
+/// name for the same reason; a test fails if the gate report stops using this name.
+pub const TRACKING_GATE: &str = "tracking";
+
 /// The value given for a score metric with fewer than [`MIN_GROUP`] decisions.
 const SUPPRESSED: &str = "suppressed";
 /// The note that tells agents the holdout gate is left out of the report.
 const HOLDOUT_NOTE: &str = "The holdout gate is not shown to agents: its result would give \
      feedback on the holdout period, which is limited to a few deliberate looks.";
+/// The note that tells agents the tracking gate is left out of the report.
+const TRACKING_NOTE: &str = "The tracking gate is not shown to agents: it compares the engine's \
+     own results with a backtest of days no strategy may be chosen on.";
 
 /// What the report is built from: the gate thresholds, the bar directory, the research
 /// config's symbols and benchmark, and the time the report is made at.
@@ -281,7 +291,7 @@ pub async fn build_agent_report<C: GenericClient>(
     let (data, regime) = read_data(args)?;
 
     let mut report_versions = Vec::with_capacity(versions.len());
-    let mut notes = vec![HOLDOUT_NOTE.to_owned()];
+    let mut notes = vec![HOLDOUT_NOTE.to_owned(), TRACKING_NOTE.to_owned()];
     for version in versions {
         let by_action = counts.remove(&version.id).unwrap_or_default();
         let visible_decisions = by_action.values().sum();
@@ -706,8 +716,9 @@ fn group_scores(rows: Vec<(i64, String, f64)>) -> BTreeMap<i64, BTreeMap<String,
     grouped
 }
 
-/// Each gate of a version as its status text, except the holdout gate ([`HOLDOUT_GATE`]). The
-/// error is returned, not swallowed: the caller turns it into a note.
+/// Each gate of a version as its status text, except the holdout and tracking gates
+/// ([`HOLDOUT_GATE`], [`TRACKING_GATE`]). The error is returned, not swallowed: the caller turns
+/// it into a note.
 async fn gate_statuses<C: GenericClient>(
     client: &C,
     version: i64,
@@ -717,7 +728,7 @@ async fn gate_statuses<C: GenericClient>(
     Ok(build_report(&inputs)
         .gates
         .iter()
-        .filter(|gate| gate.name != HOLDOUT_GATE)
+        .filter(|gate| gate.name != HOLDOUT_GATE && gate.name != TRACKING_GATE)
         .map(|gate| (gate.name.to_owned(), gate.status))
         .collect())
 }
