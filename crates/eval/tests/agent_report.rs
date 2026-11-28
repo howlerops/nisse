@@ -23,7 +23,7 @@ use nisse_eval::agent_report::{
     data_checks, round_sig,
 };
 use nisse_eval::execution_job::METRIC_SHORTFALL_BPS;
-use nisse_eval::gate_report::{ReportInputs, build_report};
+use nisse_eval::gate_report::{ReportInputs, TrackingInput, build_report};
 use nisse_eval::gates::Gates;
 use nisse_eval::outcome::Regime;
 use nisse_store::tables::order_event;
@@ -497,7 +497,16 @@ fn the_tracking_gate_is_in_the_gate_report_so_the_report_can_leave_it_out() {
         replay: (0, 0),
         risk_breaches: 0,
         sent_orders: 0,
-        live: Some((vec![0.01, 0.02], vec![0.01, 0.02])),
+        live: Some(TrackingInput {
+            environment: "paper",
+            live: vec![0.01, 0.02],
+            backtest: vec![0.01, 0.02],
+            span: None,
+            gap: None,
+            lag_sessions: 0,
+            same_experiment: true,
+            unreadable: false,
+        }),
     };
     let names: Vec<&str> = build_report(&inputs).gates.iter().map(|g| g.name).collect();
     assert!(

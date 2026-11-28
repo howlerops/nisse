@@ -9,8 +9,8 @@ use chrono::NaiveDate;
 use nisse_core::nautilus::UnixNanos;
 use nisse_core::{StrategyVersionId, Trial, TrialKind};
 use nisse_eval::gate_report::{
-    EVAL_VERSION, GateReport, GateResult, GateStatus, ReportInputs, TrialSeries, build_report,
-    load_inputs, pair_tracking, store_report,
+    EVAL_VERSION, GateReport, GateResult, GateStatus, ReportInputs, TrackingInput, TrackingPairing,
+    TrialSeries, build_report, load_inputs, pair_tracking, store_report,
 };
 use nisse_eval::gates::Gates;
 use nisse_eval::stats::{dsr, moments, pbo};
@@ -2145,6 +2145,28 @@ fn risk_breaches_must_be_zero_and_need_a_sent_order() {
 
 // ---- tracking -------------------------------------------------------------------------------
 
+/// A tracking input that passes every check but the sessions: paper equity, the same experiment as
+/// the candidate, no gap, no lag. Its span is only for the note, so it is not a real calendar.
+fn tracking_input(live: Vec<f64>, backtest: Vec<f64>) -> TrackingInput {
+    TrackingInput {
+        environment: "paper",
+        live,
+        backtest,
+        span: Some((day(1), day(31))),
+        gap: None,
+        lag_sessions: 0,
+        same_experiment: true,
+        unreadable: false,
+    }
+}
+
+/// The tracking gate of a version whose candidate is `cand` and whose tracking input is `input`.
+fn tracking_gate_of(cand: &[f64], input: TrackingInput) -> GateResult {
+    let mut i = inputs(1, vec![series(1, 1, false, cand.to_vec())], 1);
+    i.live = Some(input);
+    find(&build_report(&i), "tracking").clone()
+}
+
 #[test]
 fn tracking_is_not_evaluated_without_live_returns_and_judged_with_them() {
     let r = drift(500, 0.001, 0.010);
@@ -2154,21 +2176,180 @@ fn tracking_is_not_evaluated_without_live_returns_and_judged_with_them() {
         GateStatus::NotEvaluated
     );
 
-    i.live = Some((r.clone(), r.clone()));
+    i.live = Some(tracking_input(r.clone(), r.clone()));
     let report = build_report(&i);
     let gate = find(&report, "tracking");
     assert_eq!(gate.status, GateStatus::Pass);
     assert!(gate.value.unwrap().abs() < 1e-12);
 
     // Live returns alternate out of phase with the backtest: a large, steady gap.
-    i.live = Some((drift(500, 0.01, -0.010), r.clone()));
+    i.live = Some(tracking_input(drift(500, 0.01, -0.010), r.clone()));
     assert_eq!(status(&build_report(&i), "tracking"), GateStatus::Fail);
 
-    i.live = Some((r[..499].to_vec(), r));
+    i.live = Some(tracking_input(r[..19].to_vec(), r[..19].to_vec()));
     assert_eq!(
         status(&build_report(&i), "tracking"),
         GateStatus::NotEvaluated
     );
+}
+
+#[test]
+fn fewer_than_twenty_paired_sessions_are_not_evaluated_and_the_count_is_named() {
+    let r = drift(19, 0.001, 0.010);
+    let gate = tracking_gate_of(&r, tracking_input(r.clone(), r.clone()));
+    assert_eq!(gate.status, GateStatus::NotEvaluated, "{}", gate.note);
+    assert!(gate.note.contains("19 paired sessions"), "{}", gate.note);
+    assert!(gate.note.contains("at least 20"), "{}", gate.note);
+}
+
+#[test]
+fn exactly_twenty_identical_sessions_pass_and_the_note_names_them() {
+    let r = drift(20, 0.001, 0.010);
+    let input = TrackingInput {
+        span: Some((day(5), day(24))),
+        ..tracking_input(r.clone(), r.clone())
+    };
+    let gate = tracking_gate_of(&r, input);
+    assert_eq!(gate.status, GateStatus::Pass, "{}", gate.note);
+    for text in ["paper", "2026-01-05", "2026-01-24", "20 sessions"] {
+        assert!(gate.note.contains(text), "{} lacks {text}", gate.note);
+    }
+}
+
+#[test]
+fn a_tracking_run_lagging_six_equity_rows_is_not_evaluated() {
+    let r = drift(30, 0.001, 0.010);
+    let input = TrackingInput {
+        lag_sessions: 6,
+        ..tracking_input(r.clone(), r.clone())
+    };
+    let gate = tracking_gate_of(&r, input);
+    assert_eq!(gate.status, GateStatus::NotEvaluated, "{}", gate.note);
+    assert!(gate.note.contains("6 sessions older"), "{}", gate.note);
+    assert!(
+        gate.note.contains("make a new tracking run"),
+        "{}",
+        gate.note
+    );
+}
+
+#[test]
+fn a_tracking_run_lagging_five_equity_rows_is_judged() {
+    let r = drift(30, 0.001, 0.010);
+    let input = TrackingInput {
+        lag_sessions: 5,
+        ..tracking_input(r.clone(), r.clone())
+    };
+    let gate = tracking_gate_of(&r, input);
+    assert_eq!(gate.status, GateStatus::Pass, "{}", gate.note);
+}
+
+#[test]
+fn a_tracking_run_with_other_inputs_than_the_candidate_is_not_evaluated() {
+    let r = drift(30, 0.001, 0.010);
+    let input = TrackingInput {
+        same_experiment: false,
+        ..tracking_input(r.clone(), r.clone())
+    };
+    let gate = tracking_gate_of(&r, input);
+    assert_eq!(gate.status, GateStatus::NotEvaluated, "{}", gate.note);
+    assert!(
+        gate.note.contains("does not have the same inputs"),
+        "{}",
+        gate.note
+    );
+}
+
+#[test]
+fn an_unreadable_tracking_result_is_not_evaluated() {
+    let r = drift(30, 0.001, 0.010);
+    let input = TrackingInput {
+        unreadable: true,
+        ..tracking_input(Vec::new(), Vec::new())
+    };
+    let gate = tracking_gate_of(&r, input);
+    assert_eq!(gate.status, GateStatus::NotEvaluated, "{}", gate.note);
+    assert!(
+        gate.note
+            .contains("the tracking run's result is incomplete or malformed"),
+        "{}",
+        gate.note
+    );
+}
+
+#[test]
+fn a_gap_with_twenty_sessions_after_it_is_judged_and_the_note_names_it() {
+    let r = drift(25, 0.001, 0.010);
+    let input = TrackingInput {
+        gap: Some(day(7)),
+        ..tracking_input(r.clone(), r.clone())
+    };
+    let gate = tracking_gate_of(&r, input);
+    assert_eq!(gate.status, GateStatus::Pass, "{}", gate.note);
+    assert!(
+        gate.note.contains("sessions up to 2026-01-07 are left out"),
+        "{}",
+        gate.note
+    );
+    assert!(gate.note.contains("2026-01-07"), "{}", gate.note);
+}
+
+#[test]
+fn a_gap_leaving_fewer_than_twenty_sessions_names_the_gap() {
+    let r = drift(19, 0.001, 0.010);
+    let input = TrackingInput {
+        gap: Some(day(7)),
+        ..tracking_input(r.clone(), r.clone())
+    };
+    let gate = tracking_gate_of(&r, input);
+    assert_eq!(gate.status, GateStatus::NotEvaluated, "{}", gate.note);
+    assert!(gate.note.contains("19 paired sessions"), "{}", gate.note);
+    assert!(
+        gate.note
+            .ends_with("sessions up to 2026-01-07 are left out: the equity and tracking series do not both have 2026-01-07"),
+        "{}",
+        gate.note
+    );
+}
+
+#[test]
+fn twenty_sessions_with_a_large_divergence_fail() {
+    let r = drift(20, 0.001, 0.010);
+    let live = drift(20, 0.01, -0.010);
+    let gate = tracking_gate_of(&r, tracking_input(live, r.clone()));
+    assert_eq!(gate.status, GateStatus::Fail, "{}", gate.note);
+}
+
+#[test]
+fn the_checks_are_ordered_unreadable_before_experiment_before_lag_before_floor() {
+    let r = drift(3, 0.001, 0.010);
+    let all_bad = TrackingInput {
+        unreadable: true,
+        same_experiment: false,
+        lag_sessions: 9,
+        ..tracking_input(r.clone(), r.clone())
+    };
+    let gate = tracking_gate_of(&r, all_bad);
+    assert!(
+        gate.note.contains("incomplete or malformed"),
+        "{}",
+        gate.note
+    );
+
+    let not_same = TrackingInput {
+        same_experiment: false,
+        lag_sessions: 9,
+        ..tracking_input(r.clone(), r.clone())
+    };
+    let gate = tracking_gate_of(&r, not_same);
+    assert!(gate.note.contains("same inputs"), "{}", gate.note);
+
+    let stale = TrackingInput {
+        lag_sessions: 9,
+        ..tracking_input(r.clone(), r.clone())
+    };
+    let gate = tracking_gate_of(&r, stale);
+    assert!(gate.note.contains("sessions older"), "{}", gate.note);
 }
 
 // ---- pairing the live and tracking returns ----------------------------------------------------
@@ -2201,15 +2382,19 @@ fn assert_close(actual: &[f64], expected: &[f64]) {
     }
 }
 
-fn assert_paired(pair: Option<(Vec<f64>, Vec<f64>)>, live: &[f64], backtest: &[f64]) {
-    let (got_live, got_backtest) = pair.expect("the series pair");
-    assert_close(&got_live, live);
-    assert_close(&got_backtest, backtest);
+fn assert_paired(pair: Option<TrackingPairing>, live: &[f64], backtest: &[f64]) {
+    let pair = pair.expect("the series pair");
+    assert!(!pair.malformed, "{pair:?}");
+    assert_close(&pair.live, live);
+    assert_close(&pair.backtest, backtest);
 }
 
-/// The two series cannot be compared: both empty, which the gate reports as not computable.
-fn assert_uncomparable(pair: Option<(Vec<f64>, Vec<f64>)>) {
-    assert_eq!(pair, Some((Vec::new(), Vec::new())));
+/// The inputs are malformed: both series empty and flagged, which the gate reports as unreadable.
+fn assert_malformed(pair: Option<TrackingPairing>) {
+    let pair = pair.expect("malformed inputs still give a pairing");
+    assert!(pair.malformed, "{pair:?}");
+    assert!(pair.live.is_empty() && pair.backtest.is_empty(), "{pair:?}");
+    assert_eq!((pair.span, pair.gap), (None, None));
 }
 
 #[test]
@@ -2226,11 +2411,20 @@ fn pair_tracking_needs_two_equity_rows() {
 }
 
 #[test]
-fn pair_tracking_is_none_without_a_tracking_date_on_or_after_the_second_equity_row() {
+fn pair_tracking_with_no_tracking_date_or_only_one_before_the_span_pairs_nothing_and_reports_no_gap()
+ {
+    // Edited: this used to expect `None`. `None` now means fewer than two equity rows only.
     let eq = equity_rows(&[(5, "100"), (6, "110")]);
-    assert_eq!(pair_tracking(&eq, &[], &[]), None);
-    // A tracking date only before the second equity row: nothing to compare yet.
-    assert_eq!(pair_tracking(&eq, &days(&[4, 5]), &[0.0, 0.0]), None);
+    for pair in [
+        pair_tracking(&eq, &[], &[]),
+        // A tracking date only before the second equity row: nothing to compare yet.
+        pair_tracking(&eq, &days(&[4, 5]), &[0.0, 0.0]),
+    ] {
+        let pair = pair.expect("a pairing");
+        assert!(pair.live.is_empty() && pair.backtest.is_empty(), "{pair:?}");
+        assert_eq!((pair.span, pair.gap), (None, None));
+        assert!(!pair.malformed);
+    }
 }
 
 #[test]
@@ -2264,45 +2458,128 @@ fn pair_tracking_compares_only_up_to_the_last_tracking_date() {
 }
 
 #[test]
-fn pair_tracking_with_an_equity_row_missing_inside_the_span_is_uncomparable() {
-    // Day 7 is in the tracking run, but the equity series has no row for it.
+fn a_tracking_session_the_equity_lacks_is_the_gap_and_nothing_after_it_is_left() {
+    // Edited: this used to expect two empty series. Day 7 is in the tracking run and the equity
+    // series has no row for it. Day 8 is paired only if the session before it is an equity row,
+    // and it is not, so nothing is paired.
     let eq = equity_rows(&[(5, "100"), (6, "110"), (8, "99")]);
-    let pair = pair_tracking(&eq, &days(&[5, 6, 7, 8]), &[0.0, 0.05, 0.01, -0.02]);
-    assert_uncomparable(pair);
+    let pair = pair_tracking(&eq, &days(&[5, 6, 7, 8]), &[0.0, 0.05, 0.01, -0.02]).unwrap();
+    assert!(pair.live.is_empty() && pair.backtest.is_empty());
+    assert_eq!(pair.gap, Some(day(7)));
+    assert_eq!(pair.span, None);
+    assert!(!pair.malformed);
 }
 
 #[test]
-fn pair_tracking_with_an_equity_row_the_tracking_run_lacks_is_uncomparable() {
+fn an_equity_row_the_tracking_run_lacks_is_the_gap() {
+    // Edited: this used to expect two empty series. Day 6 has an equity row but no tracking date;
+    // day 7 is paired against day 6, which the tracking run lacks, so it is a gap too. The newest
+    // gap is day 7's previous row, day 6.
     let eq = equity_rows(&[(5, "100"), (6, "110"), (7, "99")]);
-    assert_uncomparable(pair_tracking(&eq, &days(&[5, 7]), &[0.0, 0.01]));
+    let pair = pair_tracking(&eq, &days(&[5, 7]), &[0.0, 0.01]).unwrap();
+    assert!(pair.live.is_empty() && pair.backtest.is_empty());
+    assert_eq!(pair.gap, Some(day(6)));
+    assert!(!pair.malformed);
 }
 
 #[test]
-fn pair_tracking_with_a_zero_or_negative_previous_equity_is_uncomparable() {
+fn a_zero_or_negative_previous_equity_is_a_gap_at_that_session() {
+    // Edited: this used to expect two empty series. Day 6 cannot be paired: its previous equity is
+    // not positive. The gap is day 6, and nothing before it was paired.
     let zero = equity_rows(&[(5, "0"), (6, "110")]);
-    assert_uncomparable(pair_tracking(&zero, &days(&[5, 6]), &[0.0, 0.05]));
+    let pair = pair_tracking(&zero, &days(&[5, 6]), &[0.0, 0.05]).unwrap();
+    assert!(pair.live.is_empty() && pair.backtest.is_empty());
+    assert_eq!(pair.gap, Some(day(6)));
     let negative = equity_rows(&[(5, "-5"), (6, "110")]);
-    assert_uncomparable(pair_tracking(&negative, &days(&[5, 6]), &[0.0, 0.05]));
+    let pair = pair_tracking(&negative, &days(&[5, 6]), &[0.0, 0.05]).unwrap();
+    assert!(pair.live.is_empty() && pair.backtest.is_empty());
+    assert_eq!(pair.gap, Some(day(6)));
 }
 
 #[test]
-fn pair_tracking_with_different_lengths_is_uncomparable() {
+fn a_gap_drops_the_sessions_up_to_it_and_keeps_the_rest() {
+    // Tracking has days 5 to 10. The equity has no row for day 7, so the gap is day 7 and the
+    // comparison keeps days 9 and 10 only. Day 8's equity return spans day 7, so it is dropped too.
+    let eq = equity_rows(&[
+        (5, "100"),
+        (6, "110"),
+        (8, "99"),
+        (9, "108.9"),
+        (10, "98.01"),
+    ]);
+    let dates = days(&[5, 6, 7, 8, 9, 10]);
+    let returns = [0.0, 0.1, 0.5, -0.3, 0.1, -0.1];
+    let pair = pair_tracking(&eq, &dates, &returns).unwrap();
+    assert_paired(Some(pair.clone()), &[0.1, -0.1], &[0.1, -0.1]);
+    assert_eq!(pair.gap, Some(day(7)));
+    assert_eq!(pair.span, Some((day(9), day(10))));
+}
+
+#[test]
+fn two_gaps_keep_only_the_sessions_after_the_newest() {
+    // Gaps at day 7 (equity lacks it) and day 11 (tracking has it, equity does not: the equity
+    // row on day 12 is preceded by day 9 in the equity, while the tracking run has 10 and 11).
+    let eq = equity_rows(&[
+        (5, "100"),
+        (6, "110"),
+        (8, "99"),
+        (9, "108.9"),
+        (12, "100"),
+        (13, "110"),
+        (14, "99"),
+    ]);
+    let dates = days(&[5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
+    let returns = [0.0, 0.1, 0.5, -0.3, 0.1, 0.2, 0.3, 0.4, 0.1, -0.1];
+    let pair = pair_tracking(&eq, &dates, &returns).unwrap();
+    assert_paired(Some(pair.clone()), &[0.1, -0.1], &[0.1, -0.1]);
+    assert_eq!(pair.gap, Some(day(11)));
+    assert_eq!(pair.span, Some((day(13), day(14))));
+}
+
+#[test]
+fn no_gap_reports_none() {
     let eq = equity_rows(&[(5, "100"), (6, "110"), (7, "99")]);
-    assert_uncomparable(pair_tracking(&eq, &days(&[5, 6, 7]), &[0.0, 0.05]));
-    assert_uncomparable(pair_tracking(&eq, &days(&[5, 6]), &[0.0, 0.05, -0.02]));
+    let pair = pair_tracking(&eq, &days(&[5, 6, 7]), &[0.0, 0.05, -0.02]).unwrap();
+    assert_eq!(pair.gap, None);
+    assert_eq!(pair.span, Some((day(6), day(7))));
 }
 
 #[test]
-fn pair_tracking_with_unsorted_or_repeated_tracking_dates_is_uncomparable() {
+fn a_tracking_session_after_the_last_equity_row_inside_the_span_is_a_gap() {
+    // The span ends at day 7 (the last tracking date). The equity has nothing after day 5 in it.
+    let eq = equity_rows(&[(5, "100"), (9, "110")]);
+    let pair = pair_tracking(&eq, &days(&[5, 6, 7]), &[0.0, 0.1, 0.2]).unwrap();
+    assert!(pair.live.is_empty() && pair.backtest.is_empty());
+    assert_eq!(pair.gap, Some(day(7)));
+}
+
+#[test]
+fn pair_tracking_with_different_lengths_is_malformed() {
     let eq = equity_rows(&[(5, "100"), (6, "110"), (7, "99")]);
-    assert_uncomparable(pair_tracking(&eq, &days(&[5, 7, 6]), &[0.0, -0.02, 0.05]));
-    assert_uncomparable(pair_tracking(&eq, &days(&[5, 6, 6]), &[0.0, 0.05, 0.05]));
+    assert_malformed(pair_tracking(&eq, &days(&[5, 6, 7]), &[0.0, 0.05]));
+    assert_malformed(pair_tracking(&eq, &days(&[5, 6]), &[0.0, 0.05, -0.02]));
 }
 
 #[test]
-fn pair_tracking_with_equity_out_of_date_order_is_uncomparable() {
+fn pair_tracking_with_unsorted_or_repeated_tracking_dates_is_malformed() {
+    let eq = equity_rows(&[(5, "100"), (6, "110"), (7, "99")]);
+    assert_malformed(pair_tracking(&eq, &days(&[5, 7, 6]), &[0.0, -0.02, 0.05]));
+    assert_malformed(pair_tracking(&eq, &days(&[5, 6, 6]), &[0.0, 0.05, 0.05]));
+}
+
+#[test]
+fn pair_tracking_with_equity_out_of_date_order_is_malformed() {
     let eq = equity_rows(&[(6, "110"), (5, "100")]);
-    assert_uncomparable(pair_tracking(&eq, &days(&[5, 6]), &[0.0, 0.05]));
+    assert_malformed(pair_tracking(&eq, &days(&[5, 6]), &[0.0, 0.05]));
+}
+
+#[test]
+fn a_gap_with_no_session_after_it_leaves_nothing_paired() {
+    // Tracking has day 6, which the equity lacks, so day 7 cannot be paired with day 5.
+    let eq = equity_rows(&[(5, "100"), (7, "110")]);
+    let pair = pair_tracking(&eq, &days(&[6, 7]), &[0.0, 0.1]).unwrap();
+    assert!(pair.live.is_empty() && pair.backtest.is_empty());
+    assert_eq!(pair.gap, Some(day(6)));
 }
 
 // ---- the tracking gate from the store -------------------------------------------------------
@@ -2328,12 +2605,25 @@ async fn record_equity(
     }
 }
 
-/// Registers a tracking run of `version` with its returns over `dates` and returns its trial id.
+/// Registers a tracking run of `version` with its returns over `dates`, under costs A (the same
+/// inputs as the candidate backtests of these tests), and returns its trial id.
 async fn tracking_run(
     client: &Client,
     version: StrategyVersionId,
     dates: &[NaiveDate],
     returns: &[f64],
+) -> i64 {
+    tracking_run_with_costs(client, version, dates, returns, costs_a()).await
+}
+
+/// Registers a tracking run of `version` with its returns over `dates` and costs `costs`, and
+/// returns its trial id.
+async fn tracking_run_with_costs(
+    client: &Client,
+    version: StrategyVersionId,
+    dates: &[NaiveDate],
+    returns: &[f64],
+    costs: Value,
 ) -> i64 {
     let id = register(
         client,
@@ -2342,12 +2632,81 @@ async fn tracking_run(
         Some(json!({"tracking": true})),
     )
     .await;
-    let mut result = stored_result(json!(returns), false);
+    let mut result = result_with_costs(json!(returns), costs);
     result["session_dates"] = json!(dates.iter().map(ToString::to_string).collect::<Vec<_>>());
     trial_result::insert(client, id, &result, UnixNanos::from(T))
         .await
         .unwrap();
     id
+}
+
+/// Registers an ordinary backtest of `version` with the returns given and costs `costs`, and
+/// returns its trial id. It is the candidate the tracking run is compared with.
+async fn backtest_with_costs(
+    client: &Client,
+    version: StrategyVersionId,
+    returns: &[f64],
+    costs: Value,
+) -> i64 {
+    let id = register(client, version, TrialKind::Backtest, None).await;
+    trial_result::insert(
+        client,
+        id,
+        &result_with_costs(json!(returns), costs),
+        UnixNanos::from(T),
+    )
+    .await
+    .unwrap();
+    id
+}
+
+/// The equity of January days 1 to 31: 100 on day 1, then up 10% and down 10% alternately, so
+/// the return of day `d` (from day 2 on) is `wave_returns()[d - 1]`. Exact in `Decimal`.
+fn wave_equity() -> Vec<Decimal> {
+    let mut equity = vec![dec("100")];
+    for index in 1..31 {
+        let factor = if index % 2 == 1 {
+            dec("1.1")
+        } else {
+            dec("0.9")
+        };
+        let next = equity[index - 1] * factor;
+        equity.push(next);
+    }
+    equity
+}
+
+/// The daily returns of January days 1 to 31 that match `wave_equity` (day 1 has none).
+fn wave_returns() -> Vec<f64> {
+    (0..31)
+        .map(|index| match index {
+            0 => 0.0,
+            i if i % 2 == 1 => 0.1,
+            _ => -0.1,
+        })
+        .collect()
+}
+
+/// Records the wave equity of `version` in `environment` for the given January days.
+async fn record_wave(client: &Client, version: StrategyVersionId, environment: &str, days: &[u32]) {
+    let equity = wave_equity();
+    for &n in days {
+        account_equity::insert(
+            client,
+            version,
+            environment,
+            day(n),
+            equity[(n - 1) as usize],
+            UnixNanos::from(T),
+        )
+        .await
+        .unwrap();
+    }
+}
+
+/// The January days `from` to `to`, inclusive.
+fn day_range(from: u32, to: u32) -> Vec<u32> {
+    (from..=to).collect()
 }
 
 #[tokio::test]
@@ -2373,24 +2732,107 @@ async fn the_tracking_gate_is_judged_from_equity_rows_and_a_tracking_run() {
     let db = ScratchDb::create().await;
     let client = db.client().await.unwrap();
     let v = version(&client, 1).await;
-    // Equity 100, 110, 99, 108.9: daily returns 0.10, -0.10 and 0.10.
-    record_equity(
-        &client,
-        v,
-        "paper",
-        &[(5, "100"), (6, "110"), (7, "99"), (8, "108.9")],
-    )
-    .await;
-    tracking_run(&client, v, &days(&[5, 6, 7, 8]), &[0.0, 0.1, -0.1, 0.1]).await;
+    // Edited: 22 equity rows (21 paired sessions, the floor is 20) and a candidate backtest with
+    // the tracking run's inputs. The equity alternates up and down 10%: day 2 is 0.1, day 3 -0.1.
+    record_wave(&client, v, "paper", &day_range(1, 22)).await;
+    let dates = days(&day_range(1, 22));
+    tracking_run(&client, v, &dates, &wave_returns()[..22]).await;
+    backtest_with_costs(&client, v, &wave_returns()[..22], costs_a()).await;
 
     let inputs = load_inputs(&client, v, gates()).await.unwrap();
-    let (live, backtest) = inputs.live.as_ref().expect("a paired series");
-    assert_close(live, &[0.1, -0.1, 0.1]);
-    assert_close(backtest, &[0.1, -0.1, 0.1]);
+    let input = inputs.live.as_ref().expect("a tracking input");
+    assert_eq!(input.environment, "paper");
+    assert_eq!(input.span, Some((day(2), day(22))));
+    assert_eq!(input.gap, None);
+    assert_eq!(input.lag_sessions, 0);
+    assert!(input.same_experiment && !input.unreadable);
+    assert_close(&input.live, &wave_returns()[1..22]);
+    assert_close(&input.backtest, &wave_returns()[1..22]);
     let report = build_report(&inputs);
     let gate = find(&report, "tracking");
-    assert_eq!(gate.status, GateStatus::Pass);
+    assert_eq!(gate.status, GateStatus::Pass, "{}", gate.note);
     assert!(gate.value.expect("a tracking error").abs() < 1e-12);
+    for text in ["paper", "2026-01-02", "2026-01-22", "21 sessions"] {
+        assert!(gate.note.contains(text), "{} lacks {text}", gate.note);
+    }
+
+    drop(client);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_tracking_run_with_other_costs_is_not_evaluated() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let v = version(&client, 1).await;
+    record_wave(&client, v, "paper", &day_range(1, 22)).await;
+    let dates = days(&day_range(1, 22));
+    // The candidate was run with costs A; the tracking run with costs B.
+    backtest_with_costs(&client, v, &wave_returns()[..22], costs_a()).await;
+    tracking_run_with_costs(&client, v, &dates, &wave_returns()[..22], costs_b()).await;
+
+    let inputs = load_inputs(&client, v, gates()).await.unwrap();
+    let input = inputs.live.as_ref().expect("a tracking input");
+    assert!(!input.same_experiment);
+    let gate = find(&build_report(&inputs), "tracking").clone();
+    assert_eq!(gate.status, GateStatus::NotEvaluated, "{}", gate.note);
+    assert!(gate.note.contains("same inputs"), "{}", gate.note);
+
+    drop(client);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_missed_session_is_named_and_the_rest_is_judged() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let v = version(&client, 1).await;
+    // The equity has no row for day 3, which the tracking run has. Days 1 and 2 pair, then the
+    // gap at day 3 drops them: days 5 to 31 (27 sessions) are judged.
+    let equity_days: Vec<u32> = day_range(1, 31).into_iter().filter(|&n| n != 3).collect();
+    record_wave(&client, v, "paper", &equity_days).await;
+    tracking_run(&client, v, &days(&day_range(1, 31)), &wave_returns()).await;
+    backtest_with_costs(&client, v, &wave_returns(), costs_a()).await;
+
+    let inputs = load_inputs(&client, v, gates()).await.unwrap();
+    let input = inputs.live.as_ref().expect("a tracking input");
+    assert_eq!(input.gap, Some(day(3)));
+    assert_eq!(input.span, Some((day(5), day(31))));
+    assert_eq!(input.live.len(), 27);
+    let gate = find(&build_report(&inputs), "tracking").clone();
+    assert_eq!(gate.status, GateStatus::Pass, "{}", gate.note);
+    assert!(gate.note.contains("27 sessions"), "{}", gate.note);
+    assert!(
+        gate.note.contains("sessions up to 2026-01-03 are left out"),
+        "{}",
+        gate.note
+    );
+
+    drop(client);
+    db.drop_db().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_stale_tracking_run_is_not_evaluated() {
+    let db = ScratchDb::create().await;
+    let client = db.client().await.unwrap();
+    let v = version(&client, 1).await;
+    // Equity to day 22; the tracking run ends at day 15, seven equity rows earlier.
+    record_wave(&client, v, "paper", &day_range(1, 22)).await;
+    tracking_run(&client, v, &days(&day_range(1, 15)), &wave_returns()[..15]).await;
+    backtest_with_costs(&client, v, &wave_returns()[..15], costs_a()).await;
+
+    let inputs = load_inputs(&client, v, gates()).await.unwrap();
+    let input = inputs.live.as_ref().expect("a tracking input");
+    assert_eq!(input.lag_sessions, 7);
+    let gate = find(&build_report(&inputs), "tracking").clone();
+    assert_eq!(gate.status, GateStatus::NotEvaluated, "{}", gate.note);
+    assert!(gate.note.contains("7 sessions older"), "{}", gate.note);
+    assert!(
+        gate.note.contains("make a new tracking run"),
+        "{}",
+        gate.note
+    );
 
     drop(client);
     db.drop_db().await.unwrap();
@@ -2406,30 +2848,11 @@ async fn live_equity_is_preferred_over_paper() {
     tracking_run(&client, v, &days(&[5, 6, 7]), &[0.0, 0.2, -0.25]).await;
 
     let inputs = load_inputs(&client, v, gates()).await.unwrap();
-    let (live, backtest) = inputs.live.as_ref().expect("a paired series");
+    let input = inputs.live.as_ref().expect("a tracking input");
+    assert_eq!(input.environment, "live");
     // The live rows give 0.2 and -0.25; paper's would give 0.1 and -0.1.
-    assert_close(live, &[0.2, -0.25]);
-    assert_close(backtest, &[0.2, -0.25]);
-
-    drop(client);
-    db.drop_db().await.unwrap();
-}
-
-#[tokio::test]
-async fn a_missed_session_makes_the_tracking_gate_not_evaluated() {
-    let db = ScratchDb::create().await;
-    let client = db.client().await.unwrap();
-    let v = version(&client, 1).await;
-    // The equity has no row for day 7, which the tracking run has.
-    record_equity(&client, v, "paper", &[(5, "100"), (6, "110"), (8, "108.9")]).await;
-    tracking_run(&client, v, &days(&[5, 6, 7, 8]), &[0.0, 0.1, -0.1, 0.1]).await;
-
-    let inputs = load_inputs(&client, v, gates()).await.unwrap();
-    assert_eq!(inputs.live, Some((Vec::new(), Vec::new())));
-    let report = build_report(&inputs);
-    let gate = find(&report, "tracking");
-    assert_eq!(gate.status, GateStatus::NotEvaluated);
-    assert!(gate.note.contains("could not be computed"), "{}", gate.note);
+    assert_close(&input.live, &[0.2, -0.25]);
+    assert_close(&input.backtest, &[0.2, -0.25]);
 
     drop(client);
     db.drop_db().await.unwrap();
@@ -2455,10 +2878,16 @@ async fn a_malformed_tracking_result_leaves_the_gate_uncomputable() {
         .unwrap();
 
     let inputs = load_inputs(&client, v, gates()).await.unwrap();
-    assert_eq!(inputs.live, Some((Vec::new(), Vec::new())));
-    assert_eq!(
-        status(&build_report(&inputs), "tracking"),
-        GateStatus::NotEvaluated
+    // Edited: the malformed result is now an unreadable tracking input, not two empty series.
+    let input = inputs.live.as_ref().expect("a tracking input");
+    assert!(input.unreadable);
+    assert!(input.live.is_empty() && input.backtest.is_empty());
+    let gate = find(&build_report(&inputs), "tracking").clone();
+    assert_eq!(gate.status, GateStatus::NotEvaluated, "{}", gate.note);
+    assert!(
+        gate.note.contains("incomplete or malformed"),
+        "{}",
+        gate.note
     );
 
     drop(client);
@@ -2696,7 +3125,7 @@ fn passing_inputs() -> ReportInputs {
     let mut i = inputs(1, trials, 11);
     i.holdout_looks = 1;
     i.replay = (0, 3);
-    i.live = Some((cand.clone(), cand));
+    i.live = Some(tracking_input(cand.clone(), cand));
     i
 }
 
@@ -2734,7 +3163,10 @@ fn all_pass_holds_only_when_every_gate_passes() {
         ("replay", |i| i.replay = (1, 3)),
         ("risk_breaches", |i| i.risk_breaches = 1),
         ("tracking", |i| {
-            i.live = Some((drift(500, 0.01, -0.010), drift(500, 0.011, 0.010)));
+            i.live = Some(tracking_input(
+                drift(500, 0.01, -0.010),
+                drift(500, 0.011, 0.010),
+            ));
         }),
     ];
     for (name, flip) in flips {
@@ -2953,6 +3385,18 @@ fn stored_result(returns: Value, holdout: bool) -> Value {
         "requested_start": 0,
         "requested_end": 1000,
     })
+}
+
+/// A stored result with the inputs the candidate and tracking comparison reads (see
+/// `same_inputs`): costs `costs`, symbols SPY, limits "aaa", starting cash 100000 and seed 7.
+fn result_with_costs(returns: Value, costs: Value) -> Value {
+    let mut result = stored_result(returns, false);
+    result["costs"] = costs;
+    result["symbols"] = json!(["SPY"]);
+    result["limits_hash"] = json!("aaa");
+    result["starting_cash"] = json!("100000");
+    result["seed"] = json!(7);
+    result
 }
 
 #[tokio::test]
