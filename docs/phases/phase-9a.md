@@ -10,7 +10,7 @@ None of this enables live trading: the engine still runs against paper only.
 | Where live daily returns come from | A new append-only table, `account_equity`: session-close writes the broker's account equity once per session |
 | The backtest the tracking gate compares with | Its own kind of run, a **tracking run**: allowed only for a strategy config the engine has traded, registers a trial (it counts toward the lifetime budget), is not a holdout look, and is never shown to research agents |
 | Whether the paper engine registers a trial | Yes: one `live`-kind trial per strategy config and environment, the first time the engine runs a session close for it |
-| Orders only through the risk gate | A test that reads the source and fails when a new non-test caller of the order-sending functions appears (`crates/app/tests/order_path.rs`) |
+| Orders only through the risk gate | A test that reads the source and fails when a new non-test use of the order-sending functions appears (`crates/app/tests/order_path.rs`). It is a tripwire for honest mistakes, not a proof: the functions stay public for the engine's integration tests, and a determined change could still route around a text search. Review of every change to a sensitive path remains the control. |
 
 "Strategy config" means `strategy_version.config_hash`. A strategy version is a config at one
 git SHA, so a new build of the same config is a new version; the trial, the equity series and
@@ -29,17 +29,28 @@ change that adds live.
 
 ### The engine's trial and equity row
 
-Session close gains a step, `equity`, after `observe`: if the config has no `live` trial for
-this environment it registers one (`data_range` from now, open-ended; result
-`{"environment": "paper"}`), then writes the session's `account_equity` row from the equity it
-has just observed. A re-run of the same session skips the step once it is `done`.
+`tick` and `session-close` register the trial right after the engine's state is restored
+and before anything else is done with it: if the config has no `live` trial for the engine's
+environment, one is registered (`data_range` from now, open-ended; result
+`{"environment": "paper"}`). The environment is the engine config's, not a constant.
+
+Session close gains a step, `equity`, after `observe`: it writes the session's
+`account_equity` row from the equity it has just observed. A re-run of the same session
+skips the step once it is `done`. **Known limit:** the value is the broker's equity when the
+step runs, up to six hours after the close, not at the close itself; an after-hours move
+before a late run adds noise to the comparison.
 
 ### Tracking runs
 
 `nisse-backtest <job.json> --tracking`:
 
 - refused unless the job's strategy config has a `live` trial, and unless the bars reach the
-  first session the engine ran;
+  day the engine first ran (compared by UTC date);
+- **shows nothing about the days before the engine ran.** A config can be put on paper
+  before it has passed the holdout gate, so a tracking run must not become a free look at
+  the holdout. Its stored result holds returns and session dates only for sessions on or
+  after the day the engine first ran, and no summary, final equity or other figure computed
+  over the whole span; the binary prints nothing more than that;
 - may read past `holdout_start` (it must: the engine runs today), is not marked `holdout`, and
   does not count toward `holdout_max_looks`. It is not a look in the sense the holdout
   protects: the config is already chosen and running, and the run only says how far the
@@ -57,12 +68,27 @@ has just observed. A re-run of the same session skips the step once it is `done`
 
 `nisse-gate-report` loads, for the version's config: the daily equity (the `live`
 environment's if it has any rows, else paper's) and the newest tracking run. The live return
-of a session is `equity / previous session's equity - 1`. The two series are compared over the
-sessions that have both, from the second session with an equity row to the earlier of the
-last equity row and the last tracking session. A session inside that span that the backtest
-has and the equity series lacks makes the gate `not_evaluated` (a missed session close must
-be seen, not skipped). No equity rows, fewer than two paired sessions, or no tracking run:
-`not_evaluated`, as today. The agents' report leaves the tracking gate out, like the holdout.
+of a session is `equity / previous session's equity - 1`. The two series are compared
+session by session up to the earlier of the last equity row and the last tracking session.
+
+- **A gap is reported, not hidden, and does not end the gate for good.** A session the
+  backtest has and the equity series lacks (a missed session close) cannot be made up by the
+  engine. The comparison then covers the sessions after the newest gap, and the gate's note
+  names the gap. To include the earlier sessions, the owner inserts the missing day's equity
+  by hand (`docs/runbooks/paper-run.md`).
+- **A floor.** Fewer than 20 paired sessions: `not_evaluated`. Two flat series a few days
+  long would otherwise pass.
+- **Not stale.** More than 5 equity rows after the tracking run's last session:
+  `not_evaluated`, with a note to make a new tracking run.
+- **The same experiment.** The tracking run must have the same inputs (costs, symbols,
+  limits, starting cash, seed) as the version's candidate backtest, by the rule the other
+  gates already use; otherwise `not_evaluated`. A tracking run cannot be re-made with other
+  costs until it fits.
+- The gate's note says what was judged: the environment, the first and last session and
+  the number of sessions.
+
+No equity rows or no tracking run: `not_evaluated`, as before. The agents' report leaves the
+tracking gate out, like the holdout.
 
 Before live, the rule for promotion is: every gate passes except `tracking`, which is
 `not_evaluated` or, after a paper run, judged on paper.

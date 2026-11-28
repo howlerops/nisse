@@ -82,7 +82,12 @@ The exit criterion is two consecutive weeks with none.
   tracking run of the same strategy config over bars that reach the last session
   (`nisse-backtest <job.json> --tracking`; it uses one trial of the lifetime budget and is
   not a holdout look), then `nisse-gate-report`: quote the `tracking` gate's line. Two weeks
-  is a short sample, and the first days differ while the account builds its positions.
+  is a short sample: with fewer than 20 compared sessions the gate says `not_evaluated`,
+  which is the expected answer after two weeks. A session close that was missed leaves a gap
+  the gate names; to close it, insert that day's equity by hand as `nisse_writer` (a new
+  row, never an update): `INSERT INTO account_equity (strategy_version_id, environment,
+  session_date, equity, event_ts) VALUES (<id>, 'paper', '<date>', <equity>, now());` with
+  the equity from Alpaca's portfolio history for that day.
 - Breaks, each with what happened and what was changed.
 - Slippage: the distribution of `shortfall_bps` against the model's assumption.
 - Anything that had to be done by hand.
