@@ -3,6 +3,7 @@
 //! Every function takes `&impl GenericClient`, so it runs equally on a connection or inside
 //! a transaction. Every statement is an `INSERT` or a `SELECT`: store tables are append-only.
 
+pub mod account_equity;
 pub mod decision;
 pub mod decision_holdout;
 pub mod engine_step;
